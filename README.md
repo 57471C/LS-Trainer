@@ -32,15 +32,32 @@ Built for the Lean Studio / LS-Vision workflow. Point it at a Label Studio (or Y
 npm install
 ```
 
-Create and activate the Python environment used for training:
+#### Python environment
 
-```bash
+Python 3.10–3.12 is recommended.  
+Python 3.13+ can work but may have slower wheel support for some Ultralytics dependencies.
+
+```powershell
+# Create the virtual environment in the project root
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1          # Windows
-pip install -r requirements.txt       # if present
-# or
+
+# Activate it (Windows)
+.\.venv\Scripts\Activate.ps1
+
+# Upgrade pip (recommended)
+python -m pip install --upgrade pip
+
+# Install Ultralytics
 pip install ultralytics
 ```
+
+If you later add a `requirements.txt`, use:
+
+```powershell
+pip install -r requirements.txt
+```
+
+The app looks for this `.venv` when it runs training and ONNX export.
 
 ### Run
 

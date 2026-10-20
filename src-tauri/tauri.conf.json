@@ -2,7 +2,7 @@
 	"$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
 	"productName": "LS-Trainer",
 	"version": "0.1.0",
-	"identifier": "com.tauri.dev",
+	"identifier": "studio.lean.ls-trainer",
 	"build": {
 		"frontendDist": "../dist",
 		"devUrl": "http://localhost:1420",
