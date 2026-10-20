@@ -12,6 +12,14 @@ Built for the Lean Studio / LS-Vision workflow. Point it at a Label Studio (or Y
 - Open the run folder or copy the weights path
 - Runs the local Python environment (Ultralytics) as a sidecar
 
+## Windows Installer & Post-Install Setup
+
+The Windows NSIS installer configures the Python training environment automatically:
+- **Automatic Setup Hook**: During installation, an NSIS hook automatically executes `setup-venv.bat` via `nsExec::ExecToLog` on the finish page, keeping all output visible in the installer log.
+- **Dedicated Virtual Environment**: `setup-venv.bat` creates a `.venv` directory directly adjacent to the installed `app.exe` (using `%~dp0`), upgrades `pip`, and installs `ultralytics`. If a compatible system Python is not found on PATH, it prompts to download and install Python 3.12.
+- **CUDA / GPU Check**: At the conclusion of setup, it runs `python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"` and prints a clear note indicating whether training can use GPU acceleration or will fall back to CPU.
+- **Low-Friction**: No extra user steps are needed after clicking Finish—the application is ready to run immediately.
+
 ## Stack
 
 - Tauri 2

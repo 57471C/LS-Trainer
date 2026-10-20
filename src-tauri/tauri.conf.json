@@ -1,7 +1,7 @@
 {
 	"$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
 	"productName": "LS-Trainer",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"identifier": "studio.lean.ls-trainer",
 	"build": {
 		"frontendDist": "../dist",
@@ -33,6 +33,14 @@
 			"icons/icon.icns",
 			"icons/icon.ico"
 		],
+		"resources": {
+			"../setup-venv.bat": "setup-venv.bat"
+		},
+		"windows": {
+			"nsis": {
+				"installerHooks": "installer-hooks.nsh"
+			}
+		},
 		"android": {
 			"debugApplicationIdSuffix": ".debug"
 		}
