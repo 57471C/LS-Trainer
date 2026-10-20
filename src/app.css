@@ -1,1 +1,45 @@
 @import "tailwindcss";
+
+/* Global dark mode scrollbars & overscroll handling */
+:root {
+	color-scheme: dark;
+}
+
+html,
+body {
+	height: 100%;
+	width: 100%;
+	margin: 0;
+	padding: 0;
+	overflow: hidden;
+	overscroll-behavior: none;
+}
+
+* {
+	scrollbar-width: thin;
+	scrollbar-color: #3f3f46 #09090b;
+	overscroll-behavior: none;
+}
+
+::-webkit-scrollbar {
+	width: 8px;
+	height: 8px;
+}
+
+::-webkit-scrollbar-track {
+	background: #09090b;
+}
+
+::-webkit-scrollbar-thumb {
+	background: #27272a;
+	border-radius: 4px;
+	border: 1px solid #18181b;
+}
+
+::-webkit-scrollbar-thumb:hover {
+	background: #3f3f46;
+}
+
+::-webkit-scrollbar-corner {
+	background: #09090b;
+}
