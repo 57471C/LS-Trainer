@@ -1,0 +1,30 @@
+{
+	"name": "ls-trainer",
+	"private": true,
+	"version": "0.0.0",
+	"type": "module",
+	"scripts": {
+		"dev": "vite",
+		"build": "vite build",
+		"check": "svelte-check --tsconfig ./tsconfig.json",
+		"tauri": "tauri",
+		"lint": "biome check .",
+		"format": "biome format --write ."
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.5.15",
+		"@sveltejs/vite-plugin-svelte": "^7.3.1",
+		"@tailwindcss/vite": "^4.3.3",
+		"@tauri-apps/cli": "^2.12.3",
+		"@tsconfig/svelte": "^5.0.8",
+		"@types/node": "^24.19.2",
+		"svelte": "^5.57.2",
+		"svelte-check": "^4.7.7",
+		"tailwindcss": "^4.3.3",
+		"typescript": "~6.0.3",
+		"vite": "^8.3.4"
+	},
+	"dependencies": {
+		"@tauri-apps/api": "^2.12.4"
+	}
+}
