@@ -18,6 +18,36 @@ pub struct TrainingRequest {
     pub epochs: u32,
     pub imgsz: u32,
     pub device: String,
+    #[serde(default = "default_batch")]
+    pub batch: u32,
+    #[serde(default = "default_amp")]
+    pub amp: bool,
+    #[serde(default = "default_mosaic")]
+    pub mosaic: f32,
+    #[serde(default = "default_mixup")]
+    pub mixup: f32,
+    #[serde(default = "default_scale")]
+    pub scale: f32,
+}
+
+fn default_batch() -> u32 {
+    4
+}
+
+fn default_amp() -> bool {
+    true
+}
+
+fn default_mosaic() -> f32 {
+    0.0
+}
+
+fn default_mixup() -> f32 {
+    0.0
+}
+
+fn default_scale() -> f32 {
+    0.2
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
@@ -72,7 +102,19 @@ pub fn to_display_path(path: &Path) -> String {
     }
 }
 
-fn is_cuda_available(project_root: &Path) -> bool {
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
+pub struct GpuInfo {
+    pub cuda_available: bool,
+    pub device_name: Option<String>,
+}
+
+#[tauri::command]
+fn get_gpu_info() -> GpuInfo {
+    let project_root = get_project_root();
+    detect_gpu_info(&project_root)
+}
+
+fn detect_gpu_info(project_root: &Path) -> GpuInfo {
     // 1. Check via venv Python if available
     #[cfg(target_os = "windows")]
     let venv_python = project_root.join(".venv").join("Scripts").join("python.exe");
@@ -81,36 +123,85 @@ fn is_cuda_available(project_root: &Path) -> bool {
 
     if venv_python.is_file() {
         let mut py_cmd = Command::new(&venv_python);
-        py_cmd.args(["-c", "import torch; print(torch.cuda.is_available())"]);
+        py_cmd.args([
+            "-c",
+            "import torch; avail = torch.cuda.is_available(); print(avail); print(torch.cuda.get_device_name(0) if avail else '')",
+        ]);
         #[cfg(windows)]
         {
             py_cmd.creation_flags(CREATE_NO_WINDOW);
         }
         if let Ok(output) = py_cmd.output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            if stdout.trim().eq_ignore_ascii_case("true") {
-                return true;
-            }
-            if stdout.trim().eq_ignore_ascii_case("false") {
-                return false;
+            let lines: Vec<&str> = stdout.lines().collect();
+            if let Some(first) = lines.first() {
+                if first.trim().eq_ignore_ascii_case("true") {
+                    let dev_name = lines.get(1).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+                    return GpuInfo {
+                        cuda_available: true,
+                        device_name: dev_name,
+                    };
+                }
+                if first.trim().eq_ignore_ascii_case("false") {
+                    return GpuInfo {
+                        cuda_available: false,
+                        device_name: None,
+                    };
+                }
             }
         }
     }
 
     // 2. Check nvidia-smi
     let mut smi_cmd = Command::new("nvidia-smi");
-    smi_cmd.arg("-L");
+    smi_cmd.args(["--query-gpu=name", "--format=csv,noheader"]);
     #[cfg(windows)]
     {
         smi_cmd.creation_flags(CREATE_NO_WINDOW);
     }
     if let Ok(output) = smi_cmd.output() {
-        if output.status.success() && !output.stdout.is_empty() {
-            return true;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(name) = stdout.lines().next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                return GpuInfo {
+                    cuda_available: true,
+                    device_name: Some(name),
+                };
+            }
         }
     }
 
-    // 3. Check system python if available
+    // 3. Fallback nvidia-smi -L
+    let mut smi_l_cmd = Command::new("nvidia-smi");
+    smi_l_cmd.arg("-L");
+    #[cfg(windows)]
+    {
+        smi_l_cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    if let Ok(output) = smi_l_cmd.output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if !stdout.is_empty() {
+                let name = stdout.lines().next().map(|s| {
+                    if let Some(rest) = s.strip_prefix("GPU 0: ") {
+                        if let Some((clean_name, _)) = rest.split_once(" (UUID:") {
+                            clean_name.trim().to_string()
+                        } else {
+                            rest.trim().to_string()
+                        }
+                    } else {
+                        s.trim().to_string()
+                    }
+                });
+                return GpuInfo {
+                    cuda_available: true,
+                    device_name: name,
+                };
+            }
+        }
+    }
+
+    // 4. Check system python if available
     #[cfg(target_os = "windows")]
     let sys_py = {
         let mut cmd = Command::new("cmd");
@@ -118,7 +209,7 @@ fn is_cuda_available(project_root: &Path) -> bool {
             "/C",
             "python",
             "-c",
-            "import torch; print(torch.cuda.is_available())",
+            "import torch; avail = torch.cuda.is_available(); print(avail); print(torch.cuda.get_device_name(0) if avail else '')",
         ]);
         cmd.creation_flags(CREATE_NO_WINDOW);
         cmd.output()
@@ -127,18 +218,32 @@ fn is_cuda_available(project_root: &Path) -> bool {
     let sys_py = Command::new("python3")
         .args([
             "-c",
-            "import torch; print(torch.cuda.is_available())",
+            "import torch; avail = torch.cuda.is_available(); print(avail); print(torch.cuda.get_device_name(0) if avail else '')",
         ])
         .output();
 
     if let Ok(output) = sys_py {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.trim().eq_ignore_ascii_case("true") {
-            return true;
+        let lines: Vec<&str> = stdout.lines().collect();
+        if let Some(first) = lines.first() {
+            if first.trim().eq_ignore_ascii_case("true") {
+                let dev_name = lines.get(1).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+                return GpuInfo {
+                    cuda_available: true,
+                    device_name: dev_name,
+                };
+            }
         }
     }
 
-    false
+    GpuInfo {
+        cuda_available: false,
+        device_name: None,
+    }
+}
+
+fn is_cuda_available(project_root: &Path) -> bool {
+    detect_gpu_info(project_root).cuda_available
 }
 
 fn unpack_archive(archive_path: &Path, target_dir: &Path) -> Result<(), String> {
@@ -416,14 +521,28 @@ async fn start_training(
     let model_arg = format!("model={}", request.model_choice);
     let name_arg = format!("name={run_name}");
     let epochs_arg = format!("epochs={}", request.epochs);
+    let batch_arg = format!("batch={}", request.batch);
     let imgsz_arg = format!("imgsz={}", request.imgsz);
+    let amp_arg = format!("amp={}", if request.amp { "True" } else { "False" });
+    let mosaic_arg = format!("mosaic={}", request.mosaic);
+    let mixup_arg = format!("mixup={}", request.mixup);
+    let scale_arg = format!("scale={}", request.scale);
 
     let device_input = request.device.trim();
     let effective_device = if device_input.is_empty() || device_input.eq_ignore_ascii_case("auto") {
         if is_cuda_available(&project_root) {
-            "auto".to_string()
+            let _ = on_log.send("[LS-Trainer] CUDA available, selecting device=0".to_string());
+            "0".to_string()
         } else {
             let _ = on_log.send("[LS-Trainer] No CUDA detected, using device=cpu".to_string());
+            "cpu".to_string()
+        }
+    } else if device_input.eq_ignore_ascii_case("gpu") || device_input.eq_ignore_ascii_case("cuda") {
+        if is_cuda_available(&project_root) {
+            let _ = on_log.send("[LS-Trainer] CUDA available, selecting device=0".to_string());
+            "0".to_string()
+        } else {
+            let _ = on_log.send("[LS-Trainer] No CUDA detected, falling back to device=cpu".to_string());
             "cpu".to_string()
         }
     } else {
@@ -456,12 +575,17 @@ async fn start_training(
             &name_arg,
             &project_arg,
             &epochs_arg,
+            &batch_arg,
             &imgsz_arg,
             &device_arg,
+            &amp_arg,
+            &mosaic_arg,
+            &mixup_arg,
+            &scale_arg,
         ]);
 
         let cmd_str = format!(
-            "\"{}\" detect train {data_arg} {model_arg} {name_arg} {project_arg} {epochs_arg} {imgsz_arg} {device_arg}",
+            "\"{}\" detect train {data_arg} {model_arg} {name_arg} {project_arg} {epochs_arg} {batch_arg} {imgsz_arg} {device_arg} {amp_arg} {mosaic_arg} {mixup_arg} {scale_arg}",
             expected_venv_yolo.display()
         );
 
@@ -485,8 +609,13 @@ async fn start_training(
                 &name_arg,
                 &project_arg,
                 &epochs_arg,
+                &batch_arg,
                 &imgsz_arg,
                 &device_arg,
+                &amp_arg,
+                &mosaic_arg,
+                &mixup_arg,
+                &scale_arg,
             ]);
             cmd
         };
@@ -502,14 +631,19 @@ async fn start_training(
                 &name_arg,
                 &project_arg,
                 &epochs_arg,
+                &batch_arg,
                 &imgsz_arg,
                 &device_arg,
+                &amp_arg,
+                &mosaic_arg,
+                &mixup_arg,
+                &scale_arg,
             ]);
             cmd
         };
 
         let cmd_str = format!(
-            "yolo detect train {data_arg} {model_arg} {name_arg} {project_arg} {epochs_arg} {imgsz_arg} {device_arg}"
+            "yolo detect train {data_arg} {model_arg} {name_arg} {project_arg} {epochs_arg} {batch_arg} {imgsz_arg} {device_arg} {amp_arg} {mosaic_arg} {mixup_arg} {scale_arg}"
         );
 
         (c, cmd_str)
@@ -941,7 +1075,8 @@ pub fn run() {
             pick_model_file,
             start_training,
             open_folder,
-            export_to_onnx
+            export_to_onnx,
+            get_gpu_info
         ])
         .run(tauri::generate_context!())
         .expect("error while building tauri application");

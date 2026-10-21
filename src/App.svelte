@@ -1,5 +1,6 @@
 <script lang="ts">
 import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
+import { onMount } from "svelte";
 
 type ModelMode = "continue" | "fresh";
 type ImageSize = 640 | 960 | 1280;
@@ -15,6 +16,11 @@ interface ExportResponse {
 	success: boolean;
 	onnx_path: string;
 	message: string;
+}
+
+interface GpuInfo {
+	cuda_available: boolean;
+	device_name: string | null;
 }
 
 const freshModelOptions: { id: YoloModel; label: string; desc: string }[] = [
@@ -33,8 +39,35 @@ let existingModelFileName = $state<string>("");
 let freshModel = $state<YoloModel>("yolo11n");
 let runName = $state<string>("");
 let epochs = $state<number>(60);
+let batch = $state<number>(4);
 let imageSize = $state<ImageSize>(960);
-let device = $state<string>("auto");
+let device = $state<string>("0");
+let isCustomDevice = $state<boolean>(false);
+let customDevice = $state<string>("");
+let gpuInfo = $state<GpuInfo | null>(null);
+
+// Advanced knobs
+let amp = $state<boolean>(true);
+let mosaic = $state<number>(0.0);
+let mixup = $state<number>(0.0);
+let scale = $state<number>(0.2);
+
+let activeTooltip = $state<string | null>(null);
+
+onMount(async () => {
+	if (isTauri()) {
+		try {
+			gpuInfo = await invoke<GpuInfo>("get_gpu_info");
+			if (gpuInfo.cuda_available) {
+				device = "0";
+			} else {
+				device = "cpu";
+			}
+		} catch (e) {
+			console.error("Failed to query GPU info:", e);
+		}
+	}
+});
 
 let isTraining = $state<boolean>(false);
 let logs = $state<string[]>([]);
@@ -240,8 +273,13 @@ async function handleStartTraining() {
 		model_choice: effectiveModel,
 		run_name: effectiveRunName,
 		epochs: Number(epochs),
+		batch: Number(batch),
 		imgsz: Number(imageSize),
 		device,
+		amp: Boolean(amp),
+		mosaic: Number(mosaic),
+		mixup: Number(mixup),
+		scale: Number(scale),
 	};
 
 	console.log("LS-Trainer Starting Training:", requestPayload);
@@ -274,7 +312,7 @@ async function handleStartTraining() {
 		logs = [
 			"[LS-Trainer] Running outside Tauri webview (Browser Mode)",
 			`[LS-Trainer] Simulated training run '${effectiveRunName}'`,
-			`[LS-Trainer] Command: yolo detect train data="${effectiveDataset}" model="${effectiveModel}" name="${effectiveRunName}" epochs=${epochs} imgsz=${imageSize} device="${device}"`,
+			`[LS-Trainer] Command: yolo detect train data="${effectiveDataset}" model="${effectiveModel}" name="${effectiveRunName}" epochs=${epochs} batch=${batch} imgsz=${imageSize} device="${device}" amp=${amp} mosaic=${mosaic} mixup=${mixup} scale=${scale}`,
 			"[LS-Trainer] Unpacking archive simulation complete.",
 			`[LS-Trainer] Starting YOLO11 epochs (1/${epochs})...`,
 			"[LS-Trainer] Training finished successfully.",
@@ -380,6 +418,15 @@ async function handleExportToOnnx() {
 }
 </script>
 
+<svelte:window
+	onclick={() => {
+		activeTooltip = null;
+	}}
+	onkeydown={(e) => {
+		if (e.key === "Escape") activeTooltip = null;
+	}}
+/>
+
 <div class="flex h-screen w-screen flex-col overflow-hidden bg-zinc-950 font-sans text-zinc-100 antialiased selection:bg-amber-500/30 selection:text-amber-200">
 	<!-- Top Bar -->
 	<header class="flex h-14 shrink-0 items-center justify-between border-b border-zinc-800/80 bg-zinc-900/90 px-6 backdrop-blur-md z-10">
@@ -410,7 +457,7 @@ async function handleExportToOnnx() {
 				</button>
 			{/if}
 			<span class="rounded border border-zinc-700/60 bg-zinc-800/80 px-2.5 py-0.5 font-mono text-xs text-zinc-400">
-				v0.1.0
+				v0.1.2
 			</span>
 		</div>
 	</header>
@@ -424,7 +471,7 @@ async function handleExportToOnnx() {
 					e.preventDefault();
 					handleStartTraining();
 				}}
-				class="w-full max-w-2xl space-y-6 rounded-xl border border-zinc-800/90 bg-zinc-900/50 p-6 shadow-2xl backdrop-blur-sm sm:p-8"
+				class="w-full max-w-4xl space-y-6 rounded-xl border border-zinc-800/90 bg-zinc-900/50 p-6 shadow-2xl backdrop-blur-sm sm:p-8"
 			>
 				<!-- Section 1: Dataset -->
 				<section class="space-y-2.5">
@@ -706,25 +753,42 @@ async function handleExportToOnnx() {
 					</span>
 
 					<div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
-						<!-- Epochs -->
-						<div class="space-y-1.5">
-							<label for="epochs-input" class="block text-xs font-medium text-zinc-400">
-								Epochs
-							</label>
-							<input
-								id="epochs-input"
-								type="number"
-								min="1"
-								step="1"
-								bind:value={epochs}
-								disabled={isTraining}
-								class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
-							/>
+						<!-- Epochs and Batch -->
+						<div class="grid grid-cols-2 gap-3">
+							<div class="space-y-1.5">
+								<label for="epochs-input" class="flex h-5 items-center text-xs font-medium text-zinc-400">
+									Epochs
+								</label>
+								<input
+									id="epochs-input"
+									type="number"
+									min="1"
+									step="1"
+									bind:value={epochs}
+									disabled={isTraining}
+									class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+								/>
+							</div>
+
+							<div class="space-y-1.5">
+								<label for="batch-input" class="flex h-5 items-center text-xs font-medium text-zinc-400">
+									Batch
+								</label>
+								<input
+									id="batch-input"
+									type="number"
+									min="1"
+									step="1"
+									bind:value={batch}
+									disabled={isTraining}
+									class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+								/>
+							</div>
 						</div>
 
 						<!-- Image size -->
 						<div class="space-y-1.5">
-							<label for="image-size-select" class="block text-xs font-medium text-zinc-400">
+							<label for="image-size-select" class="flex h-5 items-center text-xs font-medium text-zinc-400">
 								Image size
 							</label>
 							<select
@@ -740,27 +804,337 @@ async function handleExportToOnnx() {
 						</div>
 
 						<!-- Device -->
-						<div class="space-y-1.5">
-							<label for="device-input" class="block text-xs font-medium text-zinc-400">
-								Device
-							</label>
-							<div class="relative">
-								<input
-									id="device-input"
-									type="text"
-									list="device-options"
-									bind:value={device}
-									disabled={isTraining}
-									placeholder="auto"
-									class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
-								/>
-								<datalist id="device-options">
-									<option value="auto">auto (recommended)</option>
-									<option value="cpu">cpu</option>
-									<option value="0">0 (GPU cuda:0)</option>
-									<option value="mps">mps (Apple Silicon)</option>
-								</datalist>
+						<div class="space-y-1.5 min-w-0">
+							<div class="flex h-5 items-center justify-between gap-2 whitespace-nowrap">
+								<label for="device-select" class="block text-xs font-medium text-zinc-400 shrink-0">
+									Device
+								</label>
+								{#if gpuInfo?.cuda_available && gpuInfo.device_name}
+									<span class="flex items-center gap-1.5 text-[11px] font-medium text-emerald-400 whitespace-nowrap truncate min-w-0" title={gpuInfo.device_name}>
+										<span class="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400"></span>
+										<span class="truncate">{gpuInfo.device_name}</span>
+									</span>
+								{:else if gpuInfo && !gpuInfo.cuda_available}
+									<span class="text-[11px] text-zinc-500 whitespace-nowrap">
+										CPU only (No CUDA GPU)
+									</span>
+								{/if}
 							</div>
+							<select
+								id="device-select"
+								value={isCustomDevice ? "custom" : device}
+								onchange={(e) => {
+									const val = e.currentTarget.value;
+									if (val === "custom") {
+										isCustomDevice = true;
+										device = customDevice || "0";
+									} else {
+										isCustomDevice = false;
+										device = val;
+									}
+								}}
+								disabled={isTraining}
+								class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+							>
+								{#if gpuInfo?.cuda_available}
+									<option value="0">
+										{gpuInfo.device_name ? `GPU 0: ${gpuInfo.device_name}` : "GPU (device=0)"}
+									</option>
+									<option value="cpu">CPU (device=cpu)</option>
+									<option value="custom">Custom device...</option>
+								{:else if gpuInfo !== null}
+									<option value="cpu">CPU (device=cpu)</option>
+									<option value="custom">Custom device...</option>
+								{:else}
+									<option value="0">GPU (device=0)</option>
+									<option value="cpu">CPU (device=cpu)</option>
+									<option value="custom">Custom device...</option>
+								{/if}
+							</select>
+
+							{#if isCustomDevice}
+								<input
+									type="text"
+									placeholder="e.g. 0,1 or mps"
+									bind:value={customDevice}
+									oninput={() => {
+										device = customDevice.trim();
+									}}
+									disabled={isTraining}
+									class="mt-1.5 w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2 text-xs text-zinc-100 placeholder-zinc-500 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+								/>
+							{/if}
+						</div>
+					</div>
+				</section>
+
+				<!-- Section 5: Advanced -->
+				<section class="space-y-3 border-t border-zinc-800/80 pt-5">
+					<span class="block text-xs font-semibold tracking-wider text-zinc-300 uppercase">
+						Advanced
+					</span>
+
+					<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+						<!-- amp -->
+						<div class="space-y-1.5">
+							<div class="relative flex h-5 items-center justify-between">
+								<div class="flex items-center gap-1.5">
+									<label for="amp-toggle" class="text-xs font-medium text-zinc-400">
+										amp
+									</label>
+									<button
+										type="button"
+										onclick={(e) => {
+											e.stopPropagation();
+											activeTooltip = activeTooltip === "amp" ? null : "amp";
+										}}
+										class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
+										aria-label="amp help"
+										title="Automatic Mixed Precision. Uses FP16 where safe to reduce VRAM. Leave on unless you hit numerical problems."
+									>
+										?
+									</button>
+								</div>
+
+								{#if activeTooltip === "amp"}
+									<!-- svelte-ignore a11y_no_static_element_interactions -->
+									<div
+										onclick={(e) => e.stopPropagation()}
+										onkeydown={(e) => e.stopPropagation()}
+										class="absolute bottom-full left-0 z-30 mb-2 w-64 rounded-lg border border-amber-500/40 bg-zinc-900 p-2.5 text-xs leading-relaxed text-zinc-200 shadow-xl backdrop-blur-md"
+									>
+										<div class="flex items-start justify-between gap-2 border-b border-zinc-800 pb-1">
+											<span class="font-semibold text-amber-400">amp</span>
+											<button
+												type="button"
+												onclick={(e) => {
+													e.stopPropagation();
+													activeTooltip = null;
+												}}
+												class="text-zinc-400 transition hover:text-zinc-100"
+												aria-label="Close tooltip"
+											>
+												&times;
+											</button>
+										</div>
+										<p class="mt-1 text-zinc-300">
+											Automatic Mixed Precision. Uses FP16 where safe to reduce VRAM. Leave on unless you hit numerical problems.
+										</p>
+									</div>
+								{/if}
+							</div>
+
+							<button
+								id="amp-toggle"
+								type="button"
+								role="switch"
+								aria-checked={amp}
+								onclick={() => {
+									if (!isTraining) amp = !amp;
+								}}
+								disabled={isTraining}
+								class={`flex h-[42px] w-full items-center justify-between rounded-lg border px-3.5 py-2 text-sm font-medium transition ${
+									amp
+										? "border-amber-500/50 bg-amber-500/10 text-amber-300"
+										: "border-zinc-700/80 bg-zinc-900 text-zinc-400 hover:border-zinc-600"
+								} disabled:opacity-50`}
+							>
+								<span>{amp ? "Enabled (FP16)" : "Disabled (FP32)"}</span>
+								<span
+									class={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ${
+										amp ? "bg-amber-500" : "bg-zinc-700"
+									}`}
+								>
+									<span
+										class={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition duration-200 ease-in-out ${
+											amp ? "translate-x-4" : "translate-x-0"
+										}`}
+									></span>
+								</span>
+							</button>
+						</div>
+
+						<!-- mosaic -->
+						<div class="space-y-1.5">
+							<div class="relative flex h-5 items-center justify-between">
+								<div class="flex items-center gap-1.5">
+									<label for="mosaic-input" class="text-xs font-medium text-zinc-400">
+										mosaic
+									</label>
+									<button
+										type="button"
+										onclick={(e) => {
+											e.stopPropagation();
+											activeTooltip = activeTooltip === "mosaic" ? null : "mosaic";
+										}}
+										class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
+										aria-label="mosaic help"
+										title="Probability of stitching four images into one. 0.0 disables it. Useful to turn off for controlled industrial scenes."
+									>
+										?
+									</button>
+								</div>
+
+								{#if activeTooltip === "mosaic"}
+									<!-- svelte-ignore a11y_no_static_element_interactions -->
+									<div
+										onclick={(e) => e.stopPropagation()}
+										onkeydown={(e) => e.stopPropagation()}
+										class="absolute bottom-full left-0 z-30 mb-2 w-64 rounded-lg border border-amber-500/40 bg-zinc-900 p-2.5 text-xs leading-relaxed text-zinc-200 shadow-xl backdrop-blur-md"
+									>
+										<div class="flex items-start justify-between gap-2 border-b border-zinc-800 pb-1">
+											<span class="font-semibold text-amber-400">mosaic</span>
+											<button
+												type="button"
+												onclick={(e) => {
+													e.stopPropagation();
+													activeTooltip = null;
+												}}
+												class="text-zinc-400 transition hover:text-zinc-100"
+												aria-label="Close tooltip"
+											>
+												&times;
+											</button>
+										</div>
+										<p class="mt-1 text-zinc-300">
+											Probability of stitching four images into one. 0.0 disables it. Useful to turn off for controlled industrial scenes.
+										</p>
+									</div>
+								{/if}
+							</div>
+
+							<input
+								id="mosaic-input"
+								type="number"
+								min="0"
+								max="1"
+								step="0.05"
+								bind:value={mosaic}
+								disabled={isTraining}
+								class="h-[42px] w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+							/>
+						</div>
+
+						<!-- mixup -->
+						<div class="space-y-1.5">
+							<div class="relative flex h-5 items-center justify-between">
+								<div class="flex items-center gap-1.5">
+									<label for="mixup-input" class="text-xs font-medium text-zinc-400">
+										mixup
+									</label>
+									<button
+										type="button"
+										onclick={(e) => {
+											e.stopPropagation();
+											activeTooltip = activeTooltip === "mixup" ? null : "mixup";
+										}}
+										class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
+										aria-label="mixup help"
+										title="Probability of blending two images and their labels. Usually left at 0.0 for clean bench photos."
+									>
+										?
+									</button>
+								</div>
+
+								{#if activeTooltip === "mixup"}
+									<!-- svelte-ignore a11y_no_static_element_interactions -->
+									<div
+										onclick={(e) => e.stopPropagation()}
+										onkeydown={(e) => e.stopPropagation()}
+										class="absolute bottom-full right-0 z-30 mb-2 w-64 rounded-lg border border-amber-500/40 bg-zinc-900 p-2.5 text-xs leading-relaxed text-zinc-200 shadow-xl backdrop-blur-md"
+									>
+										<div class="flex items-start justify-between gap-2 border-b border-zinc-800 pb-1">
+											<span class="font-semibold text-amber-400">mixup</span>
+											<button
+												type="button"
+												onclick={(e) => {
+													e.stopPropagation();
+													activeTooltip = null;
+												}}
+												class="text-zinc-400 transition hover:text-zinc-100"
+												aria-label="Close tooltip"
+											>
+												&times;
+											</button>
+										</div>
+										<p class="mt-1 text-zinc-300">
+											Probability of blending two images and their labels. Usually left at 0.0 for clean bench photos.
+										</p>
+									</div>
+								{/if}
+							</div>
+
+							<input
+								id="mixup-input"
+								type="number"
+								min="0"
+								max="1"
+								step="0.05"
+								bind:value={mixup}
+								disabled={isTraining}
+								class="h-[42px] w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+							/>
+						</div>
+
+						<!-- scale -->
+						<div class="space-y-1.5">
+							<div class="relative flex h-5 items-center justify-between">
+								<div class="flex items-center gap-1.5">
+									<label for="scale-input" class="text-xs font-medium text-zinc-400">
+										scale
+									</label>
+									<button
+										type="button"
+										onclick={(e) => {
+											e.stopPropagation();
+											activeTooltip = activeTooltip === "scale" ? null : "scale";
+										}}
+										class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
+										aria-label="scale help"
+										title="Random zoom range. 0.2 means ±20 %. Lower values keep part sizes closer to production camera distance."
+									>
+										?
+									</button>
+								</div>
+
+								{#if activeTooltip === "scale"}
+									<!-- svelte-ignore a11y_no_static_element_interactions -->
+									<div
+										onclick={(e) => e.stopPropagation()}
+										onkeydown={(e) => e.stopPropagation()}
+										class="absolute bottom-full right-0 z-30 mb-2 w-64 rounded-lg border border-amber-500/40 bg-zinc-900 p-2.5 text-xs leading-relaxed text-zinc-200 shadow-xl backdrop-blur-md"
+									>
+										<div class="flex items-start justify-between gap-2 border-b border-zinc-800 pb-1">
+											<span class="font-semibold text-amber-400">scale</span>
+											<button
+												type="button"
+												onclick={(e) => {
+													e.stopPropagation();
+													activeTooltip = null;
+												}}
+												class="text-zinc-400 transition hover:text-zinc-100"
+												aria-label="Close tooltip"
+											>
+												&times;
+											</button>
+										</div>
+										<p class="mt-1 text-zinc-300">
+											Random zoom range. 0.2 means ±20 %. Lower values keep part sizes closer to production camera distance.
+										</p>
+									</div>
+								{/if}
+							</div>
+
+							<input
+								id="scale-input"
+								type="number"
+								min="0"
+								max="1"
+								step="0.05"
+								bind:value={scale}
+								disabled={isTraining}
+								class="h-[42px] w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+							/>
 						</div>
 					</div>
 				</section>

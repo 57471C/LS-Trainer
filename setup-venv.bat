@@ -84,7 +84,7 @@ set "INSTALL_DONE=0"
 REM Try winget
 where winget >nul 2>&1
 if !ERRORLEVEL! EQU 0 (
-    echo [*] Installing Python 3.12 using Windows Package Manager (winget)...
+    echo [*] Installing Python 3.12 using Windows Package Manager winget...
     winget install --id Python.Python.3.12 -e --accept-package-agreements --accept-source-agreements --disable-interactivity
     if !ERRORLEVEL! EQU 0 set "INSTALL_DONE=1"
 )
@@ -175,6 +175,7 @@ echo.
 echo [*] Checking GPU / CUDA availability...
 "%VENV_PYTHON%" -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"
 
+set "CUDA_AVAILABLE=False"
 for /f "usebackq delims=" %%G in (`"%VENV_PYTHON%" -c "import torch; print(torch.cuda.is_available())" 2^>nul`) do (
     set "CUDA_AVAILABLE=%%G"
 )
@@ -184,12 +185,50 @@ if /i "!CUDA_AVAILABLE!"=="True" (
     goto :COMPLETED
 )
 
+REM Check if CUDA wheels are already installed
+set "TORCH_HAS_CU=False"
+for /f "usebackq delims=" %%G in (`"%VENV_PYTHON%" -c "import torch; print('+cu' in torch.__version__)" 2^>nul`) do (
+    set "TORCH_HAS_CU=%%G"
+)
+
+if /i "!TORCH_HAS_CU!"=="True" (
+    echo [*] CUDA 12.4 PyTorch wheels are already installed.
+    goto :CUDA_STILL_CPU
+)
+
+echo [*] CUDA is not available in default PyTorch.
+echo [*] Reinstalling CUDA 12.4 PyTorch wheels from https://download.pytorch.org/whl/cu124...
+"%VENV_PYTHON%" -m pip uninstall -y torch torchvision torchaudio
+"%VENV_PYTHON%" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+if !ERRORLEVEL! NEQ 0 (
+    echo [!] Warning: CUDA 12.4 wheels not available for this environment. Reinstalling default PyTorch...
+    "%VENV_PYTHON%" -m pip install torch torchvision
+)
+
+echo.
+echo [*] Re-checking GPU / CUDA availability...
+"%VENV_PYTHON%" -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"
+
+set "CUDA_AVAILABLE=False"
+for /f "usebackq delims=" %%G in (`"%VENV_PYTHON%" -c "import torch; print(torch.cuda.is_available())" 2^>nul`) do (
+    set "CUDA_AVAILABLE=%%G"
+)
+
+if /i "!CUDA_AVAILABLE!"=="True" (
+    for /f "usebackq delims=" %%D in (`"%VENV_PYTHON%" -c "import torch; print(torch.cuda.get_device_name(0))" 2^>nul`) do (
+        echo [*] GPU Device: %%D
+    )
+    echo [*] GPU acceleration is available for training.
+    goto :COMPLETED
+)
+
+:CUDA_STILL_CPU
 echo.
 echo --------------------------------------------------------
-echo  NOTE: CUDA is not available on this machine.
+echo  NOTE: CUDA is still not available on this machine.
 echo  LS-Trainer will fall back to CPU for training.
-echo  (If you have an NVIDIA GPU, ensure NVIDIA drivers and
-echo   CUDA are installed if you wish to use GPU acceleration.)
+echo  Please ensure an NVIDIA driver is installed if you
+echo  wish to use GPU acceleration.
 echo --------------------------------------------------------
 
 :COMPLETED
