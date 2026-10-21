@@ -4,6 +4,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tauri::ipc::Channel;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct TrainingRequest {
     pub dataset_path: String,
@@ -74,10 +80,13 @@ fn is_cuda_available(project_root: &Path) -> bool {
     let venv_python = project_root.join(".venv").join("bin").join("python");
 
     if venv_python.is_file() {
-        if let Ok(output) = Command::new(&venv_python)
-            .args(["-c", "import torch; print(torch.cuda.is_available())"])
-            .output()
+        let mut py_cmd = Command::new(&venv_python);
+        py_cmd.args(["-c", "import torch; print(torch.cuda.is_available())"]);
+        #[cfg(windows)]
         {
+            py_cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        if let Ok(output) = py_cmd.output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if stdout.trim().eq_ignore_ascii_case("true") {
                 return true;
@@ -89,7 +98,13 @@ fn is_cuda_available(project_root: &Path) -> bool {
     }
 
     // 2. Check nvidia-smi
-    if let Ok(output) = Command::new("nvidia-smi").arg("-L").output() {
+    let mut smi_cmd = Command::new("nvidia-smi");
+    smi_cmd.arg("-L");
+    #[cfg(windows)]
+    {
+        smi_cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    if let Ok(output) = smi_cmd.output() {
         if output.status.success() && !output.stdout.is_empty() {
             return true;
         }
@@ -97,14 +112,17 @@ fn is_cuda_available(project_root: &Path) -> bool {
 
     // 3. Check system python if available
     #[cfg(target_os = "windows")]
-    let sys_py = Command::new("cmd")
-        .args([
+    let sys_py = {
+        let mut cmd = Command::new("cmd");
+        cmd.args([
             "/C",
             "python",
             "-c",
             "import torch; print(torch.cuda.is_available())",
-        ])
-        .output();
+        ]);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.output()
+    };
     #[cfg(not(target_os = "windows"))]
     let sys_py = Command::new("python3")
         .args([
@@ -508,6 +526,11 @@ async fn start_training(
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
     match cmd.spawn() {
         Ok(mut child) => {
             let stdout = child.stdout.take();
@@ -816,6 +839,11 @@ async fn export_to_onnx(
     let parent_dir = best_pt.parent().unwrap_or(&results_path);
     cmd.current_dir(parent_dir);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 
     match cmd.spawn() {
         Ok(mut child) => {
