@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tauri::ipc::Channel;
@@ -22,10 +22,20 @@ pub struct TrainingRequest {
     pub batch: u32,
     #[serde(default = "default_amp")]
     pub amp: bool,
+    #[serde(default = "default_freeze_backbone")]
+    pub freeze_backbone: bool,
+    #[serde(default = "default_freeze_layers")]
+    pub freeze_layers: u32,
     #[serde(default = "default_mosaic")]
     pub mosaic: f32,
     #[serde(default = "default_mixup")]
     pub mixup: f32,
+    #[serde(default = "default_copy_paste")]
+    pub copy_paste: f32,
+    #[serde(default = "default_degrees")]
+    pub degrees: f32,
+    #[serde(default = "default_translate")]
+    pub translate: f32,
     #[serde(default = "default_scale")]
     pub scale: f32,
 }
@@ -38,12 +48,32 @@ fn default_amp() -> bool {
     true
 }
 
+fn default_freeze_backbone() -> bool {
+    false
+}
+
+fn default_freeze_layers() -> u32 {
+    10
+}
+
 fn default_mosaic() -> f32 {
     0.0
 }
 
 fn default_mixup() -> f32 {
     0.0
+}
+
+fn default_copy_paste() -> f32 {
+    0.0
+}
+
+fn default_degrees() -> f32 {
+    0.0
+}
+
+fn default_translate() -> f32 {
+    0.1
 }
 
 fn default_scale() -> f32 {
@@ -105,27 +135,249 @@ pub fn to_display_path(path: &Path) -> String {
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct GpuInfo {
     pub cuda_available: bool,
+    pub cpu_fallback_confirmed: bool,
     pub device_name: Option<String>,
+    pub driver_version: Option<String>,
+    pub recommended_wheel: String,
+    pub cuda_label: String,
+    pub torch_version: Option<String>,
+    pub needs_repair: bool,
+    pub status_summary: String,
+}
+
+fn parse_driver_version(raw: &str) -> (String, Option<u32>) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return (String::new(), None);
+    }
+    let parts: Vec<&str> = trimmed.split('.').collect();
+    if parts.len() == 2 {
+        let major = parts[0].trim().parse::<u32>().ok();
+        return (trimmed.to_string(), major);
+    }
+    if parts.len() >= 4 {
+        // Windows WMI format e.g. "32.0.15.7216" -> last 5 digits "57216" -> "572.16"
+        let combined: String = parts[parts.len() - 2..]
+            .join("")
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
+        if combined.len() >= 5 {
+            let tail = &combined[combined.len() - 5..];
+            let major_str = &tail[..3];
+            let minor_str = &tail[3..];
+            if let Ok(major) = major_str.parse::<u32>() {
+                return (format!("{major}.{minor_str}"), Some(major));
+            }
+        }
+    }
+    let first_num = parts
+        .first()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    (trimmed.to_string(), first_num)
+}
+
+fn shorten_gpu_name(full_name: &str) -> String {
+    let trimmed = full_name.trim();
+    for prefix in ["NVIDIA GeForce ", "NVIDIA RTX ", "NVIDIA "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            if prefix == "NVIDIA RTX " {
+                return format!("RTX {}", rest.trim());
+            }
+            return rest.trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn is_blackwell_gpu(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("rtx 50")
+        || lower.contains("rtx50")
+        || lower.contains("blackwell")
+        || lower.contains("gb10")
+        || lower.contains("gb20")
+        || lower.contains("b100")
+        || lower.contains("b200")
+}
+
+fn select_pytorch_wheel(
+    gpu_name: Option<&str>,
+    driver_major: Option<u32>,
+) -> (&'static str, &'static str, &'static str) {
+    if let Some(name) = gpu_name {
+        let driver_is_560_plus = driver_major.map(|d| d >= 560).unwrap_or(false);
+        if is_blackwell_gpu(name) || driver_is_560_plus {
+            (
+                "cu128",
+                "https://download.pytorch.org/whl/cu128",
+                "CUDA 12.8",
+            )
+        } else {
+            (
+                "cu124",
+                "https://download.pytorch.org/whl/cu124",
+                "CUDA 12.4",
+            )
+        }
+    } else {
+        ("cpu", "https://download.pytorch.org/whl/cpu", "CPU-only")
+    }
+}
+
+fn detect_hardware_gpu() -> (Option<String>, Option<String>, Option<u32>) {
+    let smi_candidates = [
+        "nvidia-smi",
+        #[cfg(target_os = "windows")]
+        "C:\\Windows\\System32\\nvidia-smi.exe",
+        #[cfg(target_os = "windows")]
+        "C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvidia-smi.exe",
+    ];
+
+    for smi_bin in smi_candidates {
+        let mut smi_cmd = Command::new(smi_bin);
+        smi_cmd.args(["--query-gpu=name,driver_version", "--format=csv,noheader"]);
+        #[cfg(windows)]
+        {
+            smi_cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        if let Ok(output) = smi_cmd.output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Some(first_line) = stdout.lines().next() {
+                    let parts: Vec<&str> = first_line.split(',').collect();
+                    let name = parts
+                        .first()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let raw_driver = parts
+                        .get(1)
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
+                    if name.is_some() {
+                        let (drv_str, drv_major) = parse_driver_version(&raw_driver);
+                        let drv_opt = if drv_str.is_empty() {
+                            None
+                        } else {
+                            Some(drv_str)
+                        };
+                        return (name, drv_opt, drv_major);
+                    }
+                }
+            }
+        }
+
+        let mut smi_l = Command::new(smi_bin);
+        smi_l.arg("-L");
+        #[cfg(windows)]
+        {
+            smi_l.creation_flags(CREATE_NO_WINDOW);
+        }
+        if let Ok(output) = smi_l.output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Some(first_line) = stdout.lines().next() {
+                    let parsed_name = if let Some(rest) = first_line.strip_prefix("GPU 0: ") {
+                        if let Some((clean_name, _)) = rest.split_once(" (UUID:") {
+                            clean_name.trim().to_string()
+                        } else {
+                            rest.trim().to_string()
+                        }
+                    } else {
+                        first_line.trim().to_string()
+                    };
+                    if !parsed_name.is_empty() {
+                        return (Some(parsed_name), None, None);
+                    }
+                }
+            }
+        }
+    }
+
+    // Windows WMI fallback via PowerShell
+    #[cfg(target_os = "windows")]
+    {
+        let mut ps_cmd = Command::new("powershell");
+        ps_cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' } | Select-Object -First 1 -Property Name,DriverVersion | ForEach-Object { \"$($_.Name)|$($_.DriverVersion)\" }",
+        ]);
+        ps_cmd.creation_flags(CREATE_NO_WINDOW);
+        if let Ok(output) = ps_cmd.output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Some(line) = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()) {
+                    let mut split = line.splitn(2, '|');
+                    let name = split
+                        .next()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let raw_drv = split.next().unwrap_or("").trim();
+                    if name.is_some() {
+                        let (drv_str, drv_major) = parse_driver_version(raw_drv);
+                        let drv_opt = if drv_str.is_empty() {
+                            None
+                        } else {
+                            Some(drv_str)
+                        };
+                        return (name, drv_opt, drv_major);
+                    }
+                }
+            }
+        }
+    }
+
+    (None, None, None)
 }
 
 #[tauri::command]
-fn get_gpu_info() -> GpuInfo {
-    let project_root = get_project_root();
-    detect_gpu_info(&project_root)
+async fn get_gpu_info() -> GpuInfo {
+    tauri::async_runtime::spawn_blocking(|| {
+        let project_root = get_project_root();
+        detect_gpu_info(&project_root)
+    })
+    .await
+    .unwrap_or_else(|_| GpuInfo {
+        cuda_available: false,
+        cpu_fallback_confirmed: true,
+        device_name: None,
+        driver_version: None,
+        recommended_wheel: "cpu".to_string(),
+        cuda_label: "CPU-only".to_string(),
+        torch_version: None,
+        needs_repair: false,
+        status_summary: "CPU fallback confirmed".to_string(),
+    })
 }
 
 fn detect_gpu_info(project_root: &Path) -> GpuInfo {
-    // 1. Check via venv Python if available
+    let (hw_gpu_name, driver_version, driver_major) = detect_hardware_gpu();
+    let (recommended_wheel, _index_url, cuda_label) =
+        select_pytorch_wheel(hw_gpu_name.as_deref(), driver_major);
+
     #[cfg(target_os = "windows")]
     let venv_python = project_root.join(".venv").join("Scripts").join("python.exe");
     #[cfg(not(target_os = "windows"))]
     let venv_python = project_root.join(".venv").join("bin").join("python");
 
+    let marker_path = project_root.join(".venv").join(".ls_trainer_wheel");
+    let marker_wheel = std::fs::read_to_string(&marker_path)
+        .ok()
+        .map(|s| s.trim().to_string());
+
+    let mut torch_installed = false;
+    let mut torch_cuda_avail = false;
+    let mut torch_kernel_ok = false;
+    let mut torch_ver: Option<String> = None;
+    let mut torch_dev_name: Option<String> = None;
+
     if venv_python.is_file() {
         let mut py_cmd = Command::new(&venv_python);
         py_cmd.args([
             "-c",
-            "import torch; avail = torch.cuda.is_available(); print(avail); print(torch.cuda.get_device_name(0) if avail else '')",
+            "import torch; avail = bool(torch.cuda.is_available()); ver = getattr(torch, '__version__', ''); dev = torch.cuda.get_device_name(0) if avail else ''; kok = False\nif avail:\n    try:\n        _ = torch.zeros(1, device='cuda') + 1\n        torch.cuda.synchronize()\n        kok = True\n    except Exception:\n        kok = False\nprint(f'TORCH_OK|{avail}|{ver}|{dev}|{kok}')",
         ]);
         #[cfg(windows)]
         {
@@ -133,113 +385,290 @@ fn detect_gpu_info(project_root: &Path) -> GpuInfo {
         }
         if let Ok(output) = py_cmd.output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let lines: Vec<&str> = stdout.lines().collect();
-            if let Some(first) = lines.first() {
-                if first.trim().eq_ignore_ascii_case("true") {
-                    let dev_name = lines.get(1).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-                    return GpuInfo {
-                        cuda_available: true,
-                        device_name: dev_name,
-                    };
-                }
-                if first.trim().eq_ignore_ascii_case("false") {
-                    return GpuInfo {
-                        cuda_available: false,
-                        device_name: None,
-                    };
-                }
-            }
-        }
-    }
-
-    // 2. Check nvidia-smi
-    let mut smi_cmd = Command::new("nvidia-smi");
-    smi_cmd.args(["--query-gpu=name", "--format=csv,noheader"]);
-    #[cfg(windows)]
-    {
-        smi_cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    if let Ok(output) = smi_cmd.output() {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Some(name) = stdout.lines().next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-                return GpuInfo {
-                    cuda_available: true,
-                    device_name: Some(name),
-                };
-            }
-        }
-    }
-
-    // 3. Fallback nvidia-smi -L
-    let mut smi_l_cmd = Command::new("nvidia-smi");
-    smi_l_cmd.arg("-L");
-    #[cfg(windows)]
-    {
-        smi_l_cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    if let Ok(output) = smi_l_cmd.output() {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if !stdout.is_empty() {
-                let name = stdout.lines().next().map(|s| {
-                    if let Some(rest) = s.strip_prefix("GPU 0: ") {
-                        if let Some((clean_name, _)) = rest.split_once(" (UUID:") {
-                            clean_name.trim().to_string()
-                        } else {
-                            rest.trim().to_string()
+            for line in stdout.lines() {
+                if let Some(rest) = line.trim().strip_prefix("TORCH_OK|") {
+                    let parts: Vec<&str> = rest.split('|').collect();
+                    if parts.len() >= 4 {
+                        torch_installed = true;
+                        torch_cuda_avail = parts[0].eq_ignore_ascii_case("true");
+                        if !parts[1].is_empty() {
+                            torch_ver = Some(parts[1].to_string());
                         }
-                    } else {
-                        s.trim().to_string()
+                        if !parts[2].is_empty() {
+                            torch_dev_name = Some(parts[2].to_string());
+                        }
+                        if let Some(k) = parts.get(3) {
+                            torch_kernel_ok = k.eq_ignore_ascii_case("true");
+                        }
                     }
-                });
-                return GpuInfo {
-                    cuda_available: true,
-                    device_name: name,
-                };
+                }
             }
         }
     }
 
-    // 4. Check system python if available
-    #[cfg(target_os = "windows")]
-    let sys_py = {
-        let mut cmd = Command::new("cmd");
-        cmd.args([
-            "/C",
-            "python",
-            "-c",
-            "import torch; avail = torch.cuda.is_available(); print(avail); print(torch.cuda.get_device_name(0) if avail else '')",
-        ]);
-        cmd.creation_flags(CREATE_NO_WINDOW);
-        cmd.output()
+    let effective_gpu_name = torch_dev_name.or(hw_gpu_name.clone());
+
+    if let Some(ref gpu_name) = effective_gpu_name {
+        let ver_str = torch_ver.as_deref().unwrap_or("");
+        let has_matching_wheel = if recommended_wheel == "cu128" {
+            ver_str.contains("+cu128")
+        } else {
+            ver_str.contains("+cu")
+        };
+
+        let cuda_working = torch_installed && torch_cuda_avail && torch_kernel_ok && has_matching_wheel;
+        // If we haven't already tried & recorded a repair for this wheel, mark needs_repair when !cuda_working
+        let already_attempted = marker_wheel.as_deref() == Some(recommended_wheel);
+        let needs_repair = !cuda_working && !already_attempted;
+
+        let short_name = shorten_gpu_name(gpu_name);
+        let status_summary = if cuda_working {
+            format!("Ready — {short_name} ({cuda_label})")
+        } else if needs_repair {
+            format!("PyTorch {cuda_label} setup required for {short_name}")
+        } else if torch_installed && torch_cuda_avail && torch_kernel_ok {
+            format!("Ready — {short_name}")
+        } else {
+            format!("{short_name} detected (CUDA inactive — click Repair CUDA)")
+        };
+
+        return GpuInfo {
+            cuda_available: torch_cuda_avail && torch_kernel_ok,
+            cpu_fallback_confirmed: torch_installed && !(torch_cuda_avail && torch_kernel_ok),
+            device_name: Some(gpu_name.clone()),
+            driver_version,
+            recommended_wheel: recommended_wheel.to_string(),
+            cuda_label: cuda_label.to_string(),
+            torch_version: torch_ver,
+            needs_repair,
+            status_summary,
+        };
+    }
+
+    // No NVIDIA GPU detected
+    let already_attempted = marker_wheel.as_deref() == Some("cpu");
+    let needs_repair = !torch_installed && !already_attempted && venv_python.is_file();
+    let status_summary = if torch_installed {
+        "Ready — CPU mode (No NVIDIA GPU)".to_string()
+    } else {
+        "Installing CPU PyTorch wheel…".to_string()
     };
-    #[cfg(not(target_os = "windows"))]
-    let sys_py = Command::new("python3")
-        .args([
-            "-c",
-            "import torch; avail = torch.cuda.is_available(); print(avail); print(torch.cuda.get_device_name(0) if avail else '')",
-        ])
-        .output();
-
-    if let Ok(output) = sys_py {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let lines: Vec<&str> = stdout.lines().collect();
-        if let Some(first) = lines.first() {
-            if first.trim().eq_ignore_ascii_case("true") {
-                let dev_name = lines.get(1).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-                return GpuInfo {
-                    cuda_available: true,
-                    device_name: dev_name,
-                };
-            }
-        }
-    }
 
     GpuInfo {
         cuda_available: false,
+        cpu_fallback_confirmed: torch_installed || !venv_python.is_file(),
         device_name: None,
+        driver_version: None,
+        recommended_wheel: "cpu".to_string(),
+        cuda_label: "CPU-only".to_string(),
+        torch_version: torch_ver,
+        needs_repair,
+        status_summary,
     }
+}
+
+fn strip_ansi_codes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&nc) = chars.peek() {
+                    chars.next();
+                    if ('@'..='~').contains(&nc) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn stream_reader_lines<R: std::io::Read>(mut reader: R, on_log: &Channel<String>) {
+    let mut buf = [0u8; 1024];
+    let mut line_buf = Vec::with_capacity(256);
+    let mut last_sent = String::new();
+
+    while let Ok(n) = reader.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        for &b in &buf[..n] {
+            if b == b'\n' || b == b'\r' {
+                if !line_buf.is_empty() {
+                    let raw = String::from_utf8_lossy(&line_buf);
+                    let cleaned = strip_ansi_codes(&raw).trim_end().to_string();
+                    if !cleaned.trim().is_empty() && cleaned != last_sent {
+                        let _ = on_log.send(cleaned.clone());
+                        last_sent = cleaned;
+                    }
+                    line_buf.clear();
+                }
+            } else {
+                line_buf.push(b);
+            }
+        }
+    }
+    if !line_buf.is_empty() {
+        let raw = String::from_utf8_lossy(&line_buf);
+        let cleaned = strip_ansi_codes(&raw).trim_end().to_string();
+        if !cleaned.trim().is_empty() && cleaned != last_sent {
+            let _ = on_log.send(cleaned);
+        }
+    }
+}
+
+#[tauri::command]
+async fn repair_cuda(on_log: Channel<String>) -> Result<GpuInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let project_root = get_project_root();
+        let (hw_gpu_name, driver_version, driver_major) = detect_hardware_gpu();
+        let (wheel_id, index_url, cuda_label) =
+            select_pytorch_wheel(hw_gpu_name.as_deref(), driver_major);
+
+        let status_banner = if let Some(ref name) = hw_gpu_name {
+            let short = shorten_gpu_name(name);
+            format!("Installing PyTorch for {short} ({cuda_label})…")
+        } else {
+            "Installing PyTorch for CPU (CPU-only wheel)…".to_string()
+        };
+
+        let _ = on_log.send(format!("[LS-Trainer Status] {status_banner}"));
+        let _ = on_log.send(format!(
+            "[LS-Trainer] GPU detection: device={:?}, driver={:?} -> target={} ({})",
+            hw_gpu_name, driver_version, wheel_id, index_url
+        ));
+
+        #[cfg(target_os = "windows")]
+        let venv_python = project_root.join(".venv").join("Scripts").join("python.exe");
+        #[cfg(not(target_os = "windows"))]
+        let venv_python = project_root.join(".venv").join("bin").join("python");
+
+        if !venv_python.is_file() {
+            let msg = format!(
+                "Virtual environment Python not found at '{}'. Please run setup-venv.bat first.",
+                venv_python.display()
+            );
+            let _ = on_log.send(format!("[LS-Trainer Error] {msg}"));
+            return Err(msg);
+        }
+
+        // 1. Uninstall existing torch packages
+        let _ = on_log.send(
+            "[LS-Trainer] Running: pip uninstall -y torch torchvision torchaudio".to_string(),
+        );
+        let mut uninstall_cmd = Command::new(&venv_python);
+        uninstall_cmd.args(["-m", "pip", "uninstall", "-y", "torch", "torchvision", "torchaudio"]);
+        uninstall_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            uninstall_cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        if let Ok(mut child) = uninstall_cmd.spawn() {
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let log_out = on_log.clone();
+            let t_out = std::thread::spawn(move || {
+                if let Some(out) = stdout {
+                    stream_reader_lines(out, &log_out);
+                }
+            });
+            let log_err = on_log.clone();
+            let t_err = std::thread::spawn(move || {
+                if let Some(err) = stderr {
+                    stream_reader_lines(err, &log_err);
+                }
+            });
+            let _ = t_out.join();
+            let _ = t_err.join();
+            let _ = child.wait();
+        }
+
+        // 2. Install the matching wheel
+        let _ = on_log.send(format!(
+            "[LS-Trainer] Running: pip install torch torchvision torchaudio --index-url {index_url}"
+        ));
+        let mut install_cmd = Command::new(&venv_python);
+        install_cmd.args([
+            "-m",
+            "pip",
+            "install",
+            "torch",
+            "torchvision",
+            "torchaudio",
+            "--index-url",
+            index_url,
+        ]);
+        install_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            install_cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        match install_cmd.spawn() {
+            Ok(mut child) => {
+                let stdout = child.stdout.take();
+                let stderr = child.stderr.take();
+                let log_out = on_log.clone();
+                let t_out = std::thread::spawn(move || {
+                    if let Some(out) = stdout {
+                        stream_reader_lines(out, &log_out);
+                    }
+                });
+                let log_err = on_log.clone();
+                let t_err = std::thread::spawn(move || {
+                    if let Some(err) = stderr {
+                        stream_reader_lines(err, &log_err);
+                    }
+                });
+                let _ = t_out.join();
+                let _ = t_err.join();
+                let status = child
+                    .wait()
+                    .map_err(|e| format!("Failed waiting for pip install: {e}"))?;
+                if !status.success() {
+                    let _ = on_log.send(format!(
+                        "[LS-Trainer] Warning: pip install exited with status {:?}. Verifying environment...",
+                        status.code()
+                    ));
+                }
+            }
+            Err(e) => {
+                let err_msg = format!("Failed to start pip install: {e}");
+                let _ = on_log.send(format!("[LS-Trainer Error] {err_msg}"));
+                return Err(err_msg);
+            }
+        }
+
+        // Record marker so we know this wheel tier was provisioned
+        let marker_path = project_root.join(".venv").join(".ls_trainer_wheel");
+        let _ = std::fs::write(&marker_path, wheel_id);
+
+        let updated_info = detect_gpu_info(&project_root);
+        if updated_info.cuda_available {
+            let _ = on_log.send(format!(
+                "[LS-Trainer] CUDA verified! Device: {} ({})",
+                updated_info.device_name.as_deref().unwrap_or("GPU"),
+                updated_info.torch_version.as_deref().unwrap_or("torch")
+            ));
+        } else {
+            let _ = on_log.send(
+                "[LS-Trainer] CPU fallback confirmed. Ready for training.".to_string(),
+            );
+        }
+        let _ = on_log.send(format!(
+            "[LS-Trainer Status] {}",
+            updated_info.status_summary
+        ));
+
+        Ok(updated_info)
+    })
+    .await
+    .map_err(|e| format!("Repair task panicked: {e}"))?
 }
 
 fn is_cuda_available(project_root: &Path) -> bool {
@@ -441,6 +870,179 @@ async fn pick_model_file() -> Option<String> {
     file.map(|f| to_display_path(f.path()))
 }
 
+fn resolve_or_download_model_weights(
+    project_root: &Path,
+    raw_model_choice: &str,
+    on_log: &Channel<String>,
+) -> String {
+    let trimmed = raw_model_choice.trim().trim_matches('"');
+    if trimmed.is_empty() {
+        return "yolo11m.pt".to_string();
+    }
+
+    let as_path = Path::new(trimmed);
+    if as_path.is_file() {
+        return trimmed.to_string();
+    }
+    let rel_to_root = project_root.join(trimmed);
+    if rel_to_root.is_file() {
+        return rel_to_root.to_string_lossy().to_string();
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return trimmed.to_string();
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let weight_filename = if lower.ends_with(".pt") {
+        lower
+    } else {
+        format!("{lower}.pt")
+    };
+
+    let candidate_paths = [
+        project_root.join("models").join(&weight_filename),
+        project_root.join(&weight_filename),
+        project_root.join("src-tauri").join(&weight_filename),
+    ];
+
+    for candidate in &candidate_paths {
+        if candidate.is_file()
+            && candidate
+                .metadata()
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        {
+            let _ = on_log.send(format!(
+                "[LS-Trainer] Using cached model weights: {}",
+                candidate.display()
+            ));
+            return candidate.to_string_lossy().to_string();
+        }
+    }
+
+    let models_dir = project_root.join("models");
+    let _ = std::fs::create_dir_all(&models_dir);
+    let target_weight_path = models_dir.join(&weight_filename);
+
+    #[cfg(target_os = "windows")]
+    let python_exe = project_root.join(".venv").join("Scripts").join("python.exe");
+    #[cfg(not(target_os = "windows"))]
+    let python_exe = project_root.join(".venv").join("bin").join("python");
+    if python_exe.is_file() {
+        let _ = on_log.send(format!(
+            "[LS-Trainer] Model '{weight_filename}' not cached locally. Downloading from Ultralytics assets..."
+        ));
+        let _ = on_log.send(format!(
+            "[LS-Trainer Status] Downloading {weight_filename}…"
+        ));
+
+        let script = "import sys; from ultralytics.utils.downloads import attempt_download_asset; p = attempt_download_asset(sys.argv[1]); print(f'[LS-Trainer] Downloaded model asset: {p}', flush=True)";
+        let mut dl_cmd = Command::new(&python_exe);
+        dl_cmd
+            .args(["-c", script, &weight_filename])
+            .current_dir(&models_dir)
+            .env("PYTHONUNBUFFERED", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        #[cfg(windows)]
+        {
+            dl_cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        if let Ok(mut child) = dl_cmd.spawn() {
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+
+            let on_log_out = on_log.clone();
+            let out_t = std::thread::spawn(move || {
+                if let Some(out) = stdout {
+                    stream_reader_lines(out, &on_log_out);
+                }
+            });
+
+            let on_log_err = on_log.clone();
+            let err_t = std::thread::spawn(move || {
+                if let Some(err) = stderr {
+                    stream_reader_lines(err, &on_log_err);
+                }
+            });
+
+            let _ = out_t.join();
+            let _ = err_t.join();
+            let _ = child.wait();
+        }
+
+        if target_weight_path.is_file()
+            && target_weight_path
+                .metadata()
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        {
+            let _ = on_log.send(format!(
+                "[LS-Trainer] Model cached at: {}",
+                target_weight_path.display()
+            ));
+            return target_weight_path.to_string_lossy().to_string();
+        }
+    }
+
+    weight_filename
+}
+
+fn save_run_config_metadata(
+    abs_results_dir: &Path,
+    request: &TrainingRequest,
+    resolved_model: &str,
+    effective_device: &str,
+    exact_command: &str,
+    on_log: &Channel<String>,
+) {
+    if std::fs::create_dir_all(abs_results_dir).is_err() {
+        return;
+    }
+
+    let config_path = abs_results_dir.join("ls_trainer_config.json");
+    let effective_freeze = if request.freeze_backbone {
+        request.freeze_layers.max(1)
+    } else {
+        0
+    };
+
+    let payload = serde_json::json!({
+        "run_name": request.run_name,
+        "dataset_path": request.dataset_path,
+        "model_choice": request.model_choice,
+        "resolved_model": resolved_model,
+        "freeze_backbone": request.freeze_backbone,
+        "freeze_layers": effective_freeze,
+        "epochs": request.epochs,
+        "batch": request.batch,
+        "imgsz": request.imgsz,
+        "device": effective_device,
+        "amp": request.amp,
+        "augmentation": {
+            "mosaic": request.mosaic,
+            "mixup": request.mixup,
+            "copy_paste": request.copy_paste,
+            "degrees": request.degrees,
+            "translate": request.translate,
+            "scale": request.scale,
+        },
+        "command": exact_command,
+    });
+
+    if let Ok(serialized) = serde_json::to_string_pretty(&payload) {
+        if std::fs::write(&config_path, serialized).is_ok() {
+            let _ = on_log.send(format!(
+                "[LS-Trainer] Saved run settings to: {}",
+                config_path.display()
+            ));
+        }
+    }
+}
+
 #[tauri::command]
 async fn start_training(
     _app: tauri::AppHandle,
@@ -517,8 +1119,12 @@ async fn start_training(
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| project_root.clone());
 
+    let resolved_model =
+        resolve_or_download_model_weights(&project_root, &request.model_choice, &on_log);
+    let _ = on_log.send("[LS-Trainer Status] Training in progress...".to_string());
+
     let data_arg = format!("data={data_str}");
-    let model_arg = format!("model={}", request.model_choice);
+    let model_arg = format!("model={resolved_model}");
     let name_arg = format!("name={run_name}");
     let epochs_arg = format!("epochs={}", request.epochs);
     let batch_arg = format!("batch={}", request.batch);
@@ -526,7 +1132,33 @@ async fn start_training(
     let amp_arg = format!("amp={}", if request.amp { "True" } else { "False" });
     let mosaic_arg = format!("mosaic={}", request.mosaic);
     let mixup_arg = format!("mixup={}", request.mixup);
+    let copy_paste_arg = format!("copy_paste={}", request.copy_paste);
+    let degrees_arg = format!("degrees={}", request.degrees);
+    let translate_arg = format!("translate={}", request.translate);
     let scale_arg = format!("scale={}", request.scale);
+    let freeze_layers_val = request.freeze_layers.max(1);
+    let freeze_arg_opt = if request.freeze_backbone {
+        Some(format!("freeze={freeze_layers_val}"))
+    } else {
+        None
+    };
+
+    let _ = on_log.send(format!(
+        "[LS-Trainer] Active config: model={} | freeze={} | mosaic={} | mixup={} | copy_paste={} | degrees={} | translate={} | scale={} | amp={}",
+        request.model_choice,
+        if request.freeze_backbone {
+            format!("{freeze_layers_val} layers")
+        } else {
+            "none (0)".to_string()
+        },
+        request.mosaic,
+        request.mixup,
+        request.copy_paste,
+        request.degrees,
+        request.translate,
+        request.scale,
+        request.amp
+    ));
 
     let device_input = request.device.trim();
     let effective_device = if device_input.is_empty() || device_input.eq_ignore_ascii_case("auto") {
@@ -560,6 +1192,32 @@ async fn start_training(
     let project_runs_str = project_runs_dir.to_string_lossy().replace('\\', "/");
     let project_arg = format!("project={project_runs_str}");
 
+    let mut train_args: Vec<String> = vec![
+        "detect".to_string(),
+        "train".to_string(),
+        data_arg,
+        model_arg,
+        name_arg,
+        project_arg,
+        epochs_arg,
+        batch_arg,
+        imgsz_arg,
+        device_arg,
+        amp_arg,
+    ];
+    if let Some(ref f_arg) = freeze_arg_opt {
+        train_args.push(f_arg.clone());
+    }
+    train_args.extend([
+        mosaic_arg,
+        mixup_arg,
+        copy_paste_arg,
+        degrees_arg,
+        translate_arg,
+        scale_arg,
+    ]);
+    let joined_train_args = train_args.join(" ");
+
     let (mut cmd, exact_command) = if expected_venv_yolo.is_file() {
         let _ = on_log.send(format!(
             "[LS-Trainer] Using local venv YOLO executable: {}",
@@ -567,25 +1225,10 @@ async fn start_training(
         ));
 
         let mut c = Command::new(&expected_venv_yolo);
-        c.args([
-            "detect",
-            "train",
-            &data_arg,
-            &model_arg,
-            &name_arg,
-            &project_arg,
-            &epochs_arg,
-            &batch_arg,
-            &imgsz_arg,
-            &device_arg,
-            &amp_arg,
-            &mosaic_arg,
-            &mixup_arg,
-            &scale_arg,
-        ]);
+        c.args(&train_args);
 
         let cmd_str = format!(
-            "\"{}\" detect train {data_arg} {model_arg} {name_arg} {project_arg} {epochs_arg} {batch_arg} {imgsz_arg} {device_arg} {amp_arg} {mosaic_arg} {mixup_arg} {scale_arg}",
+            "\"{}\" {joined_train_args}",
             expected_venv_yolo.display()
         );
 
@@ -599,52 +1242,19 @@ async fn start_training(
         #[cfg(target_os = "windows")]
         let c = {
             let mut cmd = Command::new("cmd");
-            cmd.args([
-                "/C",
-                "yolo",
-                "detect",
-                "train",
-                &data_arg,
-                &model_arg,
-                &name_arg,
-                &project_arg,
-                &epochs_arg,
-                &batch_arg,
-                &imgsz_arg,
-                &device_arg,
-                &amp_arg,
-                &mosaic_arg,
-                &mixup_arg,
-                &scale_arg,
-            ]);
+            cmd.args(["/C", "yolo"]);
+            cmd.args(&train_args);
             cmd
         };
 
         #[cfg(not(target_os = "windows"))]
         let c = {
             let mut cmd = Command::new("yolo");
-            cmd.args([
-                "detect",
-                "train",
-                &data_arg,
-                &model_arg,
-                &name_arg,
-                &project_arg,
-                &epochs_arg,
-                &batch_arg,
-                &imgsz_arg,
-                &device_arg,
-                &amp_arg,
-                &mosaic_arg,
-                &mixup_arg,
-                &scale_arg,
-            ]);
+            cmd.args(&train_args);
             cmd
         };
 
-        let cmd_str = format!(
-            "yolo detect train {data_arg} {model_arg} {name_arg} {project_arg} {epochs_arg} {batch_arg} {imgsz_arg} {device_arg} {amp_arg} {mosaic_arg} {mixup_arg} {scale_arg}"
-        );
+        let cmd_str = format!("yolo {joined_train_args}");
 
         (c, cmd_str)
     };
@@ -658,7 +1268,10 @@ async fn start_training(
         dataset_working_dir.display()
     ));
 
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.env("PYTHONUNBUFFERED", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     #[cfg(windows)]
     {
@@ -673,20 +1286,14 @@ async fn start_training(
             let on_log_stdout = on_log.clone();
             let stdout_thread = std::thread::spawn(move || {
                 if let Some(out) = stdout {
-                    let reader = BufReader::new(out);
-                    for line in reader.lines().map_while(Result::ok) {
-                        let _ = on_log_stdout.send(line);
-                    }
+                    stream_reader_lines(out, &on_log_stdout);
                 }
             });
 
             let on_log_stderr = on_log.clone();
             let stderr_thread = std::thread::spawn(move || {
                 if let Some(err) = stderr {
-                    let reader = BufReader::new(err);
-                    for line in reader.lines().map_while(Result::ok) {
-                        let _ = on_log_stderr.send(line);
-                    }
+                    stream_reader_lines(err, &on_log_stderr);
                 }
             });
 
@@ -696,6 +1303,15 @@ async fn start_training(
             let status = child
                 .wait()
                 .map_err(|e| format!("Failed while waiting for YOLO: {e}"))?;
+
+            save_run_config_metadata(
+                &abs_results_dir,
+                &request,
+                &resolved_model,
+                &effective_device,
+                &exact_command,
+                &on_log,
+            );
 
             if status.success() {
                 let _ = on_log.send(format!(
@@ -719,6 +1335,15 @@ async fn start_training(
             }
         }
         Err(err) => {
+            save_run_config_metadata(
+                &abs_results_dir,
+                &request,
+                &resolved_model,
+                &effective_device,
+                &exact_command,
+                &on_log,
+            );
+
             let _ = on_log.send(format!(
                 "[LS-Trainer] Notice: Could not launch YOLO process directly ({err})."
             ));
@@ -972,7 +1597,10 @@ async fn export_to_onnx(
 
     let parent_dir = best_pt.parent().unwrap_or(&results_path);
     cmd.current_dir(parent_dir);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.env("PYTHONUNBUFFERED", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     #[cfg(windows)]
     {
@@ -987,20 +1615,14 @@ async fn export_to_onnx(
             let on_log_stdout = on_log.clone();
             let stdout_thread = std::thread::spawn(move || {
                 if let Some(out) = stdout {
-                    let reader = BufReader::new(out);
-                    for line in reader.lines().map_while(Result::ok) {
-                        let _ = on_log_stdout.send(line);
-                    }
+                    stream_reader_lines(out, &on_log_stdout);
                 }
             });
 
             let on_log_stderr = on_log.clone();
             let stderr_thread = std::thread::spawn(move || {
                 if let Some(err) = stderr {
-                    let reader = BufReader::new(err);
-                    for line in reader.lines().map_while(Result::ok) {
-                        let _ = on_log_stderr.send(line);
-                    }
+                    stream_reader_lines(err, &on_log_stderr);
                 }
             });
 
@@ -1076,7 +1698,8 @@ pub fn run() {
             start_training,
             open_folder,
             export_to_onnx,
-            get_gpu_info
+            get_gpu_info,
+            repair_cuda
         ])
         .run(tauri::generate_context!())
         .expect("error while building tauri application");

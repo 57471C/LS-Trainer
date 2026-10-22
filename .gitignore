@@ -29,6 +29,7 @@ __pycache__/
 # Training outputs & datasets
 runs/
 datasets/
+models/
 *.pt
 *.tar
 *.tar.gz
