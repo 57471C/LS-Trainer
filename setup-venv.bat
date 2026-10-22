@@ -170,44 +170,91 @@ if !ERRORLEVEL! NEQ 0 (
 )
 
 :GPU_CHECK
-REM 5. Check GPU / CUDA availability
+REM 5. Auto-detect GPU & driver and install matching PyTorch CUDA wheel
 echo.
-echo [*] Checking GPU / CUDA availability...
-"%VENV_PYTHON%" -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"
+echo [*] Detecting GPU and NVIDIA driver version...
 
-set "CUDA_AVAILABLE=False"
-for /f "usebackq delims=" %%G in (`"%VENV_PYTHON%" -c "import torch; print(torch.cuda.is_available())" 2^>nul`) do (
-    set "CUDA_AVAILABLE=%%G"
+set "TARGET_WHEEL=cpu"
+set "TARGET_URL=https://download.pytorch.org/whl/cpu"
+set "CUDA_LABEL=CPU-only"
+set "GPU_DISPLAY=CPU"
+
+for /f "usebackq tokens=1,2,3,4 delims=|" %%A in (`"%VENV_PYTHON%" -c "import subprocess, re; name=''; drv=''; major=0;
+try:
+    out = subprocess.check_output(['nvidia-smi', '--query-gpu=name,driver_version', '--format=csv,noheader'], text=True, stderr=subprocess.DEVNULL).splitlines()[0]
+    parts = [p.strip() for p in out.split(',')]
+    name = parts[0] if parts else ''
+    drv = parts[1] if len(parts)>1 else ''
+except Exception:
+    try:
+        out = subprocess.check_output(['powershell', '-NoProfile', '-Command', \"Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' } | Select-Object -First 1 -Property Name,DriverVersion | ForEach-Object { '$($_.Name)|$($_.DriverVersion)' }\"], text=True, stderr=subprocess.DEVNULL).strip()
+        if '|' in out:
+            name, raw_d = out.split('|', 1)
+            digits = re.sub(r'\D', '', raw_d)
+            if len(digits) >= 5:
+                drv = digits[-5:-2] + '.' + digits[-2:]
+    except Exception:
+        pass
+if drv:
+    try: major = int(drv.split('.')[0])
+    except Exception: major = 0
+low = name.lower()
+is_bw = any(k in low for k in ['rtx 50', 'rtx50', 'blackwell', 'gb10', 'gb20', 'b100', 'b200'])
+if name:
+    if is_bw or major >= 560:
+        print(f'cu128|https://download.pytorch.org/whl/cu128|CUDA 12.8|{name}')
+    else:
+        print(f'cu124|https://download.pytorch.org/whl/cu124|CUDA 12.4|{name}')
+else:
+    print('cpu|https://download.pytorch.org/whl/cpu|CPU-only|No NVIDIA GPU')" 2^>nul`) do (
+    set "TARGET_WHEEL=%%A"
+    set "TARGET_URL=%%B"
+    set "CUDA_LABEL=%%C"
+    set "GPU_DISPLAY=%%D"
 )
 
-if /i "!CUDA_AVAILABLE!"=="True" (
-    echo [*] GPU acceleration is available for training.
-    goto :COMPLETED
-)
+echo [*] Detected Device: !GPU_DISPLAY! ^(!CUDA_LABEL! - !TARGET_WHEEL!^)
 
-REM Check if CUDA wheels are already installed
-set "TORCH_HAS_CU=False"
-for /f "usebackq delims=" %%G in (`"%VENV_PYTHON%" -c "import torch; print('+cu' in torch.__version__)" 2^>nul`) do (
-    set "TORCH_HAS_CU=%%G"
-)
-
-if /i "!TORCH_HAS_CU!"=="True" (
-    echo [*] CUDA 12.4 PyTorch wheels are already installed.
+if /i "!TARGET_WHEEL!"=="cpu" (
+    echo [*] No NVIDIA GPU detected. Verifying CPU-only PyTorch wheel...
+    echo cpu> "%VENV_DIR%\.ls_trainer_wheel"
     goto :CUDA_STILL_CPU
 )
 
-echo [*] CUDA is not available in default PyTorch.
-echo [*] Reinstalling CUDA 12.4 PyTorch wheels from https://download.pytorch.org/whl/cu124...
-"%VENV_PYTHON%" -m pip uninstall -y torch torchvision torchaudio
-"%VENV_PYTHON%" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-if !ERRORLEVEL! NEQ 0 (
-    echo [!] Warning: CUDA 12.4 wheels not available for this environment. Reinstalling default PyTorch...
-    "%VENV_PYTHON%" -m pip install torch torchvision
+REM Check if the exact target wheel is already installed and working on the GPU
+set "WHEEL_READY=False"
+for /f "usebackq delims=" %%G in (`"%VENV_PYTHON%" -c "import torch; ver=getattr(torch,'__version__',''); avail=torch.cuda.is_available(); kok=False
+if avail:
+    try:
+        _ = torch.zeros(1, device='cuda') + 1
+        torch.cuda.synchronize()
+        kok = True
+    except Exception:
+        kok = False
+req = '+!TARGET_WHEEL!'
+print(avail and kok and (req in ver))" 2^>nul`) do (
+    set "WHEEL_READY=%%G"
 )
+
+if /i "!WHEEL_READY!"=="True" (
+    echo [*] Matching PyTorch wheel ^(!TARGET_WHEEL!^) is already installed and verified.
+    echo !TARGET_WHEEL!> "%VENV_DIR%\.ls_trainer_wheel"
+    goto :COMPLETED
+)
+
+echo [*] Installing PyTorch for !GPU_DISPLAY! ^(!CUDA_LABEL!^) from !TARGET_URL!...
+"%VENV_PYTHON%" -m pip uninstall -y torch torchvision torchaudio
+"%VENV_PYTHON%" -m pip install torch torchvision torchaudio --index-url !TARGET_URL!
+if !ERRORLEVEL! NEQ 0 (
+    echo [!] Warning: !CUDA_LABEL! wheels failed to install. Reinstalling fallback PyTorch...
+    "%VENV_PYTHON%" -m pip install torch torchvision torchaudio
+)
+
+echo !TARGET_WHEEL!> "%VENV_DIR%\.ls_trainer_wheel"
 
 echo.
 echo [*] Re-checking GPU / CUDA availability...
-"%VENV_PYTHON%" -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"
+"%VENV_PYTHON%" -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('PyTorch version:', torch.__version__); print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"
 
 set "CUDA_AVAILABLE=False"
 for /f "usebackq delims=" %%G in (`"%VENV_PYTHON%" -c "import torch; print(torch.cuda.is_available())" 2^>nul`) do (

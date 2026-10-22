@@ -4,7 +4,18 @@ import { onMount } from "svelte";
 
 type ModelMode = "continue" | "fresh";
 type ImageSize = 640 | 960 | 1280;
-type YoloModel = "yolo11n" | "yolo11s" | "yolo11m" | "yolo11l" | "yolo11x";
+type YoloModel =
+	| "yolo11n.pt"
+	| "yolo11s.pt"
+	| "yolo11m.pt"
+	| "yolo11l.pt"
+	| "yolo11x.pt"
+	| "yolo26n.pt"
+	| "yolo26s.pt"
+	| "yolo26m.pt"
+	| "yolo26l.pt"
+	| "yolo26x.pt";
+type AugPreset = "off" | "light" | "medium" | "custom";
 
 interface TrainingResponse {
 	success: boolean;
@@ -20,15 +31,82 @@ interface ExportResponse {
 
 interface GpuInfo {
 	cuda_available: boolean;
+	cpu_fallback_confirmed: boolean;
 	device_name: string | null;
+	driver_version: string | null;
+	recommended_wheel: string;
+	cuda_label: string;
+	torch_version: string | null;
+	needs_repair: boolean;
+	status_summary: string;
 }
 
-const freshModelOptions: { id: YoloModel; label: string; desc: string }[] = [
-	{ id: "yolo11n", label: "yolo11n", desc: "Nano (fastest, lightweight)" },
-	{ id: "yolo11s", label: "yolo11s", desc: "Small (balanced fast)" },
-	{ id: "yolo11m", label: "yolo11m", desc: "Medium (high accuracy)" },
-	{ id: "yolo11l", label: "yolo11l", desc: "Large (extra accuracy)" },
-	{ id: "yolo11x", label: "yolo11x", desc: "XLarge (maximum capacity)" },
+const freshModelOptions: {
+	id: YoloModel;
+	family: "YOLO11" | "YOLO26";
+	label: string;
+	desc: string;
+}[] = [
+	{
+		id: "yolo11n.pt",
+		family: "YOLO11",
+		label: "YOLO11n",
+		desc: "Nano (fastest, lightweight)",
+	},
+	{
+		id: "yolo11s.pt",
+		family: "YOLO11",
+		label: "YOLO11s",
+		desc: "Small (balanced fast)",
+	},
+	{
+		id: "yolo11m.pt",
+		family: "YOLO11",
+		label: "YOLO11m",
+		desc: "Medium (default, high accuracy)",
+	},
+	{
+		id: "yolo11l.pt",
+		family: "YOLO11",
+		label: "YOLO11l",
+		desc: "Large (extra accuracy)",
+	},
+	{
+		id: "yolo11x.pt",
+		family: "YOLO11",
+		label: "YOLO11x",
+		desc: "XLarge (maximum capacity)",
+	},
+	{
+		id: "yolo26n.pt",
+		family: "YOLO26",
+		label: "YOLO26n",
+		desc: "Nano (next-gen lightweight)",
+	},
+	{
+		id: "yolo26s.pt",
+		family: "YOLO26",
+		label: "YOLO26s",
+		desc: "Small (next-gen balanced)",
+	},
+	{
+		id: "yolo26m.pt",
+		family: "YOLO26",
+		label: "YOLO26m",
+		desc: "Medium (next-gen high accuracy)",
+	},
+	{
+		id: "yolo26l.pt",
+		family: "YOLO26",
+		label: "YOLO26l",
+		desc: "Large (next-gen extra accuracy)",
+	},
+	{
+		id: "yolo26x.pt",
+		family: "YOLO26",
+		label: "YOLO26x",
+		desc: "XLarge (next-gen maximum capacity)",
+	},
 ];
 
 let datasetPath = $state<string>("");
@@ -36,7 +114,9 @@ let datasetFileName = $state<string>("");
 let modelMode = $state<ModelMode>("fresh");
 let existingModelPath = $state<string>("");
 let existingModelFileName = $state<string>("");
-let freshModel = $state<YoloModel>("yolo11n");
+let freshModel = $state<YoloModel>("yolo11m.pt");
+let freezeBackbone = $state<boolean>(false);
+const freezeLayersCount = 10;
 let runName = $state<string>("");
 let epochs = $state<number>(60);
 let batch = $state<number>(4);
@@ -45,17 +125,258 @@ let device = $state<string>("0");
 let isCustomDevice = $state<boolean>(false);
 let customDevice = $state<string>("");
 let gpuInfo = $state<GpuInfo | null>(null);
+let isCheckingGpu = $state<boolean>(true);
+let isRepairingCuda = $state<boolean>(false);
 
-// Advanced knobs
+// Training & Augmentation controls
 let amp = $state<boolean>(true);
 let mosaic = $state<number>(0.0);
 let mixup = $state<number>(0.0);
+let copyPaste = $state<boolean>(false);
+let degrees = $state<number>(0.0);
+let translate = $state<number>(0.1);
 let scale = $state<number>(0.2);
 
 let activeTooltip = $state<string | null>(null);
 
+const activeAugPreset = $derived.by<AugPreset>(() => {
+	if (
+		mosaic === 0.0 &&
+		mixup === 0.0 &&
+		!copyPaste &&
+		degrees === 0.0 &&
+		translate === 0.0 &&
+		scale === 0.0
+	) {
+		return "off";
+	}
+	if (
+		mosaic === 0.0 &&
+		mixup === 0.0 &&
+		!copyPaste &&
+		degrees === 0.0 &&
+		translate === 0.1 &&
+		scale === 0.2
+	) {
+		return "light";
+	}
+	if (
+		mosaic === 0.5 &&
+		mixup === 0.1 &&
+		!copyPaste &&
+		degrees === 5.0 &&
+		translate === 0.1 &&
+		scale === 0.4
+	) {
+		return "medium";
+	}
+	return "custom";
+});
+
+function applyAugPreset(preset: "off" | "light" | "medium") {
+	if (isTraining) return;
+	if (preset === "off") {
+		mosaic = 0.0;
+		mixup = 0.0;
+		copyPaste = false;
+		degrees = 0.0;
+		translate = 0.0;
+		scale = 0.0;
+	} else if (preset === "light") {
+		mosaic = 0.0;
+		mixup = 0.0;
+		copyPaste = false;
+		degrees = 0.0;
+		translate = 0.1;
+		scale = 0.2;
+	} else if (preset === "medium") {
+		mosaic = 0.5;
+		mixup = 0.1;
+		copyPaste = false;
+		degrees = 5.0;
+		translate = 0.1;
+		scale = 0.4;
+	}
+}
+
+const activeModelLabel = $derived.by(() => {
+	if (modelMode === "continue") {
+		return existingModelFileName.trim() || "Custom .pt";
+	}
+	const found = freshModelOptions.find((o) => o.id === freshModel);
+	return found ? found.label : freshModel;
+});
+
+const activeFreezeLabel = $derived(
+	freezeBackbone ? `freeze=${freezeLayersCount}` : "unfrozen",
+);
+
+const activeAugSummary = $derived(
+	`mosaic=${mosaic} · mixup=${mixup} · copy_paste=${copyPaste ? "on" : "off"} · deg=${degrees} · trans=${translate} · scale=${scale}`,
+);
+
+const activeRunConfigBanner = $derived(
+	`${activeModelLabel} · ${activeFreezeLabel} · ${activeAugSummary}`,
+);
+
+// Epoch countdown & rolling ETA tracking
+let currentEpoch = $state<number>(0);
+let totalEpochs = $state<number>(0);
+let currentEpochStartTime = $state<number | null>(null);
+let recentEpochDurations = $state<number[]>([]);
+let firstEpochEstimatedSec = $state<number | null>(null);
+
+const remainingEpochs = $derived(Math.max(0, totalEpochs - currentEpoch));
+const rollingAvgEpochSec = $derived(
+	recentEpochDurations.length > 0
+		? recentEpochDurations.reduce((sum, d) => sum + d, 0) /
+				recentEpochDurations.length
+		: firstEpochEstimatedSec,
+);
+const epochEtaLabel = $derived.by(() => {
+	if (currentEpoch <= 0 || totalEpochs <= 0) return "";
+	if (!isTraining && remainingEpochs === 0) return "Complete";
+	if (rollingAvgEpochSec === null || rollingAvgEpochSec <= 0) {
+		return "estimating…";
+	}
+	const secLeft = remainingEpochs * rollingAvgEpochSec;
+	if (secLeft < 45) {
+		return `~${Math.max(1, Math.round(secLeft))} sec left`;
+	}
+	const mins = Math.max(1, Math.round(secLeft / 60));
+	return `~${mins} min left`;
+});
+const epochCountdownText = $derived(
+	currentEpoch > 0 && totalEpochs > 0
+		? `Epoch ${currentEpoch} / ${totalEpochs}   (${remainingEpochs} remaining)   ${epochEtaLabel}`
+		: "",
+);
+const epochProgressPercent = $derived(
+	totalEpochs > 0
+		? Math.min(100, Math.round((currentEpoch / totalEpochs) * 100))
+		: 0,
+);
+
+function shortenGpuName(name: string): string {
+	return name
+		.replace(/^NVIDIA GeForce\s+/i, "")
+		.replace(/^NVIDIA\s+/i, "")
+		.trim();
+}
+
+function processIncomingLogLine(line: string) {
+	if (line.startsWith("[LS-Trainer Status] ")) {
+		statusMessage = line.replace("[LS-Trainer Status] ", "").trim();
+		return;
+	}
+
+	// Detect Ultralytics epoch progress row e.g. "     12/80      2.41G ..." or "Epoch 12/80"
+	const yoloRowMatch =
+		line.match(/^\s*(\d+)\s*\/\s*(\d+)\s+\S+\s+\d+(?:\.\d+)?/) ||
+		line.match(/^\s*(\d+)\s*\/\s*(\d+)\s+.*?\d+%\|/) ||
+		line.match(/epochs?\s*\(?(\d+)\s*\/\s*(\d+)\)?/i);
+
+	if (yoloRowMatch) {
+		const ep = Number(yoloRowMatch[1]);
+		const tot = Number(yoloRowMatch[2]);
+		if (ep >= 1 && tot >= 1 && ep <= tot) {
+			const now = Date.now();
+			if (ep !== currentEpoch) {
+				if (
+					currentEpoch > 0 &&
+					currentEpochStartTime !== null &&
+					ep > currentEpoch
+				) {
+					const elapsedSec =
+						(now - currentEpochStartTime) / (1000 * (ep - currentEpoch));
+					if (elapsedSec > 0.02) {
+						recentEpochDurations = [
+							...recentEpochDurations.slice(-4),
+							elapsedSec,
+						];
+					}
+				}
+				currentEpoch = ep;
+				totalEpochs = tot;
+				currentEpochStartTime = now;
+			}
+
+			// Parse tqdm [MM:SS<MM:SS] for first-epoch ETA before a full epoch transition completes
+			const tqdmTimeMatch = line.match(/\[(\d+):(\d+)<(\d+):(\d+)/);
+			if (tqdmTimeMatch) {
+				const elap = Number(tqdmTimeMatch[1]) * 60 + Number(tqdmTimeMatch[2]);
+				const rem = Number(tqdmTimeMatch[3]) * 60 + Number(tqdmTimeMatch[4]);
+				if (elap + rem > 0) {
+					firstEpochEstimatedSec = elap + rem;
+				}
+			}
+
+			// Replace in-place if the previous log line is an incomplete tqdm bar for the same epoch
+			const isTqdmBar = /\d+%\|/.test(line);
+			if (isTqdmBar && logs.length > 0) {
+				const prev = logs[logs.length - 1];
+				const prevMatch = prev.match(/^\s*(\d+)\s*\/\s*(\d+)\s+/);
+				if (
+					prevMatch &&
+					Number(prevMatch[1]) === ep &&
+					Number(prevMatch[2]) === tot &&
+					!/100%\|/.test(prev)
+				) {
+					logs[logs.length - 1] = line;
+					return;
+				}
+			}
+		}
+	}
+
+	logs = [...logs, line];
+}
+
+async function handleRepairCuda() {
+	if (isTraining || isRepairingCuda) {
+		return;
+	}
+	isRepairingCuda = true;
+	isLogPanelOpen = true;
+
+	if (gpuInfo?.device_name) {
+		statusMessage = `Installing PyTorch for ${shortenGpuName(gpuInfo.device_name)} (${gpuInfo.cuda_label})…`;
+	} else {
+		statusMessage = "Detecting GPU and installing matching PyTorch wheel…";
+	}
+
+	if (isTauri()) {
+		try {
+			const onLog = new Channel<string>();
+			onLog.onmessage = (message) => {
+				processIncomingLogLine(message);
+			};
+			const updated = await invoke<GpuInfo>("repair_cuda", { onLog });
+			gpuInfo = updated;
+			device = updated.cuda_available ? "0" : "cpu";
+			statusMessage = updated.status_summary;
+		} catch (err) {
+			const errMsg = err instanceof Error ? err.message : String(err);
+			logs = [...logs, `[LS-Trainer Error] ${errMsg}`];
+			statusMessage = "CUDA repair encountered an error";
+		} finally {
+			isRepairingCuda = false;
+		}
+	} else {
+		logs = [
+			...logs,
+			"[LS-Trainer] Simulated CUDA repair in Browser Mode",
+			"[LS-Trainer] Verified PyTorch environment.",
+		];
+		statusMessage = "Ready";
+		isRepairingCuda = false;
+	}
+}
+
 onMount(async () => {
 	if (isTauri()) {
+		isCheckingGpu = true;
+		statusMessage = "Checking GPU and PyTorch CUDA environment…";
 		try {
 			gpuInfo = await invoke<GpuInfo>("get_gpu_info");
 			if (gpuInfo.cuda_available) {
@@ -63,9 +384,19 @@ onMount(async () => {
 			} else {
 				device = "cpu";
 			}
+			statusMessage = gpuInfo.status_summary || "Ready";
+			isCheckingGpu = false;
+
+			if (gpuInfo.needs_repair) {
+				await handleRepairCuda();
+			}
 		} catch (e) {
 			console.error("Failed to query GPU info:", e);
+			statusMessage = "Ready";
+			isCheckingGpu = false;
 		}
+	} else {
+		isCheckingGpu = false;
 	}
 });
 
@@ -96,8 +427,15 @@ const isModelSelected = $derived(
 		? Boolean(existingModelPath.trim() || existingModelFileName.trim())
 		: Boolean(freshModel),
 );
+const isTorchReady = $derived(
+	!isCheckingGpu &&
+		!isRepairingCuda &&
+		(gpuInfo === null
+			? !isTauri()
+			: Boolean(gpuInfo.cuda_available || gpuInfo.cpu_fallback_confirmed)),
+);
 const isFormValid = $derived(
-	isDatasetSelected && isModelSelected && !isTraining,
+	isDatasetSelected && isModelSelected && !isTraining && isTorchReady,
 );
 
 $effect(() => {
@@ -259,6 +597,11 @@ async function handleStartTraining() {
 	onnxError = null;
 	hasCopiedResultsPath = false;
 	hasCopiedOnnxPath = false;
+	currentEpoch = 0;
+	totalEpochs = Number(epochs);
+	currentEpochStartTime = null;
+	recentEpochDurations = [];
+	firstEpochEstimatedSec = null;
 	statusMessage = "Training in progress...";
 
 	const effectiveRunName = runName.trim() || "BB-Parts-v3";
@@ -268,6 +611,7 @@ async function handleStartTraining() {
 			? existingModelPath.trim() || existingModelFileName.trim()
 			: freshModel;
 
+	const effectiveCopyPaste = copyPaste ? 0.3 : 0.0;
 	const requestPayload = {
 		dataset_path: effectiveDataset,
 		model_choice: effectiveModel,
@@ -277,8 +621,13 @@ async function handleStartTraining() {
 		imgsz: Number(imageSize),
 		device,
 		amp: Boolean(amp),
+		freeze_backbone: Boolean(freezeBackbone),
+		freeze_layers: freezeLayersCount,
 		mosaic: Number(mosaic),
 		mixup: Number(mixup),
+		copy_paste: effectiveCopyPaste,
+		degrees: Number(degrees),
+		translate: Number(translate),
 		scale: Number(scale),
 	};
 
@@ -288,7 +637,7 @@ async function handleStartTraining() {
 		try {
 			const onLog = new Channel<string>();
 			onLog.onmessage = (message) => {
-				logs = [...logs, message];
+				processIncomingLogLine(message);
 			};
 
 			const response = await invoke<TrainingResponse>("start_training", {
@@ -296,6 +645,9 @@ async function handleStartTraining() {
 				request: requestPayload,
 			});
 
+			if (response.success && totalEpochs > 0) {
+				currentEpoch = totalEpochs;
+			}
 			resultsDir = normalizePath(response.results_dir);
 			statusMessage = response.success
 				? `Finished — ${normalizePath(response.results_dir)}`
@@ -309,14 +661,18 @@ async function handleStartTraining() {
 		}
 	} else {
 		// Browser development preview simulation
+		const freezeArgStr = freezeBackbone ? ` freeze=${freezeLayersCount}` : "";
 		logs = [
 			"[LS-Trainer] Running outside Tauri webview (Browser Mode)",
 			`[LS-Trainer] Simulated training run '${effectiveRunName}'`,
-			`[LS-Trainer] Command: yolo detect train data="${effectiveDataset}" model="${effectiveModel}" name="${effectiveRunName}" epochs=${epochs} batch=${batch} imgsz=${imageSize} device="${device}" amp=${amp} mosaic=${mosaic} mixup=${mixup} scale=${scale}`,
+			`[LS-Trainer] Active config: ${activeRunConfigBanner}`,
+			`[LS-Trainer] Command: yolo detect train data="${effectiveDataset}" model="${effectiveModel}" name="${effectiveRunName}" epochs=${epochs} batch=${batch} imgsz=${imageSize} device="${device}" amp=${amp}${freezeArgStr} mosaic=${mosaic} mixup=${mixup} copy_paste=${effectiveCopyPaste} degrees=${degrees} translate=${translate} scale=${scale}`,
 			"[LS-Trainer] Unpacking archive simulation complete.",
-			`[LS-Trainer] Starting YOLO11 epochs (1/${epochs})...`,
+			`[LS-Trainer] Starting ${activeModelLabel} epochs (1/${epochs})...`,
 			"[LS-Trainer] Training finished successfully.",
 		];
+		currentEpoch = Number(epochs);
+		totalEpochs = Number(epochs);
 		resultsDir = normalizePath(
 			`C:/Scripts/LS-Trainer/runs/detect/${effectiveRunName}/`,
 		);
@@ -457,7 +813,7 @@ async function handleExportToOnnx() {
 				</button>
 			{/if}
 			<span class="rounded border border-zinc-700/60 bg-zinc-800/80 px-2.5 py-0.5 font-mono text-xs text-zinc-400">
-				v0.1.2
+				v0.1.3
 			</span>
 		</div>
 	</header>
@@ -600,7 +956,7 @@ async function handleExportToOnnx() {
 							/>
 							<div>
 								<span class="block text-sm font-medium text-zinc-200">Start fresh</span>
-								<span class="block text-xs text-zinc-400">Initialize a pretrained YOLO11 base</span>
+								<span class="block text-xs text-zinc-400">Initialize a pretrained YOLO11 or YOLO26 base</span>
 							</div>
 						</label>
 
@@ -642,11 +998,20 @@ async function handleExportToOnnx() {
 								disabled={isTraining}
 								class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
 							>
-								{#each freshModelOptions as opt (opt.id)}
-									<option value={opt.id}>
-										{opt.label} — {opt.desc}
-									</option>
-								{/each}
+								<optgroup label="YOLO11 Series">
+									{#each freshModelOptions.filter((o) => o.family === "YOLO11") as opt (opt.id)}
+										<option value={opt.id}>
+											{opt.label} ({opt.id}) — {opt.desc}
+										</option>
+									{/each}
+								</optgroup>
+								<optgroup label="YOLO26 Series">
+									{#each freshModelOptions.filter((o) => o.family === "YOLO26") as opt (opt.id)}
+										<option value={opt.id}>
+											{opt.label} ({opt.id}) — {opt.desc}
+										</option>
+									{/each}
+								</optgroup>
 							</select>
 						</div>
 					{:else}
@@ -726,6 +1091,65 @@ async function handleExportToOnnx() {
 							{/if}
 						</div>
 					{/if}
+
+					<!-- Freeze backbone checkbox -->
+					<div class="relative flex items-center justify-between rounded-lg border border-zinc-800/90 bg-zinc-950/40 px-3.5 py-2.5">
+						<div class="flex items-center gap-2.5">
+							<input
+								id="freeze-backbone-checkbox"
+								type="checkbox"
+								bind:checked={freezeBackbone}
+								disabled={isTraining}
+								class="h-4 w-4 rounded border-zinc-700 bg-zinc-900 accent-amber-500 focus:ring-amber-500 disabled:opacity-50"
+							/>
+							<label for="freeze-backbone-checkbox" class="cursor-pointer text-sm font-medium text-zinc-200 select-none">
+								Freeze backbone (first {freezeLayersCount} layers)
+							</label>
+							<button
+								type="button"
+								onclick={(e) => {
+									e.stopPropagation();
+									activeTooltip = activeTooltip === "freeze" ? null : "freeze";
+								}}
+								class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
+								aria-label="Freeze backbone help"
+								title="Freezes early layers so the model mainly learns the new head. Useful when you have limited labeled data."
+							>
+								?
+							</button>
+						</div>
+
+						<span class={`font-mono text-xs ${freezeBackbone ? "text-amber-400 font-medium" : "text-zinc-500"}`}>
+							{freezeBackbone ? `freeze=${freezeLayersCount}` : "freeze=0"}
+						</span>
+
+						{#if activeTooltip === "freeze"}
+							<!-- svelte-ignore a11y_no_static_element_interactions -->
+							<div
+								onclick={(e) => e.stopPropagation()}
+								onkeydown={(e) => e.stopPropagation()}
+								class="absolute bottom-full left-4 z-30 mb-2 w-72 rounded-lg border border-amber-500/40 bg-zinc-900 p-2.5 text-xs leading-relaxed text-zinc-200 shadow-xl backdrop-blur-md"
+							>
+								<div class="flex items-start justify-between gap-2 border-b border-zinc-800 pb-1">
+									<span class="font-semibold text-amber-400">Freeze backbone</span>
+									<button
+										type="button"
+										onclick={(e) => {
+											e.stopPropagation();
+											activeTooltip = null;
+										}}
+										class="text-zinc-400 transition hover:text-zinc-100"
+										aria-label="Close tooltip"
+									>
+										&times;
+									</button>
+								</div>
+								<p class="mt-1 text-zinc-300">
+									Freezes early layers so the model mainly learns the new head. Useful when you have limited labeled data.
+								</p>
+							</div>
+						{/if}
+					</div>
 				</section>
 
 				<!-- Section 3: Output -->
@@ -746,13 +1170,45 @@ async function handleExportToOnnx() {
 					<p class="text-xs text-zinc-500">Run identifier for checkpoint directories and evaluation metrics</p>
 				</section>
 
-				<!-- Section 4: Parameters -->
+				<!-- Section 4: Parameters / Settings -->
 				<section class="space-y-3 border-t border-zinc-800/80 pt-5">
-					<span class="block text-xs font-semibold tracking-wider text-zinc-300 uppercase">
-						Parameters
-					</span>
+					<div class="flex items-center justify-between gap-2">
+						<span class="block text-xs font-semibold tracking-wider text-zinc-300 uppercase">
+							Parameters &amp; Settings
+						</span>
+						<button
+							type="button"
+							onclick={handleRepairCuda}
+							disabled={isTraining || isRepairingCuda}
+							class="inline-flex items-center gap-1.5 rounded-md border border-zinc-700/80 bg-zinc-800/80 px-2.5 py-1 text-xs font-medium text-zinc-300 transition hover:border-amber-500/60 hover:bg-zinc-800 hover:text-amber-300 disabled:opacity-50"
+							title="Re-detect GPU and driver version and install the matching PyTorch CUDA wheel"
+						>
+							{#if isRepairingCuda}
+								<svg class="h-3.5 w-3.5 animate-spin text-amber-400" aria-hidden="true" fill="none" viewBox="0 0 24 24">
+									<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+									<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+								</svg>
+								<span>Repairing CUDA…</span>
+							{:else}
+								<svg class="h-3.5 w-3.5 text-amber-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+									<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+								</svg>
+								<span>Repair CUDA</span>
+							{/if}
+						</button>
+					</div>
 
-					<div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
+					{#if isRepairingCuda}
+						<div class="flex items-center gap-2.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3.5 py-2.5 text-xs font-medium text-amber-300">
+							<svg class="h-4 w-4 shrink-0 animate-spin text-amber-400" aria-hidden="true" fill="none" viewBox="0 0 24 24">
+								<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+								<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+							</svg>
+							<span>{statusMessage}</span>
+						</div>
+					{/if}
+
+					<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
 						<!-- Epochs and Batch -->
 						<div class="grid grid-cols-2 gap-3">
 							<div class="space-y-1.5">
@@ -812,7 +1268,7 @@ async function handleExportToOnnx() {
 								{#if gpuInfo?.cuda_available && gpuInfo.device_name}
 									<span class="flex items-center gap-1.5 text-[11px] font-medium text-emerald-400 whitespace-nowrap truncate min-w-0" title={gpuInfo.device_name}>
 										<span class="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400"></span>
-										<span class="truncate">{gpuInfo.device_name}</span>
+										<span class="truncate">{shortenGpuName(gpuInfo.device_name)}</span>
 									</span>
 								{:else if gpuInfo && !gpuInfo.cuda_available}
 									<span class="text-[11px] text-zinc-500 whitespace-nowrap">
@@ -838,7 +1294,7 @@ async function handleExportToOnnx() {
 							>
 								{#if gpuInfo?.cuda_available}
 									<option value="0">
-										{gpuInfo.device_name ? `GPU 0: ${gpuInfo.device_name}` : "GPU (device=0)"}
+										{gpuInfo.device_name ? `GPU 0: ${ gpuInfo.device_name }` : "GPU (device=0)"}
 									</option>
 									<option value="cpu">CPU (device=cpu)</option>
 									<option value="custom">Custom device...</option>
@@ -865,16 +1321,7 @@ async function handleExportToOnnx() {
 								/>
 							{/if}
 						</div>
-					</div>
-				</section>
 
-				<!-- Section 5: Advanced -->
-				<section class="space-y-3 border-t border-zinc-800/80 pt-5">
-					<span class="block text-xs font-semibold tracking-wider text-zinc-300 uppercase">
-						Advanced
-					</span>
-
-					<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
 						<!-- amp -->
 						<div class="space-y-1.5">
 							<div class="relative flex h-5 items-center justify-between">
@@ -901,7 +1348,7 @@ async function handleExportToOnnx() {
 									<div
 										onclick={(e) => e.stopPropagation()}
 										onkeydown={(e) => e.stopPropagation()}
-										class="absolute bottom-full left-0 z-30 mb-2 w-64 rounded-lg border border-amber-500/40 bg-zinc-900 p-2.5 text-xs leading-relaxed text-zinc-200 shadow-xl backdrop-blur-md"
+										class="absolute bottom-full right-0 z-30 mb-2 w-64 rounded-lg border border-amber-500/40 bg-zinc-900 p-2.5 text-xs leading-relaxed text-zinc-200 shadow-xl backdrop-blur-md"
 									>
 										<div class="flex items-start justify-between gap-2 border-b border-zinc-800 pb-1">
 											<span class="font-semibold text-amber-400">amp</span>
@@ -953,13 +1400,71 @@ async function handleExportToOnnx() {
 								</span>
 							</button>
 						</div>
+					</div>
+				</section>
 
-						<!-- mosaic -->
+				<!-- Section 5: Augmentation Controls -->
+				<section class="space-y-3.5 border-t border-zinc-800/80 pt-5">
+					<div class="flex flex-wrap items-center justify-between gap-2">
+						<div class="flex items-center gap-2">
+							<span class="block text-xs font-semibold tracking-wider text-zinc-300 uppercase">
+								Augmentation
+							</span>
+							<span class="rounded border border-zinc-800 bg-zinc-950/60 px-2 py-0.5 font-mono text-[11px] text-zinc-400">
+								{activeAugSummary}
+							</span>
+						</div>
+
+						<!-- Preset buttons: Off / Light / Medium -->
+						<div class="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-950/60 p-0.5">
+							<span class="px-2 text-[11px] text-zinc-500">Preset:</span>
+							<button
+								type="button"
+								onclick={() => applyAugPreset("off")}
+								disabled={isTraining}
+								class={`rounded-md px-2 py-0.5 text-xs font-medium transition ${
+									activeAugPreset === "off"
+										? "bg-amber-500/20 text-amber-300 border border-amber-500/40"
+										: "text-zinc-400 hover:text-zinc-200"
+								} disabled:opacity-50`}
+							>
+								Off
+							</button>
+							<button
+								type="button"
+								onclick={() => applyAugPreset("light")}
+								disabled={isTraining}
+								class={`rounded-md px-2 py-0.5 text-xs font-medium transition ${
+									activeAugPreset === "light"
+										? "bg-amber-500/20 text-amber-300 border border-amber-500/40"
+										: "text-zinc-400 hover:text-zinc-200"
+								} disabled:opacity-50`}
+							>
+								Light
+							</button>
+							<button
+								type="button"
+								onclick={() => applyAugPreset("medium")}
+								disabled={isTraining}
+								class={`rounded-md px-2 py-0.5 text-xs font-medium transition ${
+									activeAugPreset === "medium"
+										? "bg-amber-500/20 text-amber-300 border border-amber-500/40"
+										: "text-zinc-400 hover:text-zinc-200"
+								} disabled:opacity-50`}
+							>
+								Medium
+							</button>
+						</div>
+					</div>
+
+					<!-- Row 1: Mosaic (dropdown 0.0 / 0.5 / 1.0), MixUp (slider 0.0–0.5), Copy-paste (on/off) -->
+					<div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
+						<!-- Mosaic dropdown -->
 						<div class="space-y-1.5">
 							<div class="relative flex h-5 items-center justify-between">
 								<div class="flex items-center gap-1.5">
-									<label for="mosaic-input" class="text-xs font-medium text-zinc-400">
-										mosaic
+									<label for="mosaic-select" class="text-xs font-medium text-zinc-400">
+										Mosaic
 									</label>
 									<button
 										type="button"
@@ -1003,24 +1508,24 @@ async function handleExportToOnnx() {
 								{/if}
 							</div>
 
-							<input
-								id="mosaic-input"
-								type="number"
-								min="0"
-								max="1"
-								step="0.05"
+							<select
+								id="mosaic-select"
 								bind:value={mosaic}
 								disabled={isTraining}
-								class="h-[42px] w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
-							/>
+								class="h-[42px] w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+							>
+								<option value={0.0}>0.0 — Off (Bench default)</option>
+								<option value={0.5}>0.5 — Moderate</option>
+								<option value={1.0}>1.0 — Full (Ultralytics default)</option>
+							</select>
 						</div>
 
-						<!-- mixup -->
+						<!-- MixUp slider 0.0–0.5 -->
 						<div class="space-y-1.5">
 							<div class="relative flex h-5 items-center justify-between">
 								<div class="flex items-center gap-1.5">
-									<label for="mixup-input" class="text-xs font-medium text-zinc-400">
-										mixup
+									<label for="mixup-slider" class="text-xs font-medium text-zinc-400">
+										MixUp
 									</label>
 									<button
 										type="button"
@@ -1035,13 +1540,14 @@ async function handleExportToOnnx() {
 										?
 									</button>
 								</div>
+								<span class="font-mono text-xs text-amber-400">{mixup.toFixed(2)}</span>
 
 								{#if activeTooltip === "mixup"}
 									<!-- svelte-ignore a11y_no_static_element_interactions -->
 									<div
 										onclick={(e) => e.stopPropagation()}
 										onkeydown={(e) => e.stopPropagation()}
-										class="absolute bottom-full right-0 z-30 mb-2 w-64 rounded-lg border border-amber-500/40 bg-zinc-900 p-2.5 text-xs leading-relaxed text-zinc-200 shadow-xl backdrop-blur-md"
+										class="absolute bottom-full left-0 z-30 mb-2 w-64 rounded-lg border border-amber-500/40 bg-zinc-900 p-2.5 text-xs leading-relaxed text-zinc-200 shadow-xl backdrop-blur-md"
 									>
 										<div class="flex items-start justify-between gap-2 border-b border-zinc-800 pb-1">
 											<span class="font-semibold text-amber-400">mixup</span>
@@ -1064,24 +1570,148 @@ async function handleExportToOnnx() {
 								{/if}
 							</div>
 
+							<div class="flex h-[42px] items-center gap-3 rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5">
+								<input
+									id="mixup-slider"
+									type="range"
+									min="0"
+									max="0.5"
+									step="0.05"
+									bind:value={mixup}
+									disabled={isTraining}
+									class="w-full accent-amber-500 disabled:opacity-50"
+								/>
+							</div>
+						</div>
+
+						<!-- Copy-paste on/off -->
+						<div class="space-y-1.5">
+							<div class="relative flex h-5 items-center justify-between">
+								<div class="flex items-center gap-1.5">
+									<label for="copy-paste-toggle" class="text-xs font-medium text-zinc-400">
+										Copy-paste
+									</label>
+									<button
+										type="button"
+										onclick={(e) => {
+											e.stopPropagation();
+											activeTooltip = activeTooltip === "copy_paste" ? null : "copy_paste";
+										}}
+										class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
+										aria-label="copy-paste help"
+										title="Copy-paste object patches across training images. Default off for clean bench work."
+									>
+										?
+									</button>
+								</div>
+
+								{#if activeTooltip === "copy_paste"}
+									<!-- svelte-ignore a11y_no_static_element_interactions -->
+									<div
+										onclick={(e) => e.stopPropagation()}
+										onkeydown={(e) => e.stopPropagation()}
+										class="absolute bottom-full right-0 z-30 mb-2 w-64 rounded-lg border border-amber-500/40 bg-zinc-900 p-2.5 text-xs leading-relaxed text-zinc-200 shadow-xl backdrop-blur-md"
+									>
+										<div class="flex items-start justify-between gap-2 border-b border-zinc-800 pb-1">
+											<span class="font-semibold text-amber-400">copy_paste</span>
+											<button
+												type="button"
+												onclick={(e) => {
+													e.stopPropagation();
+													activeTooltip = null;
+												}}
+												class="text-zinc-400 transition hover:text-zinc-100"
+												aria-label="Close tooltip"
+											>
+												&times;
+											</button>
+										</div>
+										<p class="mt-1 text-zinc-300">
+											Copy-paste object patches across training images. Default off (0.0) for controlled bench scenes.
+										</p>
+									</div>
+								{/if}
+							</div>
+
+							<button
+								id="copy-paste-toggle"
+								type="button"
+								role="switch"
+								aria-checked={copyPaste}
+								onclick={() => {
+									if (!isTraining) copyPaste = !copyPaste;
+								}}
+								disabled={isTraining}
+								class={`flex h-[42px] w-full items-center justify-between rounded-lg border px-3.5 py-2 text-sm font-medium transition ${
+									copyPaste
+										? "border-amber-500/50 bg-amber-500/10 text-amber-300"
+										: "border-zinc-700/80 bg-zinc-900 text-zinc-400 hover:border-zinc-600"
+								} disabled:opacity-50`}
+							>
+								<span>{copyPaste ? "On (0.3)" : "Off (0.0)"}</span>
+								<span
+									class={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ${
+										copyPaste ? "bg-amber-500" : "bg-zinc-700"
+									}`}
+								>
+									<span
+										class={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition duration-200 ease-in-out ${
+											copyPaste ? "translate-x-4" : "translate-x-0"
+										}`}
+									></span>
+								</span>
+							</button>
+						</div>
+					</div>
+
+					<!-- Row 2: Degrees / Translate / Scale number inputs -->
+					<div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
+						<!-- Degrees -->
+						<div class="space-y-1.5">
+							<div class="flex h-5 items-center justify-between">
+								<label for="degrees-input" class="text-xs font-medium text-zinc-400">
+									Degrees (±rot)
+								</label>
+								<span class="font-mono text-[11px] text-zinc-500">0–180°</span>
+							</div>
 							<input
-								id="mixup-input"
+								id="degrees-input"
 								type="number"
 								min="0"
-								max="1"
-								step="0.05"
-								bind:value={mixup}
+								max="180"
+								step="1"
+								bind:value={degrees}
 								disabled={isTraining}
 								class="h-[42px] w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
 							/>
 						</div>
 
-						<!-- scale -->
+						<!-- Translate -->
+						<div class="space-y-1.5">
+							<div class="flex h-5 items-center justify-between">
+								<label for="translate-input" class="text-xs font-medium text-zinc-400">
+									Translate (±shift)
+								</label>
+								<span class="font-mono text-[11px] text-zinc-500">0.0–1.0</span>
+							</div>
+							<input
+								id="translate-input"
+								type="number"
+								min="0"
+								max="1"
+								step="0.05"
+								bind:value={translate}
+								disabled={isTraining}
+								class="h-[42px] w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+							/>
+						</div>
+
+						<!-- Scale -->
 						<div class="space-y-1.5">
 							<div class="relative flex h-5 items-center justify-between">
 								<div class="flex items-center gap-1.5">
 									<label for="scale-input" class="text-xs font-medium text-zinc-400">
-										scale
+										Scale (±zoom)
 									</label>
 									<button
 										type="button"
@@ -1096,6 +1726,7 @@ async function handleExportToOnnx() {
 										?
 									</button>
 								</div>
+								<span class="font-mono text-[11px] text-zinc-500">0.0–1.0</span>
 
 								{#if activeTooltip === "scale"}
 									<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -1139,8 +1770,30 @@ async function handleExportToOnnx() {
 					</div>
 				</section>
 
-				<!-- Section 5: Go Button -->
-				<div class="border-t border-zinc-800/80 pt-5">
+				<!-- Section 6: Go Button -->
+				<div class="border-t border-zinc-800/80 pt-5 space-y-3">
+					{#if epochCountdownText}
+						<div class="rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 space-y-2">
+							<div class="flex flex-wrap items-center justify-between gap-2">
+								<span class="font-mono text-sm font-semibold text-amber-300 whitespace-pre">
+									{epochCountdownText}
+								</span>
+								<span class="font-mono text-xs font-medium text-amber-400/90">
+									{epochProgressPercent}%
+								</span>
+							</div>
+							<div class="font-mono text-[11px] text-zinc-300/90 truncate" title={activeRunConfigBanner}>
+								{activeRunConfigBanner}
+							</div>
+							<div class="h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
+								<div
+									class="h-full rounded-full bg-amber-500 transition-all duration-300"
+									style={`width: ${epochProgressPercent}%`}
+								></div>
+							</div>
+						</div>
+					{/if}
+
 					<button
 						type="submit"
 						disabled={!isFormValid || isTraining}
@@ -1150,7 +1803,13 @@ async function handleExportToOnnx() {
 								: "cursor-not-allowed border border-zinc-800 bg-zinc-800/50 text-zinc-500 opacity-60"
 						}`}
 					>
-						{#if isTraining}
+						{#if isRepairingCuda || isCheckingGpu}
+							<svg class="h-4 w-4 animate-spin text-zinc-400" aria-hidden="true" fill="none" viewBox="0 0 24 24">
+								<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+								<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+							</svg>
+							<span>{statusMessage}</span>
+						{:else if isTraining}
 							<svg class="h-4 w-4 animate-spin text-zinc-950" aria-hidden="true" fill="none" viewBox="0 0 24 24">
 								<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
 								<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
@@ -1160,7 +1819,7 @@ async function handleExportToOnnx() {
 							<svg class="h-4 w-4" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
 								<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
 							</svg>
-							<span>Go</span>
+							<span>Train</span>
 						{/if}
 					</button>
 				</div>
@@ -1168,10 +1827,10 @@ async function handleExportToOnnx() {
 				<!-- Status Line -->
 				<div class="flex items-center justify-between border-t border-zinc-800/60 pt-4 text-xs text-zinc-400">
 					<div class="flex items-center gap-2">
-						<span class={`h-2 w-2 rounded-full ${isTraining ? "bg-amber-400 animate-pulse shadow-[0_0_8px_rgba(245,158,11,0.8)]" : "bg-amber-500/80 shadow-[0_0_6px_rgba(245,158,11,0.6)]"}`}></span>
+						<span class={`h-2 w-2 rounded-full ${isTraining || isRepairingCuda ? "bg-amber-400 animate-pulse shadow-[0_0_8px_rgba(245,158,11,0.8)]" : isTorchReady ? "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]" : "bg-amber-500/80 shadow-[0_0_6px_rgba(245,158,11,0.6)]"}`}></span>
 						<span>{statusMessage}</span>
 					</div>
-					{#if (logs.length > 0 || isTraining) && !isLogPanelOpen}
+					{#if (logs.length > 0 || isTraining || isRepairingCuda) && !isLogPanelOpen}
 						<button
 							type="button"
 							onclick={() => {
@@ -1210,64 +1869,69 @@ async function handleExportToOnnx() {
 				class="flex h-full shrink-0 flex-col overflow-hidden border-l border-zinc-800/80 bg-zinc-950"
 			>
 				<!-- Log Panel Header -->
-				<div class="flex h-12 shrink-0 items-center justify-between border-b border-zinc-800/80 bg-zinc-900/90 px-4">
-					<div class="flex items-center gap-2">
-						<span class={`h-2 w-2 rounded-full ${isTraining ? "bg-amber-400 animate-pulse shadow-[0_0_8px_rgba(245,158,11,0.9)]" : "bg-emerald-500"}`}></span>
-						<span class="text-xs font-semibold tracking-wider text-zinc-300 uppercase">
-							Training Log
-						</span>
-						{#if isTraining}
-							<span class="rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">
-								Streaming
+				<div class="flex shrink-0 flex-col border-b border-zinc-800/80 bg-zinc-900/90 px-4 py-2.5 gap-1">
+					<div class="flex items-center justify-between">
+						<div class="flex items-center gap-2">
+							<span class={`h-2 w-2 rounded-full ${isTraining ? "bg-amber-400 animate-pulse shadow-[0_0_8px_rgba(245,158,11,0.9)]" : "bg-emerald-500"}`}></span>
+							<span class="text-xs font-semibold tracking-wider text-zinc-300 uppercase">
+								Training Log
 							</span>
-						{/if}
-					</div>
-
-					<div class="flex items-center gap-1.5">
-						<span class="font-mono text-[11px] text-zinc-500 mr-1">
-							{logs.length} lines
-						</span>
-						<button
-							type="button"
-							onclick={() => {
-								logs = [];
-							}}
-							disabled={isTraining || logs.length === 0}
-							class="rounded bg-zinc-800/80 px-2 py-1 text-[11px] text-zinc-400 transition hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
-						>
-							Clear
-						</button>
-						<button
-							type="button"
-							onclick={copyLogsToClipboard}
-							disabled={logs.length === 0}
-							class="rounded bg-zinc-800/80 p-1 text-zinc-400 transition hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
-							title={hasCopiedLogs ? "Copied!" : "Copy logs to clipboard"}
-							aria-label="Copy logs to clipboard"
-						>
-							{#if hasCopiedLogs}
-								<svg class="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-									<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7" />
-								</svg>
-							{:else}
-								<svg class="h-3.5 w-3.5" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-									<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-								</svg>
+							{#if isTraining}
+								<span class="rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">
+									Streaming
+								</span>
 							{/if}
-						</button>
-						<button
-							type="button"
-							onclick={() => {
-								isLogPanelOpen = false;
-							}}
-							class="ml-1 rounded p-1 text-zinc-400 transition hover:bg-zinc-800 hover:text-zinc-200"
-							title="Collapse panel"
-							aria-label="Close log panel"
-						>
-							<svg class="h-4 w-4" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-								<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-							</svg>
-						</button>
+						</div>
+
+						<div class="flex items-center gap-1.5">
+							<span class="font-mono text-[11px] text-zinc-500 mr-1">
+								{logs.length} lines
+							</span>
+							<button
+								type="button"
+								onclick={() => {
+									logs = [];
+								}}
+								disabled={isTraining || logs.length === 0}
+								class="rounded bg-zinc-800/80 px-2 py-1 text-[11px] text-zinc-400 transition hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
+							>
+								Clear
+							</button>
+							<button
+								type="button"
+								onclick={copyLogsToClipboard}
+								disabled={logs.length === 0}
+								class="rounded bg-zinc-800/80 p-1 text-zinc-400 transition hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
+								title={hasCopiedLogs ? "Copied!" : "Copy logs to clipboard"}
+								aria-label="Copy logs to clipboard"
+							>
+								{#if hasCopiedLogs}
+									<svg class="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+										<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7" />
+									</svg>
+								{:else}
+									<svg class="h-3.5 w-3.5" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+										<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+									</svg>
+								{/if}
+							</button>
+							<button
+								type="button"
+								onclick={() => {
+									isLogPanelOpen = false;
+								}}
+								class="ml-1 rounded p-1 text-zinc-400 transition hover:bg-zinc-800 hover:text-zinc-200"
+								title="Collapse panel"
+								aria-label="Close log panel"
+							>
+								<svg class="h-4 w-4" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+									<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+								</svg>
+							</button>
+						</div>
+					</div>
+					<div class="font-mono text-[11px] text-amber-300/90 truncate" title={activeRunConfigBanner}>
+						{activeRunConfigBanner}
 					</div>
 				</div>
 
