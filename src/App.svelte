@@ -787,9 +787,11 @@ async function handleExportToOnnx() {
 	<!-- Top Bar -->
 	<header class="flex h-14 shrink-0 items-center justify-between border-b border-zinc-800/80 bg-zinc-900/90 px-6 backdrop-blur-md z-10">
 		<div class="flex items-center gap-3">
-			<div class="flex h-7 w-7 items-center justify-center rounded-md border border-amber-500/40 bg-amber-500/10">
-				<span class="h-2 w-2 rounded-sm bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.8)]"></span>
-			</div>
+			<img
+				src="/LS-Trainer.svg"
+				alt="LS-Trainer Logo"
+				class="h-7 w-7 rounded-md select-none"
+			/>
 			<div>
 				<h1 class="text-sm font-bold tracking-wider text-zinc-100 uppercase">LS-Trainer</h1>
 			</div>
