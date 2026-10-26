@@ -3,6 +3,7 @@ import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
 import { onMount } from "svelte";
 
 type ModelMode = "continue" | "fresh";
+type TrainTask = "detect" | "segment";
 type ImageSize = 640 | 960 | 1280;
 type YoloModel =
 	| "yolo11n.pt"
@@ -14,8 +15,11 @@ type YoloModel =
 	| "yolo26s.pt"
 	| "yolo26m.pt"
 	| "yolo26l.pt"
-	| "yolo26x.pt";
-type AugPreset = "off" | "light" | "medium" | "custom";
+	| "yolo26x.pt"
+	| "yolo11s-seg.pt"
+	| "yolo11m-seg.pt"
+	| "yolo26s-seg.pt";
+type AugPreset = "off" | "light" | "medium" | "bench" | "custom";
 
 interface TrainingResponse {
 	success: boolean;
@@ -41,71 +45,111 @@ interface GpuInfo {
 	status_summary: string;
 }
 
+interface LabelCheckResult {
+	polygons_found: boolean;
+	bboxes_found: boolean;
+	files_scanned: number;
+	lines_scanned: number;
+	warning: string | null;
+}
+
 const freshModelOptions: {
 	id: YoloModel;
 	family: "YOLO11" | "YOLO26";
+	task: TrainTask;
 	label: string;
 	desc: string;
 }[] = [
 	{
 		id: "yolo11n.pt",
 		family: "YOLO11",
+		task: "detect",
 		label: "YOLO11n",
 		desc: "Nano (fastest, lightweight)",
 	},
 	{
 		id: "yolo11s.pt",
 		family: "YOLO11",
+		task: "detect",
 		label: "YOLO11s",
 		desc: "Small (balanced fast)",
 	},
 	{
 		id: "yolo11m.pt",
 		family: "YOLO11",
+		task: "detect",
 		label: "YOLO11m",
 		desc: "Medium (default, high accuracy)",
 	},
 	{
 		id: "yolo11l.pt",
 		family: "YOLO11",
+		task: "detect",
 		label: "YOLO11l",
 		desc: "Large (extra accuracy)",
 	},
 	{
 		id: "yolo11x.pt",
 		family: "YOLO11",
+		task: "detect",
 		label: "YOLO11x",
 		desc: "XLarge (maximum capacity)",
 	},
 	{
 		id: "yolo26n.pt",
 		family: "YOLO26",
+		task: "detect",
 		label: "YOLO26n",
 		desc: "Nano (next-gen lightweight)",
 	},
 	{
 		id: "yolo26s.pt",
 		family: "YOLO26",
+		task: "detect",
 		label: "YOLO26s",
 		desc: "Small (next-gen balanced)",
 	},
 	{
 		id: "yolo26m.pt",
 		family: "YOLO26",
+		task: "detect",
 		label: "YOLO26m",
 		desc: "Medium (next-gen high accuracy)",
 	},
 	{
 		id: "yolo26l.pt",
 		family: "YOLO26",
+		task: "detect",
 		label: "YOLO26l",
 		desc: "Large (next-gen extra accuracy)",
 	},
 	{
 		id: "yolo26x.pt",
 		family: "YOLO26",
+		task: "detect",
 		label: "YOLO26x",
 		desc: "XLarge (next-gen maximum capacity)",
+	},
+	{
+		id: "yolo11s-seg.pt",
+		family: "YOLO11",
+		task: "segment",
+		label: "YOLO11s-seg",
+		desc: "Small instance segmentation",
+	},
+	{
+		id: "yolo11m-seg.pt",
+		family: "YOLO11",
+		task: "segment",
+		label: "YOLO11m-seg",
+		desc: "Medium instance segmentation",
+	},
+	{
+		id: "yolo26s-seg.pt",
+		family: "YOLO26",
+		task: "segment",
+		label: "YOLO26s-seg",
+		desc: "Small next-gen segmentation",
 	},
 ];
 
@@ -115,6 +159,7 @@ let modelMode = $state<ModelMode>("fresh");
 let existingModelPath = $state<string>("");
 let existingModelFileName = $state<string>("");
 let freshModel = $state<YoloModel>("yolo11m.pt");
+let trainTask = $state<TrainTask>("detect");
 let freezeBackbone = $state<boolean>(false);
 const freezeLayersCount = 10;
 let runName = $state<string>("");
@@ -133,9 +178,15 @@ let amp = $state<boolean>(true);
 let mosaic = $state<number>(0.0);
 let mixup = $state<number>(0.0);
 let copyPaste = $state<boolean>(false);
-let degrees = $state<number>(0.0);
+let degrees = $state<number>(180);
+let flipud = $state<number>(0.5);
 let translate = $state<number>(0.1);
-let scale = $state<number>(0.2);
+let scale = $state<number>(0.05);
+let closeMosaic = $state<number>(10);
+let autoExportOnnx = $state<boolean>(true);
+let labelWarning = $state<string | null>(null);
+let labelCheckNote = $state<string | null>(null);
+let labelCheckPending = $state<boolean>(false);
 
 let activeTooltip = $state<string | null>(null);
 
@@ -144,7 +195,20 @@ const activeAugPreset = $derived.by<AugPreset>(() => {
 		mosaic === 0.0 &&
 		mixup === 0.0 &&
 		!copyPaste &&
+		degrees === 180 &&
+		flipud === 0.5 &&
+		translate === 0.1 &&
+		scale === 0.05 &&
+		closeMosaic === 10
+	) {
+		return "bench";
+	}
+	if (
+		mosaic === 0.0 &&
+		mixup === 0.0 &&
+		!copyPaste &&
 		degrees === 0.0 &&
+		flipud === 0.0 &&
 		translate === 0.0 &&
 		scale === 0.0
 	) {
@@ -155,6 +219,7 @@ const activeAugPreset = $derived.by<AugPreset>(() => {
 		mixup === 0.0 &&
 		!copyPaste &&
 		degrees === 0.0 &&
+		flipud === 0.0 &&
 		translate === 0.1 &&
 		scale === 0.2
 	) {
@@ -165,6 +230,7 @@ const activeAugPreset = $derived.by<AugPreset>(() => {
 		mixup === 0.1 &&
 		!copyPaste &&
 		degrees === 5.0 &&
+		flipud === 0.0 &&
 		translate === 0.1 &&
 		scale === 0.4
 	) {
@@ -173,13 +239,14 @@ const activeAugPreset = $derived.by<AugPreset>(() => {
 	return "custom";
 });
 
-function applyAugPreset(preset: "off" | "light" | "medium") {
+function applyAugPreset(preset: "off" | "light" | "medium" | "bench") {
 	if (isTraining) return;
 	if (preset === "off") {
 		mosaic = 0.0;
 		mixup = 0.0;
 		copyPaste = false;
 		degrees = 0.0;
+		flipud = 0.0;
 		translate = 0.0;
 		scale = 0.0;
 	} else if (preset === "light") {
@@ -187,6 +254,7 @@ function applyAugPreset(preset: "off" | "light" | "medium") {
 		mixup = 0.0;
 		copyPaste = false;
 		degrees = 0.0;
+		flipud = 0.0;
 		translate = 0.1;
 		scale = 0.2;
 	} else if (preset === "medium") {
@@ -194,8 +262,27 @@ function applyAugPreset(preset: "off" | "light" | "medium") {
 		mixup = 0.1;
 		copyPaste = false;
 		degrees = 5.0;
+		flipud = 0.0;
 		translate = 0.1;
 		scale = 0.4;
+	} else if (preset === "bench") {
+		mosaic = 0.0;
+		mixup = 0.0;
+		copyPaste = false;
+		degrees = 180;
+		flipud = 0.5;
+		translate = 0.1;
+		scale = 0.05;
+		closeMosaic = 10;
+	}
+}
+
+function selectTrainTask(task: TrainTask) {
+	if (isTraining) return;
+	trainTask = task;
+	const current = freshModelOptions.find((o) => o.id === freshModel);
+	if (!current || current.task !== task) {
+		freshModel = task === "segment" ? "yolo11s-seg.pt" : "yolo11m.pt";
 	}
 }
 
@@ -212,11 +299,27 @@ const activeFreezeLabel = $derived(
 );
 
 const activeAugSummary = $derived(
-	`mosaic=${mosaic} · mixup=${mixup} · copy_paste=${copyPaste ? "on" : "off"} · deg=${degrees} · trans=${translate} · scale=${scale}`,
+	`mosaic=${mosaic} · mixup=${mixup} · copy_paste=${copyPaste ? "on" : "off"} · deg=${degrees} · flipud=${flipud} · trans=${translate} · scale=${scale} · close_mosaic=${closeMosaic}`,
 );
 
+const effectiveModelName = $derived(
+	modelMode === "continue"
+		? existingModelFileName || existingModelPath
+		: freshModel,
+);
+
+const isSegmentationRun = $derived(
+	trainTask === "segment" || /-seg/i.test(effectiveModelName),
+);
+
+const visibleModelOptions = $derived(
+	freshModelOptions.filter((o) => o.task === trainTask),
+);
+
+const activeTaskLabel = $derived(isSegmentationRun ? "segment" : "detect");
+
 const activeRunConfigBanner = $derived(
-	`${activeModelLabel} · ${activeFreezeLabel} · ${activeAugSummary}`,
+	`${activeTaskLabel} · ${activeModelLabel} · ${activeFreezeLabel} · ${activeAugSummary}`,
 );
 
 // Epoch countdown & rolling ETA tracking
@@ -400,6 +503,52 @@ onMount(async () => {
 	}
 });
 
+$effect(() => {
+	const path = datasetPath.trim() || datasetFileName.trim();
+	const seg = isSegmentationRun;
+	if (!seg || !path) {
+		labelWarning = null;
+		labelCheckNote = null;
+		labelCheckPending = false;
+		return;
+	}
+	if (!isTauri()) {
+		labelWarning = null;
+		labelCheckPending = false;
+		labelCheckNote =
+			"Polygon check runs in the desktop app when a dataset archive is selected.";
+		return;
+	}
+
+	let cancelled = false;
+	labelCheckPending = true;
+	labelWarning = null;
+	labelCheckNote = null;
+	invoke<LabelCheckResult>("inspect_dataset_labels", { datasetPath: path })
+		.then((result) => {
+			if (cancelled) return;
+			labelCheckPending = false;
+			if (result.warning) {
+				labelWarning = result.warning;
+				labelCheckNote = null;
+			} else if (result.polygons_found) {
+				labelCheckNote = `Polygon annotations detected (${result.files_scanned} label files).`;
+			} else {
+				labelWarning =
+					"No polygon annotations were found. Instance segmentation needs label lines with more than 5 values.";
+			}
+		})
+		.catch((err) => {
+			if (cancelled) return;
+			labelCheckPending = false;
+			labelWarning = err instanceof Error ? err.message : String(err);
+		});
+
+	return () => {
+		cancelled = true;
+	};
+});
+
 let isTraining = $state<boolean>(false);
 let logs = $state<string[]>([]);
 let resultsDir = $state<string | null>(null);
@@ -557,6 +706,9 @@ async function handlePickExistingModel() {
 				existingModelPath = norm;
 				const cleanName = norm.replace(/\\/g, "/").split("/").pop();
 				existingModelFileName = cleanName || norm;
+				if (/-seg/i.test(existingModelFileName)) {
+					selectTrainTask("segment");
+				}
 			}
 			return;
 		} catch (err) {
@@ -573,6 +725,9 @@ function handleExistingModelFileInputChange(event: Event) {
 		existingModelFileName = file.name;
 		const raw = (file as unknown as { path?: string }).path || file.name;
 		existingModelPath = normalizePath(raw);
+		if (/-seg/i.test(file.name)) {
+			selectTrainTask("segment");
+		}
 	}
 }
 
@@ -612,6 +767,7 @@ async function handleStartTraining() {
 			: freshModel;
 
 	const effectiveCopyPaste = copyPaste ? 0.3 : 0.0;
+	const taskName = isSegmentationRun ? "segment" : "detect";
 	const requestPayload = {
 		dataset_path: effectiveDataset,
 		model_choice: effectiveModel,
@@ -627,8 +783,11 @@ async function handleStartTraining() {
 		mixup: Number(mixup),
 		copy_paste: effectiveCopyPaste,
 		degrees: Number(degrees),
+		flipud: Number(flipud),
 		translate: Number(translate),
 		scale: Number(scale),
+		close_mosaic: Number(closeMosaic),
+		task: taskName,
 	};
 
 	console.log("LS-Trainer Starting Training:", requestPayload);
@@ -649,8 +808,18 @@ async function handleStartTraining() {
 				currentEpoch = totalEpochs;
 			}
 			resultsDir = normalizePath(response.results_dir);
+			if (
+				response.success &&
+				autoExportOnnx &&
+				/complete/i.test(response.message)
+			) {
+				statusMessage = "Training complete — exporting ONNX…";
+				await handleExportToOnnx();
+			}
 			statusMessage = response.success
-				? `Finished — ${normalizePath(response.results_dir)}`
+				? onnxPath
+					? `Finished — ${normalizePath(onnxPath)}`
+					: `Finished — ${normalizePath(response.results_dir)}`
 				: "Process finished with status warnings";
 		} catch (err) {
 			const errMsg = err instanceof Error ? err.message : String(err);
@@ -665,8 +834,9 @@ async function handleStartTraining() {
 		logs = [
 			"[LS-Trainer] Running outside Tauri webview (Browser Mode)",
 			`[LS-Trainer] Simulated training run '${effectiveRunName}'`,
+			`[LS-Trainer] Ultralytics task="${taskName}"`,
 			`[LS-Trainer] Active config: ${activeRunConfigBanner}`,
-			`[LS-Trainer] Command: yolo detect train data="${effectiveDataset}" model="${effectiveModel}" name="${effectiveRunName}" epochs=${epochs} batch=${batch} imgsz=${imageSize} device="${device}" amp=${amp}${freezeArgStr} mosaic=${mosaic} mixup=${mixup} copy_paste=${effectiveCopyPaste} degrees=${degrees} translate=${translate} scale=${scale}`,
+			`[LS-Trainer] Command: yolo ${taskName} train task=${taskName} data="${effectiveDataset}" model="${effectiveModel}" name="${effectiveRunName}" epochs=${epochs} batch=${batch} imgsz=${imageSize} device="${device}" amp=${amp}${freezeArgStr} mosaic=${mosaic} close_mosaic=${closeMosaic} mixup=${mixup} copy_paste=${effectiveCopyPaste} degrees=${degrees} flipud=${flipud} translate=${translate} scale=${scale}`,
 			"[LS-Trainer] Unpacking archive simulation complete.",
 			`[LS-Trainer] Starting ${activeModelLabel} epochs (1/${epochs})...`,
 			"[LS-Trainer] Training finished successfully.",
@@ -674,9 +844,15 @@ async function handleStartTraining() {
 		currentEpoch = Number(epochs);
 		totalEpochs = Number(epochs);
 		resultsDir = normalizePath(
-			`C:/Scripts/LS-Trainer/runs/detect/${effectiveRunName}/`,
+			`C:/Scripts/LS-Trainer/runs/${taskName}/${effectiveRunName}/`,
 		);
-		statusMessage = `Finished — ${normalizePath(resultsDir)}`;
+		if (autoExportOnnx) {
+			statusMessage = "Training complete — exporting ONNX…";
+			await handleExportToOnnx();
+		}
+		statusMessage = onnxPath
+			? `Finished — ${normalizePath(onnxPath)}`
+			: `Finished — ${normalizePath(resultsDir)}`;
 		isTraining = false;
 	}
 }
@@ -745,6 +921,9 @@ async function handleExportToOnnx() {
 				onLog,
 				request: {
 					results_dir: resultsDir,
+					imgsz: Number(imageSize),
+					dynamic: false,
+					simplify: true,
 				},
 			});
 
@@ -764,7 +943,7 @@ async function handleExportToOnnx() {
 		// Browser development preview simulation
 		logs = [
 			...logs,
-			`[LS-Trainer] Export command: yolo export model=${normalizePath(resultsDir)}weights\\best.pt format=onnx imgsz=640`,
+			`[LS-Trainer] model.export(format="onnx", imgsz=${imageSize}, dynamic=False, simplify=True)`,
 			`[LS-Trainer] Export completed successfully: ${normalizePath(resultsDir)}weights\\best.onnx`,
 			"[LS-Trainer] Note: This model is optimized and ready for inference in LS-Vision.",
 		];
@@ -815,7 +994,7 @@ async function handleExportToOnnx() {
 				</button>
 			{/if}
 			<span class="rounded border border-zinc-700/60 bg-zinc-800/80 px-2.5 py-0.5 font-mono text-xs text-zinc-400">
-				v0.1.3
+				v0.1.4
 			</span>
 		</div>
 	</header>
@@ -958,7 +1137,7 @@ async function handleExportToOnnx() {
 							/>
 							<div>
 								<span class="block text-sm font-medium text-zinc-200">Start fresh</span>
-								<span class="block text-xs text-zinc-400">Initialize a pretrained YOLO11 or YOLO26 base</span>
+								<span class="block text-xs text-zinc-400">Initialize a pretrained detection or segmentation model</span>
 							</div>
 						</label>
 
@@ -988,6 +1167,66 @@ async function handleExportToOnnx() {
 						</label>
 					</div>
 
+					<div class="space-y-1.5">
+						<span class="block text-xs font-medium text-zinc-400">Task</span>
+						<div class="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+							<label
+								class={`flex cursor-pointer items-start gap-3 rounded-lg border p-3 transition-all ${
+									trainTask === "detect"
+										? "border-amber-500/70 bg-amber-500/10 ring-1 ring-amber-500/40"
+										: "border-zinc-800 bg-zinc-950/40 hover:border-zinc-700 hover:bg-zinc-900/50"
+								}`}
+							>
+								<input
+									type="radio"
+									name="train-task"
+									value="detect"
+									disabled={isTraining}
+									checked={trainTask === "detect"}
+									onchange={() => selectTrainTask("detect")}
+									class="mt-0.5 accent-amber-500"
+								/>
+								<div>
+									<span class="block text-sm font-medium text-zinc-200">Object Detection</span>
+									<span class="block text-xs text-zinc-400">Boxes around each part</span>
+								</div>
+							</label>
+							<label
+								class={`flex cursor-pointer items-start gap-3 rounded-lg border p-3 transition-all ${
+									trainTask === "segment"
+										? "border-amber-500/70 bg-amber-500/10 ring-1 ring-amber-500/40"
+										: "border-zinc-800 bg-zinc-950/40 hover:border-zinc-700 hover:bg-zinc-900/50"
+								}`}
+							>
+								<input
+									type="radio"
+									name="train-task"
+									value="segment"
+									disabled={isTraining}
+									checked={trainTask === "segment"}
+									onchange={() => selectTrainTask("segment")}
+									class="mt-0.5 accent-amber-500"
+								/>
+								<div>
+									<span class="block text-sm font-medium text-zinc-200">Instance Segmentation</span>
+									<span class="block text-xs text-zinc-400">Polygon masks (task="segment")</span>
+								</div>
+							</label>
+						</div>
+					</div>
+
+					{#if isSegmentationRun && isDatasetSelected}
+						{#if labelCheckPending}
+							<p class="text-xs text-zinc-400">Checking label files for polygon annotations…</p>
+						{:else if labelWarning}
+							<div class="rounded-lg border border-amber-500/50 bg-amber-500/10 px-3.5 py-2.5 text-xs leading-relaxed text-amber-100/90">
+								{labelWarning}
+							</div>
+						{:else if labelCheckNote}
+							<p class="text-xs text-emerald-400/90">{labelCheckNote}</p>
+						{/if}
+					{/if}
+
 					<!-- Dynamic Model Inputs based on choice -->
 					{#if modelMode === "fresh"}
 						<div class="space-y-1.5 pt-1">
@@ -1000,20 +1239,24 @@ async function handleExportToOnnx() {
 								disabled={isTraining}
 								class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
 							>
-								<optgroup label="YOLO11 Series">
-									{#each freshModelOptions.filter((o) => o.family === "YOLO11") as opt (opt.id)}
-										<option value={opt.id}>
-											{opt.label} ({opt.id}) — {opt.desc}
-										</option>
-									{/each}
-								</optgroup>
-								<optgroup label="YOLO26 Series">
-									{#each freshModelOptions.filter((o) => o.family === "YOLO26") as opt (opt.id)}
-										<option value={opt.id}>
-											{opt.label} ({opt.id}) — {opt.desc}
-										</option>
-									{/each}
-								</optgroup>
+								{#if visibleModelOptions.some((o) => o.family === "YOLO11")}
+									<optgroup label={trainTask === "segment" ? "YOLO11 Segmentation" : "YOLO11 Series"}>
+										{#each visibleModelOptions.filter((o) => o.family === "YOLO11") as opt (opt.id)}
+											<option value={opt.id}>
+												{opt.label} ({opt.id}) — {opt.desc}
+											</option>
+										{/each}
+									</optgroup>
+								{/if}
+								{#if visibleModelOptions.some((o) => o.family === "YOLO26")}
+									<optgroup label={trainTask === "segment" ? "YOLO26 Segmentation" : "YOLO26 Series"}>
+										{#each visibleModelOptions.filter((o) => o.family === "YOLO26") as opt (opt.id)}
+											<option value={opt.id}>
+												{opt.label} ({opt.id}) — {opt.desc}
+											</option>
+										{/each}
+									</optgroup>
+								{/if}
 							</select>
 						</div>
 					{:else}
@@ -1417,9 +1660,21 @@ async function handleExportToOnnx() {
 							</span>
 						</div>
 
-						<!-- Preset buttons: Off / Light / Medium -->
+						<!-- Preset buttons: Bench / Off / Light / Medium -->
 						<div class="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-950/60 p-0.5">
 							<span class="px-2 text-[11px] text-zinc-500">Preset:</span>
+							<button
+								type="button"
+								onclick={() => applyAugPreset("bench")}
+								disabled={isTraining}
+								class={`rounded-md px-2 py-0.5 text-xs font-medium transition ${
+									activeAugPreset === "bench"
+										? "bg-amber-500/20 text-amber-300 border border-amber-500/40"
+										: "text-zinc-400 hover:text-zinc-200"
+								} disabled:opacity-50`}
+							>
+								Bench
+							</button>
 							<button
 								type="button"
 								onclick={() => applyAugPreset("off")}
@@ -1671,7 +1926,7 @@ async function handleExportToOnnx() {
 						<!-- Degrees -->
 						<div class="space-y-1.5">
 							<div class="flex h-5 items-center justify-between">
-								<label for="degrees-input" class="text-xs font-medium text-zinc-400">
+								<label for="degrees-input" class="text-xs font-medium text-zinc-400" title="180° gives top-down rotational invariance on a bench.">
 									Degrees (±rot)
 								</label>
 								<span class="font-mono text-[11px] text-zinc-500">0–180°</span>
@@ -1723,7 +1978,7 @@ async function handleExportToOnnx() {
 										}}
 										class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
 										aria-label="scale help"
-										title="Random zoom range. 0.2 means ±20 %. Lower values keep part sizes closer to production camera distance."
+										title="Random zoom range. Bench default 0.05 is ±5% for a fixed working distance."
 									>
 										?
 									</button>
@@ -1752,7 +2007,7 @@ async function handleExportToOnnx() {
 											</button>
 										</div>
 										<p class="mt-1 text-zinc-300">
-											Random zoom range. 0.2 means ±20 %. Lower values keep part sizes closer to production camera distance.
+											Random zoom range. 0.05 means ±5%. The bench default keeps part sizes close to a fixed working distance.
 										</p>
 									</div>
 								{/if}
@@ -1763,8 +2018,129 @@ async function handleExportToOnnx() {
 								type="number"
 								min="0"
 								max="1"
-								step="0.05"
+								step="0.01"
 								bind:value={scale}
+								disabled={isTraining}
+								class="h-[42px] w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+							/>
+						</div>
+					</div>
+
+					<div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+						<div class="space-y-1.5">
+							<div class="relative flex h-5 items-center justify-between">
+								<div class="flex items-center gap-1.5">
+									<label for="flipud-input" class="text-xs font-medium text-zinc-400">
+										Flip UD
+									</label>
+									<button
+										type="button"
+										onclick={(e) => {
+											e.stopPropagation();
+											activeTooltip = activeTooltip === "flipud" ? null : "flipud";
+										}}
+										class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
+										aria-label="flipud help"
+										title="Probability of a vertical flip. 0.5 gives top-down parts the same invariance as a horizontal flip."
+									>
+										?
+									</button>
+								</div>
+								<span class="font-mono text-[11px] text-zinc-500">0.0–1.0</span>
+
+								{#if activeTooltip === "flipud"}
+									<!-- svelte-ignore a11y_no_static_element_interactions -->
+									<div
+										onclick={(e) => e.stopPropagation()}
+										onkeydown={(e) => e.stopPropagation()}
+										class="absolute bottom-full left-0 z-30 mb-2 w-64 rounded-lg border border-amber-500/40 bg-zinc-900 p-2.5 text-xs leading-relaxed text-zinc-200 shadow-xl backdrop-blur-md"
+									>
+										<div class="flex items-start justify-between gap-2 border-b border-zinc-800 pb-1">
+											<span class="font-semibold text-amber-400">flipud</span>
+											<button
+												type="button"
+												onclick={(e) => {
+													e.stopPropagation();
+													activeTooltip = null;
+												}}
+												class="text-zinc-400 transition hover:text-zinc-100"
+												aria-label="Close tooltip"
+											>
+												&times;
+											</button>
+										</div>
+										<p class="mt-1 text-zinc-300">
+											Probability of flipping the image upside down. Bench default is 0.5 so a top-down camera is invariant to which way the part is placed.
+										</p>
+									</div>
+								{/if}
+							</div>
+							<input
+								id="flipud-input"
+								type="number"
+								min="0"
+								max="1"
+								step="0.05"
+								bind:value={flipud}
+								disabled={isTraining}
+								class="h-[42px] w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+							/>
+						</div>
+
+						<div class="space-y-1.5">
+							<div class="relative flex h-5 items-center justify-between">
+								<div class="flex items-center gap-1.5">
+									<label for="close-mosaic-input" class="text-xs font-medium text-zinc-400">
+										Close mosaic
+									</label>
+									<button
+										type="button"
+										onclick={(e) => {
+											e.stopPropagation();
+											activeTooltip = activeTooltip === "close_mosaic" ? null : "close_mosaic";
+										}}
+										class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
+										aria-label="close mosaic help"
+										title="Turns mosaic off for the final N epochs. Bench default is 10."
+									>
+										?
+									</button>
+								</div>
+								<span class="font-mono text-[11px] text-zinc-500">epochs</span>
+
+								{#if activeTooltip === "close_mosaic"}
+									<!-- svelte-ignore a11y_no_static_element_interactions -->
+									<div
+										onclick={(e) => e.stopPropagation()}
+										onkeydown={(e) => e.stopPropagation()}
+										class="absolute bottom-full right-0 z-30 mb-2 w-64 rounded-lg border border-amber-500/40 bg-zinc-900 p-2.5 text-xs leading-relaxed text-zinc-200 shadow-xl backdrop-blur-md"
+									>
+										<div class="flex items-start justify-between gap-2 border-b border-zinc-800 pb-1">
+											<span class="font-semibold text-amber-400">close_mosaic</span>
+											<button
+												type="button"
+												onclick={(e) => {
+													e.stopPropagation();
+													activeTooltip = null;
+												}}
+												class="text-zinc-400 transition hover:text-zinc-100"
+												aria-label="Close tooltip"
+											>
+												&times;
+											</button>
+										</div>
+										<p class="mt-1 text-zinc-300">
+											Disables mosaic for the last N epochs so the model finishes on whole images. 10 is the bench default.
+										</p>
+									</div>
+								{/if}
+							</div>
+							<input
+								id="close-mosaic-input"
+								type="number"
+								min="0"
+								step="1"
+								bind:value={closeMosaic}
 								disabled={isTraining}
 								class="h-[42px] w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
 							/>
@@ -1774,6 +2150,21 @@ async function handleExportToOnnx() {
 
 				<!-- Section 6: Go Button -->
 				<div class="border-t border-zinc-800/80 pt-5 space-y-3">
+					<label class="flex items-start gap-3 rounded-lg border border-zinc-800/90 bg-zinc-950/40 px-3.5 py-2.5">
+						<input
+							type="checkbox"
+							bind:checked={autoExportOnnx}
+							disabled={isTraining}
+							class="mt-0.5 h-4 w-4 rounded border-zinc-700 bg-zinc-900 accent-amber-500 focus:ring-amber-500 disabled:opacity-50"
+						/>
+						<span>
+							<span class="block text-sm font-medium text-zinc-200">Auto-export ONNX on completion</span>
+							<span class="block text-xs text-zinc-400">
+								After a successful run, export best.pt with format="onnx", the selected image size, dynamic=False, and simplify=True.
+							</span>
+						</span>
+					</label>
+
 					{#if epochCountdownText}
 						<div class="rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 space-y-2">
 							<div class="flex flex-wrap items-center justify-between gap-2">
@@ -1811,6 +2202,12 @@ async function handleExportToOnnx() {
 								<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
 							</svg>
 							<span>{statusMessage}</span>
+						{:else if isExportingOnnx}
+							<svg class="h-4 w-4 animate-spin text-zinc-950" aria-hidden="true" fill="none" viewBox="0 0 24 24">
+								<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+								<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+							</svg>
+							<span class="text-zinc-950 font-medium">Exporting ONNX...</span>
 						{:else if isTraining}
 							<svg class="h-4 w-4 animate-spin text-zinc-950" aria-hidden="true" fill="none" viewBox="0 0 24 24">
 								<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>

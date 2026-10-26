@@ -6,10 +6,14 @@ Built for the Lean Studio / LS-Vision workflow. Point it at a Label Studio (or Y
 
 ## Features
 
-- Train YOLO models from a local dataset (`data.yaml` + images)
+- Train YOLO11 and YOLO26 models for object detection or instance segmentation
+- Segmentation weights: `yolo11s-seg.pt`, `yolo11m-seg.pt`, `yolo26s-seg.pt` (`task="segment"`)
+- Bench defaults for a fixed top-down camera: `degrees` 180, `flipud` 0.5, `scale` 0.05, `close_mosaic` 10
+- Image sizes 640, 960, and 1280 px
+- Warns when a segmentation run is pointed at plain bounding-box labels
 - Live training log
-- Export finished model to ONNX
-- Open the run folder or copy the weights path
+- Auto-export the finished model to ONNX at the selected image size (`dynamic=False`, `simplify=True`)
+- Open the run folder or copy the weights and ONNX paths
 - Runs the local Python environment (Ultralytics) as a sidecar
 
 ## Windows Installer & Post-Install Setup
@@ -73,11 +77,10 @@ The app looks for this `.venv` when it runs training and ONNX export.
 npm run tauri dev
 ```
 
-The app expects a YOLO-format dataset (the zip export from Label Studio works).  
-After a successful run you can convert the model to ONNX and copy the path for use in LS-Vision.
+The app expects a YOLO-format dataset archive (`.tar`, `.tar.gz`, or `.tgz`, including a Label Studio export).  
+Detection runs are written under `runs/detect`. Segmentation runs are written under `runs/segment`.  
+When auto-export is on, a successful run writes `best.onnx` next to `best.pt`. Copy that path for LS-Vision.
 
 ## Project status
 
-Early but usable.  
-Current focus is reliable local training + ONNX export.  
-Other base models and dataset formats can be added later.
+Version 0.1.4. Usable for local detection and instance-segmentation training, plus ONNX export.

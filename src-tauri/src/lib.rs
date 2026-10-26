@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tauri::ipc::Channel;
@@ -38,6 +38,13 @@ pub struct TrainingRequest {
     pub translate: f32,
     #[serde(default = "default_scale")]
     pub scale: f32,
+    #[serde(default = "default_flipud")]
+    pub flipud: f32,
+    #[serde(default = "default_close_mosaic")]
+    pub close_mosaic: u32,
+    /// Ultralytics task: "detect" or "segment". A `-seg` weight forces "segment".
+    #[serde(default = "default_task")]
+    pub task: String,
 }
 
 fn default_batch() -> u32 {
@@ -69,7 +76,7 @@ fn default_copy_paste() -> f32 {
 }
 
 fn default_degrees() -> f32 {
-    0.0
+    180.0
 }
 
 fn default_translate() -> f32 {
@@ -77,7 +84,31 @@ fn default_translate() -> f32 {
 }
 
 fn default_scale() -> f32 {
-    0.2
+    0.05
+}
+
+fn default_flipud() -> f32 {
+    0.5
+}
+
+fn default_close_mosaic() -> u32 {
+    10
+}
+
+fn default_task() -> String {
+    "detect".to_string()
+}
+
+fn default_export_imgsz() -> u32 {
+    640
+}
+
+fn default_export_dynamic() -> bool {
+    false
+}
+
+fn default_export_simplify() -> bool {
+    true
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
@@ -991,6 +1022,258 @@ fn resolve_or_download_model_weights(
     weight_filename
 }
 
+const MAX_LABEL_FILES: u32 = 80;
+const MAX_LINES_PER_FILE: u32 = 40;
+
+#[derive(serde::Serialize, Debug, Clone)]
+pub struct LabelCheckResult {
+    pub polygons_found: bool,
+    pub bboxes_found: bool,
+    pub files_scanned: u32,
+    pub lines_scanned: u32,
+    pub warning: Option<String>,
+}
+
+#[derive(Default)]
+struct LabelStats {
+    polygons: u32,
+    bboxes: u32,
+    files_scanned: u32,
+    lines_scanned: u32,
+}
+
+/// YOLO detect lines are `class xc yc w h` (5 values).
+/// Segmentation polygons are `class x1 y1 x2 y2 ...` (more than 5 values).
+fn classify_annotation_line(line: &str) -> Option<bool> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let mut count = 0u32;
+    for token in line.split_whitespace() {
+        if token.parse::<f64>().is_err() {
+            return None;
+        }
+        count += 1;
+    }
+    if count == 5 {
+        Some(false)
+    } else if count > 5 {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn path_is_candidate_label(path: &str) -> bool {
+    let lower = path.replace('\\', "/").to_ascii_lowercase();
+    if lower.contains("__macosx/") || !lower.ends_with(".txt") {
+        return false;
+    }
+    let file_name = lower.rsplit('/').next().unwrap_or(&lower);
+    if file_name.starts_with("._") {
+        return false;
+    }
+    if matches!(
+        file_name,
+        "classes.txt" | "class_names.txt" | "notes.txt" | "readme.txt" | "license.txt"
+    ) {
+        return false;
+    }
+    let in_labels = lower.contains("/labels/") || lower.starts_with("labels/");
+    if !in_labels
+        && matches!(
+            file_name,
+            "train.txt" | "val.txt" | "valid.txt" | "test.txt" | "data.txt"
+        )
+    {
+        return false;
+    }
+    true
+}
+
+fn scan_label_text(text: &str, stats: &mut LabelStats) {
+    let mut lines_in_file = 0u32;
+    let mut counted = false;
+    for line in text.lines() {
+        if lines_in_file >= MAX_LINES_PER_FILE {
+            break;
+        }
+        match classify_annotation_line(line) {
+            Some(true) => {
+                stats.polygons += 1;
+                stats.lines_scanned += 1;
+                lines_in_file += 1;
+                counted = true;
+            }
+            Some(false) => {
+                stats.bboxes += 1;
+                stats.lines_scanned += 1;
+                lines_in_file += 1;
+                counted = true;
+            }
+            None => {}
+        }
+    }
+    if counted {
+        stats.files_scanned += 1;
+    }
+}
+
+fn label_sample_complete(stats: &LabelStats) -> bool {
+    if stats.polygons > 0 && stats.bboxes > 0 {
+        return true;
+    }
+    stats.files_scanned >= MAX_LABEL_FILES
+}
+
+fn result_from_stats(stats: &LabelStats) -> LabelCheckResult {
+    let warning = if stats.lines_scanned == 0 {
+        Some(
+            "No polygon annotations were found in the dataset labels. Instance segmentation needs label lines with more than 5 values (class plus polygon points)."
+                .to_string(),
+        )
+    } else if stats.polygons == 0 && stats.bboxes > 0 {
+        Some(format!(
+            "Plain bounding-box labels detected ({} lines with 5 values, 0 polygon lines). Instance segmentation needs polygon annotations (more than 5 values per line).",
+            stats.bboxes
+        ))
+    } else if stats.bboxes > 0 {
+        Some(format!(
+            "Mixed labels detected: {} polygon lines and {} plain bounding-box lines (5 values). Segmentation training expects polygons (more than 5 values per line).",
+            stats.polygons, stats.bboxes
+        ))
+    } else {
+        None
+    };
+
+    LabelCheckResult {
+        polygons_found: stats.polygons > 0,
+        bboxes_found: stats.bboxes > 0,
+        files_scanned: stats.files_scanned,
+        lines_scanned: stats.lines_scanned,
+        warning,
+    }
+}
+
+fn inspect_label_tree(root: &Path) -> LabelCheckResult {
+    let mut stats = LabelStats::default();
+    for entry in walkdir::WalkDir::new(root)
+        .max_depth(6)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if label_sample_complete(&stats) {
+            break;
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path_str = entry.path().to_string_lossy().to_string();
+        if !path_is_candidate_label(&path_str) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        let slice = if bytes.len() > 256 * 1024 {
+            &bytes[..256 * 1024]
+        } else {
+            &bytes[..]
+        };
+        let text = String::from_utf8_lossy(slice);
+        scan_label_text(&text, &mut stats);
+    }
+    result_from_stats(&stats)
+}
+
+fn scan_tar_archive<R: Read>(mut archive: tar::Archive<R>) -> Result<LabelCheckResult, String> {
+    let mut stats = LabelStats::default();
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("Failed to read dataset archive: {e}"))?;
+    for entry in entries {
+        if label_sample_complete(&stats) {
+            break;
+        }
+        let mut entry = entry.map_err(|e| format!("Failed to read archive entry: {e}"))?;
+        let path_str = {
+            let path = entry
+                .path()
+                .map_err(|e| format!("Failed to read archive entry path: {e}"))?;
+            path.to_string_lossy().to_string()
+        };
+        if !path_is_candidate_label(&path_str) {
+            continue;
+        }
+        let mut buf = Vec::new();
+        let mut limited = (&mut entry).take(256 * 1024);
+        let _ = limited.read_to_end(&mut buf);
+        let text = String::from_utf8_lossy(&buf);
+        scan_label_text(&text, &mut stats);
+    }
+    Ok(result_from_stats(&stats))
+}
+
+fn inspect_archive_labels(archive_path: &Path) -> Result<LabelCheckResult, String> {
+    let file = File::open(archive_path)
+        .map_err(|e| format!("Failed to open dataset archive: {e}"))?;
+    let path_str = archive_path.to_string_lossy().to_lowercase();
+    if path_str.ends_with(".tar.gz") || path_str.ends_with(".tgz") {
+        let gz = flate2::read::GzDecoder::new(BufReader::new(file));
+        scan_tar_archive(tar::Archive::new(gz))
+    } else if path_str.ends_with(".tar") {
+        scan_tar_archive(tar::Archive::new(BufReader::new(file)))
+    } else {
+        Err(format!(
+            "Unsupported dataset archive format: {}",
+            archive_path.display()
+        ))
+    }
+}
+
+fn inspect_dataset_path(path: &Path) -> Result<LabelCheckResult, String> {
+    if !path.exists() {
+        return Err(format!(
+            "Dataset path does not exist: {}",
+            path.display()
+        ));
+    }
+    if path.is_dir() {
+        return Ok(inspect_label_tree(path));
+    }
+    let lower = path.to_string_lossy().to_lowercase();
+    if lower.ends_with(".yaml") || lower.ends_with(".yml") {
+        let root = path.parent().unwrap_or(path);
+        return Ok(inspect_label_tree(root));
+    }
+    if lower.ends_with(".tar") || lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        return inspect_archive_labels(path);
+    }
+    Err(format!(
+        "Unsupported dataset path for label check: {}",
+        path.display()
+    ))
+}
+
+fn resolve_train_task(request: &TrainingRequest) -> String {
+    let model = request.model_choice.to_ascii_lowercase();
+    if model.contains("-seg") {
+        return "segment".to_string();
+    }
+    if request.task.eq_ignore_ascii_case("segment") {
+        return "segment".to_string();
+    }
+    "detect".to_string()
+}
+
+#[tauri::command]
+async fn inspect_dataset_labels(dataset_path: String) -> Result<LabelCheckResult, String> {
+    tauri::async_runtime::spawn_blocking(move || inspect_dataset_path(Path::new(&dataset_path)))
+        .await
+        .map_err(|e| format!("Label check failed: {e}"))?
+}
+
 fn save_run_config_metadata(
     abs_results_dir: &Path,
     request: &TrainingRequest,
@@ -1015,6 +1298,7 @@ fn save_run_config_metadata(
         "dataset_path": request.dataset_path,
         "model_choice": request.model_choice,
         "resolved_model": resolved_model,
+        "task": resolve_train_task(request),
         "freeze_backbone": request.freeze_backbone,
         "freeze_layers": effective_freeze,
         "epochs": request.epochs,
@@ -1029,6 +1313,8 @@ fn save_run_config_metadata(
             "degrees": request.degrees,
             "translate": request.translate,
             "scale": request.scale,
+            "flipud": request.flipud,
+            "close_mosaic": request.close_mosaic,
         },
         "command": exact_command,
     });
@@ -1056,7 +1342,8 @@ async fn start_training(
     };
 
     let project_root = get_project_root();
-    let project_runs_dir = project_root.join("runs").join("detect");
+    let yolo_task = resolve_train_task(&request);
+    let project_runs_dir = project_root.join("runs").join(&yolo_task);
     let abs_results_dir = project_runs_dir.join(&run_name);
     let results_dir = to_display_path(&abs_results_dir);
 
@@ -1111,6 +1398,22 @@ async fn start_training(
         dataset_input.clone()
     };
 
+    if yolo_task == "segment" {
+        let label_root = raw_data_yaml_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| dataset_input.clone());
+        let label_check = inspect_label_tree(&label_root);
+        if let Some(warning) = label_check.warning {
+            let _ = on_log.send(format!("[LS-Trainer] Warning: {warning}"));
+        } else {
+            let _ = on_log.send(format!(
+                "[LS-Trainer] Segmentation labels OK: polygon annotations found ({} label files, {} lines).",
+                label_check.files_scanned, label_check.lines_scanned
+            ));
+        }
+    }
+
     // Read data.yaml, resolve all relative paths to absolute, and rewrite it
     let fixed_data_yaml_path = resolve_and_fix_data_yaml(&raw_data_yaml_path, &on_log)?;
     let data_str = fixed_data_yaml_path.to_string_lossy().to_string();
@@ -1136,6 +1439,9 @@ async fn start_training(
     let degrees_arg = format!("degrees={}", request.degrees);
     let translate_arg = format!("translate={}", request.translate);
     let scale_arg = format!("scale={}", request.scale);
+    let flipud_arg = format!("flipud={}", request.flipud);
+    let close_mosaic_arg = format!("close_mosaic={}", request.close_mosaic);
+    let task_arg = format!("task={yolo_task}");
     let freeze_layers_val = request.freeze_layers.max(1);
     let freeze_arg_opt = if request.freeze_backbone {
         Some(format!("freeze={freeze_layers_val}"))
@@ -1144,7 +1450,11 @@ async fn start_training(
     };
 
     let _ = on_log.send(format!(
-        "[LS-Trainer] Active config: model={} | freeze={} | mosaic={} | mixup={} | copy_paste={} | degrees={} | translate={} | scale={} | amp={}",
+        "[LS-Trainer] Ultralytics task=\"{yolo_task}\""
+    ));
+    let _ = on_log.send(format!(
+        "[LS-Trainer] Active config: task={} | model={} | freeze={} | mosaic={} | close_mosaic={} | mixup={} | copy_paste={} | degrees={} | flipud={} | translate={} | scale={} | amp={}",
+        yolo_task,
         request.model_choice,
         if request.freeze_backbone {
             format!("{freeze_layers_val} layers")
@@ -1152,9 +1462,11 @@ async fn start_training(
             "none (0)".to_string()
         },
         request.mosaic,
+        request.close_mosaic,
         request.mixup,
         request.copy_paste,
         request.degrees,
+        request.flipud,
         request.translate,
         request.scale,
         request.amp
@@ -1193,8 +1505,9 @@ async fn start_training(
     let project_arg = format!("project={project_runs_str}");
 
     let mut train_args: Vec<String> = vec![
-        "detect".to_string(),
+        yolo_task.clone(),
         "train".to_string(),
+        task_arg,
         data_arg,
         model_arg,
         name_arg,
@@ -1210,9 +1523,11 @@ async fn start_training(
     }
     train_args.extend([
         mosaic_arg,
+        close_mosaic_arg,
         mixup_arg,
         copy_paste_arg,
         degrees_arg,
+        flipud_arg,
         translate_arg,
         scale_arg,
     ]);
@@ -1369,6 +1684,12 @@ async fn start_training(
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct ExportRequest {
     pub results_dir: String,
+    #[serde(default = "default_export_imgsz")]
+    pub imgsz: u32,
+    #[serde(default = "default_export_dynamic")]
+    pub dynamic: bool,
+    #[serde(default = "default_export_simplify")]
+    pub simplify: bool,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
@@ -1530,11 +1851,35 @@ async fn export_to_onnx(
     let best_pt_str = best_pt.to_string_lossy().replace('\\', "/");
     let _ = on_log.send(format!("[LS-Trainer] Found checkpoint: {best_pt_str}"));
 
+    let export_imgsz = if request.imgsz == 0 {
+        default_export_imgsz()
+    } else {
+        request.imgsz
+    };
+    let dynamic_flag = if request.dynamic { "True" } else { "False" };
+    let simplify_flag = if request.simplify { "True" } else { "False" };
+    let _ = on_log.send(format!(
+        "[LS-Trainer] model.export(format=\"onnx\", imgsz={export_imgsz}, dynamic={dynamic_flag}, simplify={simplify_flag})"
+    ));
+
     #[cfg(target_os = "windows")]
     let expected_venv_yolo = project_root.join(".venv").join("Scripts").join("yolo.exe");
 
     #[cfg(not(target_os = "windows"))]
     let expected_venv_yolo = project_root.join(".venv").join("bin").join("yolo");
+
+    let model_arg = format!("model={best_pt_str}");
+    let imgsz_arg = format!("imgsz={export_imgsz}");
+    let dynamic_arg = format!("dynamic={dynamic_flag}");
+    let simplify_arg = format!("simplify={simplify_flag}");
+    let export_args = [
+        "export",
+        model_arg.as_str(),
+        "format=onnx",
+        imgsz_arg.as_str(),
+        dynamic_arg.as_str(),
+        simplify_arg.as_str(),
+    ];
 
     let (mut cmd, exact_command) = if expected_venv_yolo.is_file() {
         let _ = on_log.send(format!(
@@ -1543,15 +1888,10 @@ async fn export_to_onnx(
         ));
 
         let mut c = Command::new(&expected_venv_yolo);
-        c.args([
-            "export",
-            &format!("model={best_pt_str}"),
-            "format=onnx",
-            "imgsz=640",
-        ]);
+        c.args(export_args);
 
         let cmd_str = format!(
-            "\"{}\" export model=\"{best_pt_str}\" format=onnx imgsz=640",
+            "\"{}\" export model=\"{best_pt_str}\" format=onnx imgsz={export_imgsz} dynamic={dynamic_flag} simplify={simplify_flag}",
             expected_venv_yolo.display()
         );
 
@@ -1565,30 +1905,21 @@ async fn export_to_onnx(
         #[cfg(target_os = "windows")]
         let c = {
             let mut cmd = Command::new("cmd");
-            cmd.args([
-                "/C",
-                "yolo",
-                "export",
-                &format!("model={best_pt_str}"),
-                "format=onnx",
-                "imgsz=640",
-            ]);
+            cmd.args(["/C", "yolo"]);
+            cmd.args(export_args);
             cmd
         };
 
         #[cfg(not(target_os = "windows"))]
         let c = {
             let mut cmd = Command::new("yolo");
-            cmd.args([
-                "export",
-                &format!("model={best_pt_str}"),
-                "format=onnx",
-                "imgsz=640",
-            ]);
+            cmd.args(export_args);
             cmd
         };
 
-        let cmd_str = format!("yolo export model=\"{best_pt_str}\" format=onnx imgsz=640");
+        let cmd_str = format!(
+            "yolo export model=\"{best_pt_str}\" format=onnx imgsz={export_imgsz} dynamic={dynamic_flag} simplify={simplify_flag}"
+        );
 
         (c, cmd_str)
     };
@@ -1695,6 +2026,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             pick_dataset_file,
             pick_model_file,
+            inspect_dataset_labels,
             start_training,
             open_folder,
             export_to_onnx,
@@ -1703,4 +2035,127 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while building tauri application");
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    #[test]
+    fn polygon_line_has_more_than_five_values() {
+        let mut stats = LabelStats::default();
+        scan_label_text("0 0.1 0.1 0.2 0.1 0.2 0.2\n", &mut stats);
+        assert_eq!(stats.polygons, 1);
+        assert_eq!(stats.bboxes, 0);
+        let result = result_from_stats(&stats);
+        assert!(result.polygons_found);
+        assert!(result.warning.is_none());
+    }
+
+    #[test]
+    fn bbox_line_warns_for_segmentation() {
+        let mut stats = LabelStats::default();
+        scan_label_text("0 0.5 0.5 0.2 0.2\n", &mut stats);
+        let result = result_from_stats(&stats);
+        assert!(result.bboxes_found);
+        assert!(!result.polygons_found);
+        let warning = result.warning.expect("bbox dataset should warn");
+        assert!(warning.to_lowercase().contains("bounding-box"));
+    }
+
+    #[test]
+    fn mixed_labels_warn() {
+        let mut stats = LabelStats::default();
+        scan_label_text("0 0.5 0.5 0.2 0.2\n1 0.1 0.1 0.2 0.1 0.2 0.2 0.1 0.2\n", &mut stats);
+        let result = result_from_stats(&stats);
+        assert!(result.polygons_found && result.bboxes_found);
+        assert!(result.warning.is_some());
+    }
+
+    #[test]
+    fn class_name_lines_are_not_annotations() {
+        let mut stats = LabelStats::default();
+        scan_label_text("bolt\nnut\n", &mut stats);
+        assert_eq!(stats.lines_scanned, 0);
+        assert!(result_from_stats(&stats).warning.is_some());
+    }
+
+    #[test]
+    fn archive_scan_warns_on_bbox_labels() {
+        let mut raw = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut raw);
+            let body = b"0 0.5 0.5 0.1 0.1\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "labels/train/a.txt", &body[..])
+                .unwrap();
+            let classes = b"bolt\n";
+            let mut classes_header = tar::Header::new_gnu();
+            classes_header.set_size(classes.len() as u64);
+            classes_header.set_cksum();
+            builder
+                .append_data(&mut classes_header, "classes.txt", &classes[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let result = scan_tar_archive(tar::Archive::new(std::io::Cursor::new(raw))).unwrap();
+        assert!(result.bboxes_found);
+        assert!(!result.polygons_found);
+        assert!(result.warning.is_some());
+    }
+
+    #[test]
+    fn seg_weight_forces_segment_task() {
+        let request = TrainingRequest {
+            dataset_path: String::new(),
+            model_choice: "yolo11s-seg.pt".to_string(),
+            run_name: String::new(),
+            epochs: 1,
+            imgsz: 1280,
+            device: "cpu".to_string(),
+            batch: 4,
+            amp: true,
+            freeze_backbone: false,
+            freeze_layers: 10,
+            mosaic: 0.0,
+            mixup: 0.0,
+            copy_paste: 0.0,
+            degrees: 180.0,
+            translate: 0.1,
+            scale: 0.05,
+            flipud: 0.5,
+            close_mosaic: 10,
+            task: "detect".to_string(),
+        };
+        assert_eq!(resolve_train_task(&request), "segment");
+    }
+
+    #[test]
+    fn task_selector_segment_without_seg_filename() {
+        let request = TrainingRequest {
+            dataset_path: String::new(),
+            model_choice: r"C:\runs\segment\best.pt".to_string(),
+            run_name: String::new(),
+            epochs: 1,
+            imgsz: 1280,
+            device: "cpu".to_string(),
+            batch: 4,
+            amp: true,
+            freeze_backbone: false,
+            freeze_layers: 10,
+            mosaic: 0.0,
+            mixup: 0.0,
+            copy_paste: 0.0,
+            degrees: 180.0,
+            translate: 0.1,
+            scale: 0.05,
+            flipud: 0.5,
+            close_mosaic: 10,
+            task: "segment".to_string(),
+        };
+        assert_eq!(resolve_train_task(&request), "segment");
+    }
 }
