@@ -318,7 +318,15 @@ fn shorten_gpu_name(full_name: &str) -> String {
 
 fn is_intel_arc_gpu(name: &str) -> bool {
     let lower = name.to_lowercase();
-    (lower.contains("intel") && (lower.contains("arc") || lower.contains("xpu")))
+    (lower.contains("intel")
+        && (lower.contains("arc")
+            || lower.contains("xpu")
+            || lower.contains("dg2")
+            || lower.contains("battlemage")
+            || lower.contains("alchemist")
+            || lower.contains("xe")
+            || lower.contains("pro a")
+            || lower.contains("pro b")))
         || lower.starts_with("arc ")
 }
 
@@ -393,6 +401,79 @@ fn detect_hardware_gpu() -> (Option<String>, Option<String>, Option<u32>) {
                             Some(raw_drv.to_string())
                         };
                         return (name, drv_opt, None);
+                    }
+                }
+            }
+        }
+    }
+
+    // 1b. Prefer Intel Arc / XPU when present on Linux
+    #[cfg(target_os = "linux")]
+    {
+        // Check xpu-smi discovery
+        let mut xpu_cmd = Command::new("xpu-smi");
+        xpu_cmd.args(["discovery", "-d", "0"]);
+        if let Ok(output) = xpu_cmd.output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    let trimmed = line.trim();
+                    if let Some(rest) = trimmed.strip_prefix("Device Name:") {
+                        let name = rest.trim().to_string();
+                        if !name.is_empty() {
+                            return (Some(name), None, None);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check lspci for Intel Arc / DG2 / Battlemage / Alchemist / Pro GPUs
+        for lspci_bin in ["lspci", "/usr/bin/lspci"] {
+            if let Ok(output) = Command::new(lspci_bin).output() {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines() {
+                        let lower = line.to_lowercase();
+                        if lower.contains("intel")
+                            && (lower.contains("arc")
+                                || lower.contains("dg2")
+                                || lower.contains("battlemage")
+                                || lower.contains("alchemist")
+                                || lower.contains("xpu")
+                                || lower.contains("pro a")
+                                || lower.contains("pro b")
+                                || lower.contains("graphics")
+                                || lower.contains("device 56"))
+                        {
+                            let parsed_name = if let Some((_, after)) = line.split_once(": ") {
+                                after.trim().to_string()
+                            } else {
+                                line.trim().to_string()
+                            };
+                            return (Some(parsed_name), None, None);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check Linux sysfs DRM devices for Intel vendor 0x8086
+        if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if file_name.starts_with("card") && !file_name.contains('-') {
+                    let vendor_path = entry.path().join("device").join("vendor");
+                    if let Ok(vendor) = std::fs::read_to_string(&vendor_path) {
+                        if vendor.trim().eq_ignore_ascii_case("0x8086") {
+                            let driver_link = entry.path().join("device").join("driver");
+                            if let Ok(target) = std::fs::read_link(&driver_link) {
+                                let drv = target.file_name().unwrap_or_default().to_string_lossy();
+                                if drv == "i915" || drv == "xe" {
+                                    return (Some("Intel Arc GPU".to_string()), None, None);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2378,12 +2459,15 @@ def select_training_device(requested):
     if req in ("", "auto", "gpu", "0", "xpu", "xpu:0", "cuda", "cuda:0"):
         if xpu_avail and req not in ("cuda", "cuda:0"):
             dev_name = "Intel Arc XPU"
+            dev_count = 1
             try:
+                dev_count = torch.xpu.device_count()
                 dev_name = torch.xpu.get_device_name(0)
             except Exception:
                 pass
+            count_info = f" ({dev_count} device(s) detected)" if dev_count > 1 else ""
             print(
-                f"[LS-Trainer] RF-DETR device selection: torch.xpu.is_available()=True -> using Intel Arc XPU device=xpu ({dev_name})",
+                f"[LS-Trainer] RF-DETR device selection: torch.xpu.is_available()=True -> using Intel Arc XPU device=xpu ({dev_name}{count_info})",
                 flush=True,
             )
             return "xpu"
@@ -2403,6 +2487,19 @@ def select_training_device(requested):
             flush=True,
         )
         return "cpu"
+
+    if req.startswith("xpu"):
+        dev_name = "Intel Arc XPU"
+        try:
+            idx = int(req.split(":")[1]) if ":" in req else 0
+            dev_name = torch.xpu.get_device_name(idx)
+        except Exception:
+            pass
+        print(
+            f"[LS-Trainer] RF-DETR device selection: using specified Intel Arc device={requested} ({dev_name})",
+            flush=True,
+        )
+        return str(requested)
 
     print(f"[LS-Trainer] RF-DETR device selection: using custom device={requested}", flush=True)
     return str(requested)
@@ -2559,15 +2656,27 @@ def main():
 
     def hooked_build_trainer(*args, **kw):
         if str(device).lower().startswith("xpu"):
+            dev_idx = 0
+            if ":" in str(device):
+                try:
+                    dev_idx = int(str(device).split(":")[1])
+                except Exception:
+                    dev_idx = 0
             kw["accelerator"] = "auto"
             kw["devices"] = 1
             kw["strategy"] = SingleDeviceStrategy(
-                device=torch.device("xpu", 0),
+                device=torch.device("xpu", dev_idx),
                 accelerator=XPUAccelerator(),
             )
         elif str(device).lower().startswith("cuda"):
+            dev_idx = 0
+            if ":" in str(device):
+                try:
+                    dev_idx = int(str(device).split(":")[1])
+                except Exception:
+                    dev_idx = 0
             kw["accelerator"] = "cuda"
-            kw["devices"] = 1
+            kw["devices"] = [dev_idx]
         elif str(device).lower() == "cpu":
             kw["accelerator"] = "cpu"
             kw["devices"] = 1
@@ -2939,20 +3048,41 @@ async fn start_training(
     ));
 
     let device_input = request.device.trim();
-    let effective_device = if device_input.is_empty() || device_input.eq_ignore_ascii_case("auto") {
-        if is_cuda_available(&project_root) {
-            let _ = on_log.send("[LS-Trainer] CUDA available, selecting device=0".to_string());
+    let gpu_probe = detect_gpu_info(&project_root);
+    let effective_device = if device_input.eq_ignore_ascii_case("cpu") {
+        let _ = on_log.send("[LS-Trainer] Device override: using device=cpu".to_string());
+        "cpu".to_string()
+    } else if device_input.is_empty()
+        || device_input.eq_ignore_ascii_case("auto")
+        || device_input.eq_ignore_ascii_case("gpu")
+        || device_input.eq_ignore_ascii_case("xpu")
+        || device_input.eq_ignore_ascii_case("xpu:0")
+        || device_input.eq_ignore_ascii_case("cuda")
+        || device_input == "0"
+    {
+        if gpu_probe.xpu_available && !device_input.eq_ignore_ascii_case("cuda") && device_input != "0" {
+            let dev_label = gpu_probe.device_name.as_deref().unwrap_or("Intel Arc XPU");
+            let _ = on_log.send(format!(
+                "[LS-Trainer] Intel Arc XPU available (torch.xpu.is_available()=True), selecting device=xpu ({dev_label})"
+            ));
+            "xpu".to_string()
+        } else if gpu_probe.cuda_available {
+            let dev_label = gpu_probe.device_name.as_deref().unwrap_or("CUDA GPU");
+            let _ = on_log.send(format!(
+                "[LS-Trainer] CUDA available (torch.cuda.is_available()=True), selecting device=0 ({dev_label})"
+            ));
             "0".to_string()
+        } else if gpu_probe.xpu_available {
+            let dev_label = gpu_probe.device_name.as_deref().unwrap_or("Intel Arc XPU");
+            let _ = on_log.send(format!(
+                "[LS-Trainer] Intel Arc XPU available (torch.xpu.is_available()=True), selecting device=xpu ({dev_label})"
+            ));
+            "xpu".to_string()
         } else {
-            let _ = on_log.send("[LS-Trainer] No CUDA detected, using device=cpu".to_string());
-            "cpu".to_string()
-        }
-    } else if device_input.eq_ignore_ascii_case("gpu") || device_input.eq_ignore_ascii_case("cuda") {
-        if is_cuda_available(&project_root) {
-            let _ = on_log.send("[LS-Trainer] CUDA available, selecting device=0".to_string());
-            "0".to_string()
-        } else {
-            let _ = on_log.send("[LS-Trainer] No CUDA detected, falling back to device=cpu".to_string());
+            let _ = on_log.send(
+                "[LS-Trainer] Neither Intel Arc XPU nor CUDA available, using device=cpu"
+                    .to_string(),
+            );
             "cpu".to_string()
         }
     } else {
@@ -4056,6 +4186,9 @@ mod label_tests {
     fn intel_arc_and_pytorch_wheel_selection() {
         assert!(is_intel_arc_gpu("Intel(R) Arc(TM) 140V GPU (16GB)"));
         assert!(is_intel_arc_gpu("Intel Arc A770 Graphics"));
+        assert!(is_intel_arc_gpu("Intel Corporation Battlemage [Arc B580]"));
+        assert!(is_intel_arc_gpu("Intel Corporation DG2 [Arc Pro A60]"));
+        assert!(is_intel_arc_gpu("Intel Arc Pro Graphics"));
         assert!(!is_intel_arc_gpu("Intel(R) UHD Graphics 770"));
         assert!(!is_intel_arc_gpu("NVIDIA GeForce RTX 4080"));
 
