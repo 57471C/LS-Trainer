@@ -179,6 +179,8 @@ pub fn to_display_path(path: &Path) -> String {
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct GpuInfo {
     pub cuda_available: bool,
+    #[serde(default)]
+    pub xpu_available: bool,
     pub cpu_fallback_confirmed: bool,
     pub device_name: Option<String>,
     pub driver_version: Option<String>,
@@ -298,7 +300,11 @@ fn parse_driver_version(raw: &str) -> (String, Option<u32>) {
 }
 
 fn shorten_gpu_name(full_name: &str) -> String {
-    let trimmed = full_name.trim();
+    let cleaned = full_name
+        .replace("(R)", "")
+        .replace("(TM)", "")
+        .replace("  ", " ");
+    let trimmed = cleaned.trim();
     for prefix in ["NVIDIA GeForce ", "NVIDIA RTX ", "NVIDIA "] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             if prefix == "NVIDIA RTX " {
@@ -308,6 +314,12 @@ fn shorten_gpu_name(full_name: &str) -> String {
         }
     }
     trimmed.to_string()
+}
+
+fn is_intel_arc_gpu(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    (lower.contains("intel") && (lower.contains("arc") || lower.contains("xpu")))
+        || lower.starts_with("arc ")
 }
 
 fn is_blackwell_gpu(name: &str) -> bool {
@@ -326,6 +338,13 @@ fn select_pytorch_wheel(
     driver_major: Option<u32>,
 ) -> (&'static str, &'static str, &'static str) {
     if let Some(name) = gpu_name {
+        if is_intel_arc_gpu(name) {
+            return (
+                "xpu",
+                "https://download.pytorch.org/whl/xpu",
+                "Intel Arc XPU",
+            );
+        }
         let driver_is_560_plus = driver_major.map(|d| d >= 560).unwrap_or(false);
         if is_blackwell_gpu(name) || driver_is_560_plus {
             (
@@ -346,6 +365,41 @@ fn select_pytorch_wheel(
 }
 
 fn detect_hardware_gpu() -> (Option<String>, Option<String>, Option<u32>) {
+    // 1. Prefer Intel Arc / XPU when present on Windows
+    #[cfg(target_os = "windows")]
+    {
+        let mut arc_cmd = Command::new("powershell");
+        arc_cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'Intel' -and ($_.Name -match 'Arc' -or $_.Name -match 'XPU') } | Select-Object -First 1 -Property Name,DriverVersion | ForEach-Object { \"$($_.Name)|$($_.DriverVersion)\" }",
+        ]);
+        arc_cmd.creation_flags(CREATE_NO_WINDOW);
+        if let Ok(output) = arc_cmd.output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Some(line) = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()) {
+                    let mut split = line.splitn(2, '|');
+                    let name = split
+                        .next()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let raw_drv = split.next().unwrap_or("").trim();
+                    if name.is_some() {
+                        let drv_opt = if raw_drv.is_empty() {
+                            None
+                        } else {
+                            Some(raw_drv.to_string())
+                        };
+                        return (name, drv_opt, None);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check NVIDIA GPU via nvidia-smi
     let smi_candidates = [
         "nvidia-smi",
         #[cfg(target_os = "windows")]
@@ -414,7 +468,7 @@ fn detect_hardware_gpu() -> (Option<String>, Option<String>, Option<u32>) {
         }
     }
 
-    // Windows WMI fallback via PowerShell
+    // 3. Windows WMI fallback for NVIDIA via PowerShell
     #[cfg(target_os = "windows")]
     {
         let mut ps_cmd = Command::new("powershell");
@@ -461,6 +515,7 @@ async fn get_gpu_info() -> GpuInfo {
     .await
     .unwrap_or_else(|_| GpuInfo {
         cuda_available: false,
+        xpu_available: false,
         cpu_fallback_confirmed: true,
         device_name: None,
         driver_version: None,
@@ -493,7 +548,9 @@ fn detect_gpu_info(project_root: &Path) -> GpuInfo {
 
     let mut torch_installed = false;
     let mut torch_cuda_avail = false;
-    let mut torch_kernel_ok = false;
+    let mut torch_cuda_kernel_ok = false;
+    let mut torch_xpu_avail = false;
+    let mut torch_xpu_kernel_ok = false;
     let mut torch_ver: Option<String> = None;
     let mut torch_dev_name: Option<String> = None;
 
@@ -501,7 +558,7 @@ fn detect_gpu_info(project_root: &Path) -> GpuInfo {
         let mut py_cmd = Command::new(&venv_python);
         py_cmd.args([
             "-c",
-            "import torch; avail = bool(torch.cuda.is_available()); ver = getattr(torch, '__version__', ''); dev = torch.cuda.get_device_name(0) if avail else ''; kok = False\nif avail:\n    try:\n        _ = torch.zeros(1, device='cuda') + 1\n        torch.cuda.synchronize()\n        kok = True\n    except Exception:\n        kok = False\nprint(f'TORCH_OK|{avail}|{ver}|{dev}|{kok}')",
+            "import torch\nver = getattr(torch, '__version__', '')\nxpu_avail = bool(hasattr(torch, 'xpu') and torch.xpu.is_available())\nxpu_dev = ''\nxpu_kok = False\nif xpu_avail:\n    try:\n        xpu_dev = torch.xpu.get_device_name(0)\n        _ = torch.zeros(1, device='xpu') + 1\n        torch.xpu.synchronize()\n        xpu_kok = True\n    except Exception:\n        xpu_kok = False\ncuda_avail = bool(torch.cuda.is_available())\ncuda_dev = ''\ncuda_kok = False\nif cuda_avail:\n    try:\n        cuda_dev = torch.cuda.get_device_name(0)\n        _ = torch.zeros(1, device='cuda') + 1\n        torch.cuda.synchronize()\n        cuda_kok = True\n    except Exception:\n        cuda_kok = False\ndev = xpu_dev if (xpu_avail and xpu_kok) else (cuda_dev if cuda_avail else xpu_dev)\nprint(f'TORCH_OK|{cuda_avail}|{ver}|{dev}|{cuda_kok}|{xpu_avail}|{xpu_kok}')",
         ]);
         #[cfg(windows)]
         {
@@ -522,7 +579,13 @@ fn detect_gpu_info(project_root: &Path) -> GpuInfo {
                             torch_dev_name = Some(parts[2].to_string());
                         }
                         if let Some(k) = parts.get(3) {
-                            torch_kernel_ok = k.eq_ignore_ascii_case("true");
+                            torch_cuda_kernel_ok = k.eq_ignore_ascii_case("true");
+                        }
+                        if let Some(xa) = parts.get(4) {
+                            torch_xpu_avail = xa.eq_ignore_ascii_case("true");
+                        }
+                        if let Some(xk) = parts.get(5) {
+                            torch_xpu_kernel_ok = xk.eq_ignore_ascii_case("true");
                         }
                     }
                 }
@@ -534,31 +597,70 @@ fn detect_gpu_info(project_root: &Path) -> GpuInfo {
 
     if let Some(ref gpu_name) = effective_gpu_name {
         let ver_str = torch_ver.as_deref().unwrap_or("");
+        let short_name = shorten_gpu_name(gpu_name);
+
+        if recommended_wheel == "xpu" || is_intel_arc_gpu(gpu_name) {
+            let has_xpu_wheel = ver_str.contains("+xpu");
+            let xpu_working =
+                torch_installed && torch_xpu_avail && torch_xpu_kernel_ok && has_xpu_wheel;
+            let already_attempted = marker_wheel.as_deref() == Some("xpu");
+            let needs_repair = !xpu_working && !already_attempted;
+
+            let status_summary = if xpu_working {
+                format!("Ready — {short_name} (Intel Arc XPU)")
+            } else if needs_repair {
+                format!("PyTorch Intel Arc XPU setup required for {short_name}")
+            } else if torch_installed && torch_xpu_avail && torch_xpu_kernel_ok {
+                format!("Ready — {short_name}")
+            } else {
+                format!("{short_name} detected (XPU inactive — click Repair GPU)")
+            };
+
+            return GpuInfo {
+                cuda_available: false,
+                xpu_available: torch_xpu_avail && torch_xpu_kernel_ok,
+                cpu_fallback_confirmed: torch_installed
+                    && !(torch_xpu_avail && torch_xpu_kernel_ok),
+                device_name: Some(gpu_name.clone()),
+                driver_version,
+                recommended_wheel: "xpu".to_string(),
+                cuda_label: "Intel Arc XPU".to_string(),
+                torch_version: torch_ver,
+                needs_repair,
+                status_summary,
+                recommended_workers,
+                physical_cores,
+                logical_cores,
+            };
+        }
+
         let has_matching_wheel = if recommended_wheel == "cu128" {
             ver_str.contains("+cu128")
         } else {
             ver_str.contains("+cu")
         };
 
-        let cuda_working = torch_installed && torch_cuda_avail && torch_kernel_ok && has_matching_wheel;
+        let cuda_working =
+            torch_installed && torch_cuda_avail && torch_cuda_kernel_ok && has_matching_wheel;
         // If we haven't already tried & recorded a repair for this wheel, mark needs_repair when !cuda_working
         let already_attempted = marker_wheel.as_deref() == Some(recommended_wheel);
         let needs_repair = !cuda_working && !already_attempted;
 
-        let short_name = shorten_gpu_name(gpu_name);
         let status_summary = if cuda_working {
             format!("Ready — {short_name} ({cuda_label})")
         } else if needs_repair {
             format!("PyTorch {cuda_label} setup required for {short_name}")
-        } else if torch_installed && torch_cuda_avail && torch_kernel_ok {
+        } else if torch_installed && torch_cuda_avail && torch_cuda_kernel_ok {
             format!("Ready — {short_name}")
         } else {
-            format!("{short_name} detected (CUDA inactive — click Repair CUDA)")
+            format!("{short_name} detected (CUDA inactive — click Repair GPU)")
         };
 
         return GpuInfo {
-            cuda_available: torch_cuda_avail && torch_kernel_ok,
-            cpu_fallback_confirmed: torch_installed && !(torch_cuda_avail && torch_kernel_ok),
+            cuda_available: torch_cuda_avail && torch_cuda_kernel_ok,
+            xpu_available: false,
+            cpu_fallback_confirmed: torch_installed
+                && !(torch_cuda_avail && torch_cuda_kernel_ok),
             device_name: Some(gpu_name.clone()),
             driver_version,
             recommended_wheel: recommended_wheel.to_string(),
@@ -572,17 +674,18 @@ fn detect_gpu_info(project_root: &Path) -> GpuInfo {
         };
     }
 
-    // No NVIDIA GPU detected
+    // Neither Intel Arc nor NVIDIA GPU detected
     let already_attempted = marker_wheel.as_deref() == Some("cpu");
     let needs_repair = !torch_installed && !already_attempted && venv_python.is_file();
     let status_summary = if torch_installed {
-        "Ready — CPU mode (No NVIDIA GPU)".to_string()
+        "Ready — CPU mode (No discrete GPU)".to_string()
     } else {
         "Installing CPU PyTorch wheel…".to_string()
     };
 
     GpuInfo {
         cuda_available: false,
+        xpu_available: false,
         cpu_fallback_confirmed: torch_installed || !venv_python.is_file(),
         device_name: None,
         driver_version: None,
@@ -779,7 +882,13 @@ async fn repair_cuda(on_log: Channel<String>) -> Result<GpuInfo, String> {
         let _ = std::fs::write(&marker_path, wheel_id);
 
         let updated_info = detect_gpu_info(&project_root);
-        if updated_info.cuda_available {
+        if updated_info.xpu_available {
+            let _ = on_log.send(format!(
+                "[LS-Trainer] Intel Arc XPU verified! Device: {} ({})",
+                updated_info.device_name.as_deref().unwrap_or("Intel Arc XPU"),
+                updated_info.torch_version.as_deref().unwrap_or("torch")
+            ));
+        } else if updated_info.cuda_available {
             let _ = on_log.send(format!(
                 "[LS-Trainer] CUDA verified! Device: {} ({})",
                 updated_info.device_name.as_deref().unwrap_or("GPU"),
@@ -2173,17 +2282,38 @@ async fn start_rfdetr_training(
     };
 
     let device_input = request.device.trim();
-    let effective_device = if device_input.is_empty()
+    let gpu_probe = detect_gpu_info(&project_root);
+    let effective_device = if device_input.eq_ignore_ascii_case("cpu") {
+        let _ = on_log.send("[LS-Trainer] Device override: using device=cpu".to_string());
+        "cpu".to_string()
+    } else if device_input.is_empty()
         || device_input.eq_ignore_ascii_case("auto")
         || device_input.eq_ignore_ascii_case("gpu")
+        || device_input.eq_ignore_ascii_case("xpu")
+        || device_input.eq_ignore_ascii_case("xpu:0")
         || device_input.eq_ignore_ascii_case("cuda")
         || device_input == "0"
     {
-        if is_cuda_available(&project_root) {
-            let _ = on_log.send("[LS-Trainer] CUDA available, selecting device=cuda".to_string());
+        if gpu_probe.xpu_available && !device_input.eq_ignore_ascii_case("cuda") {
+            let dev_label = gpu_probe
+                .device_name
+                .as_deref()
+                .unwrap_or("Intel Arc XPU");
+            let _ = on_log.send(format!(
+                "[LS-Trainer] Intel Arc XPU available (torch.xpu.is_available()=True), selecting device=xpu ({dev_label})"
+            ));
+            "xpu".to_string()
+        } else if gpu_probe.cuda_available {
+            let dev_label = gpu_probe.device_name.as_deref().unwrap_or("CUDA GPU");
+            let _ = on_log.send(format!(
+                "[LS-Trainer] CUDA available (torch.cuda.is_available()=True), selecting device=cuda ({dev_label})"
+            ));
             "cuda".to_string()
         } else {
-            let _ = on_log.send("[LS-Trainer] No CUDA detected, using device=cpu".to_string());
+            let _ = on_log.send(
+                "[LS-Trainer] Neither Intel Arc XPU nor CUDA available, using device=cpu"
+                    .to_string(),
+            );
             "cpu".to_string()
         }
     } else {
@@ -2232,6 +2362,51 @@ def detect_num_workers(cfg):
     base_cores = phys if (phys is not None and phys > 0) else max(1, logical // 2)
     return min(8, max(1, base_cores - 1))
 
+def select_training_device(requested):
+    import torch
+    req = str(requested or "auto").strip().lower()
+    xpu_avail = bool(hasattr(torch, "xpu") and torch.xpu.is_available())
+    cuda_avail = bool(torch.cuda.is_available())
+
+    if req == "cpu":
+        print(
+            "[LS-Trainer] RF-DETR device selection: CPU requested -> device=cpu (accelerator=cpu, devices=1)",
+            flush=True,
+        )
+        return "cpu"
+
+    if req in ("", "auto", "gpu", "0", "xpu", "xpu:0", "cuda", "cuda:0"):
+        if xpu_avail and req not in ("cuda", "cuda:0"):
+            dev_name = "Intel Arc XPU"
+            try:
+                dev_name = torch.xpu.get_device_name(0)
+            except Exception:
+                pass
+            print(
+                f"[LS-Trainer] RF-DETR device selection: torch.xpu.is_available()=True -> using Intel Arc XPU device=xpu ({dev_name})",
+                flush=True,
+            )
+            return "xpu"
+        if cuda_avail:
+            dev_name = "CUDA GPU"
+            try:
+                dev_name = torch.cuda.get_device_name(0)
+            except Exception:
+                pass
+            print(
+                f"[LS-Trainer] RF-DETR device selection: torch.cuda.is_available()=True -> using NVIDIA CUDA device=cuda ({dev_name})",
+                flush=True,
+            )
+            return "cuda"
+        print(
+            "[LS-Trainer] RF-DETR device selection: neither Intel Arc XPU nor CUDA is available -> falling back to device=cpu",
+            flush=True,
+        )
+        return "cpu"
+
+    print(f"[LS-Trainer] RF-DETR device selection: using custom device={requested}", flush=True)
+    return str(requested)
+
 def main():
     cfg_path = sys.argv[1]
     with open(cfg_path, "r", encoding="utf-8") as f:
@@ -2241,10 +2416,14 @@ def main():
     os.makedirs(models_dir, exist_ok=True)
     os.chdir(models_dir)
 
+    import torch
     import rfdetr
+    import rfdetr.detr as rf_detr_mod
     import rfdetr.training as rf_training
     import rfdetr.training.trainer as rf_trainer_mod
     from pytorch_lightning import Callback
+    from pytorch_lightning.accelerators import Accelerator
+    from pytorch_lightning.strategies import SingleDeviceStrategy
 
     try:
         import rfdetr.utilities.console as rf_console
@@ -2263,12 +2442,55 @@ def main():
     epochs = int(cfg["epochs"])
     batch_size = max(1, int(cfg["batch_size"]))
     resolution = int(cfg["resolution"])
-    device = cfg["device"]
+    device = select_training_device(cfg.get("device", "auto"))
     pretrain_weights = cfg["pretrain_weights"]
     freeze_backbone = bool(cfg.get("freeze_backbone", False))
     num_workers = detect_num_workers(cfg)
 
     os.makedirs(output_dir, exist_ok=True)
+
+    class XPUAccelerator(Accelerator):
+        """PyTorch Lightning Accelerator for Intel Arc / XPU devices."""
+        def setup_device(self, dev):
+            if dev.type != "xpu":
+                raise ValueError(f"Expected xpu device, got {dev}")
+            torch.xpu.set_device(dev)
+
+        def get_device_stats(self, dev):
+            return {}
+
+        def teardown(self):
+            if hasattr(torch, "xpu") and torch.xpu.is_available():
+                torch.xpu.empty_cache()
+
+        @staticmethod
+        def parse_devices(devices):
+            return [torch.device("xpu", 0)]
+
+        @staticmethod
+        def get_parallel_devices(devices):
+            return [torch.device("xpu", 0)]
+
+        @staticmethod
+        def auto_device_count():
+            return torch.xpu.device_count() if (hasattr(torch, "xpu") and torch.xpu.is_available()) else 0
+
+        @staticmethod
+        def is_available():
+            return bool(hasattr(torch, "xpu") and torch.xpu.is_available())
+
+        @staticmethod
+        def name():
+            return "xpu"
+
+    orig_resolve_device_kwargs = getattr(rf_detr_mod.RFDETR, "_resolve_trainer_device_kwargs", None)
+    if orig_resolve_device_kwargs is not None:
+        @staticmethod
+        def patched_resolve_device_kwargs(dev, *args, **kwargs):
+            if dev is not None and str(dev).strip().lower().startswith("xpu"):
+                return "auto", 1
+            return orig_resolve_device_kwargs(dev, *args, **kwargs)
+        rf_detr_mod.RFDETR._resolve_trainer_device_kwargs = patched_resolve_device_kwargs
 
     best_state = {"map50": 0.0, "map50_95": 0.0}
 
@@ -2290,15 +2512,17 @@ def main():
             dm = getattr(trainer, "datamodule", None)
             if dm is not None and hasattr(dm, "_num_workers"):
                 dm._num_workers = num_workers
+            root_dev = getattr(getattr(trainer, "strategy", None), "root_device", device)
+            accel_name = type(getattr(trainer, "accelerator", None)).__name__
             print(
-                f"[LS-Trainer] RF-DETR DataLoaders configured: train_dataloader num_workers={num_workers}, val_dataloader num_workers={num_workers}",
+                f"[LS-Trainer] Lightning Trainer active: accelerator={accel_name}, root_device={root_dev}, train/val num_workers={num_workers}",
                 flush=True,
             )
 
         def on_train_epoch_start(self, trainer, pl_module):
             ep = int(trainer.current_epoch) + 1
             total = int(trainer.max_epochs)
-            print(f"Epoch {ep}/{total} - RF-DETR ({class_name}) training...", flush=True)
+            print(f"Epoch {ep}/{total} - RF-DETR ({class_name}) training on {device}...", flush=True)
 
         def on_validation_epoch_end(self, trainer, pl_module):
             if getattr(trainer, "sanity_checking", False):
@@ -2334,6 +2558,19 @@ def main():
     orig_build_trainer = rf_training.build_trainer
 
     def hooked_build_trainer(*args, **kw):
+        if str(device).lower().startswith("xpu"):
+            kw["accelerator"] = "auto"
+            kw["devices"] = 1
+            kw["strategy"] = SingleDeviceStrategy(
+                device=torch.device("xpu", 0),
+                accelerator=XPUAccelerator(),
+            )
+        elif str(device).lower().startswith("cuda"):
+            kw["accelerator"] = "cuda"
+            kw["devices"] = 1
+        elif str(device).lower() == "cpu":
+            kw["accelerator"] = "cpu"
+            kw["devices"] = 1
         trainer = orig_build_trainer(*args, **kw)
         trainer.callbacks.append(LSTrainerProgressCallback())
         return trainer
@@ -2352,7 +2589,7 @@ def main():
 
     model_cls = getattr(rfdetr, class_name)
     print(
-        f"[LS-Trainer] Initializing {class_name} (resolution={resolution}, pretrain_weights={pretrain_weights}, eval_backend={eval_backend}, num_workers={num_workers})...",
+        f"[LS-Trainer] Initializing {class_name} (resolution={resolution}, pretrain_weights={pretrain_weights}, device={device}, eval_backend={eval_backend}, num_workers={num_workers})...",
         flush=True,
     )
     model = model_cls(resolution=resolution, pretrain_weights=pretrain_weights, device=device)
@@ -2373,7 +2610,7 @@ def main():
     if freeze_backbone:
         train_kwargs["lr_encoder"] = 0.0
 
-    print(f"Epoch 1/{epochs} - Starting RF-DETR training loop (num_workers={num_workers})...", flush=True)
+    print(f"Epoch 1/{epochs} - Starting RF-DETR training loop on device={device} (num_workers={num_workers})...", flush=True)
     model.train(**train_kwargs)
 
     metrics_file = os.path.join(output_dir, "ls_trainer_metrics.json")
@@ -3813,5 +4050,31 @@ mod label_tests {
         assert_eq!(compute_recommended_workers(None, 12), 5);
         assert_eq!(compute_recommended_workers(None, 2), 1);
         assert_eq!(compute_recommended_workers(Some(1), 1), 0);
+    }
+
+    #[test]
+    fn intel_arc_and_pytorch_wheel_selection() {
+        assert!(is_intel_arc_gpu("Intel(R) Arc(TM) 140V GPU (16GB)"));
+        assert!(is_intel_arc_gpu("Intel Arc A770 Graphics"));
+        assert!(!is_intel_arc_gpu("Intel(R) UHD Graphics 770"));
+        assert!(!is_intel_arc_gpu("NVIDIA GeForce RTX 4080"));
+
+        let (arc_wheel, arc_url, arc_label) =
+            select_pytorch_wheel(Some("Intel(R) Arc(TM) 140V GPU (16GB)"), None);
+        assert_eq!(arc_wheel, "xpu");
+        assert_eq!(arc_url, "https://download.pytorch.org/whl/xpu");
+        assert_eq!(arc_label, "Intel Arc XPU");
+
+        let (nv_50_wheel, _, _) =
+            select_pytorch_wheel(Some("NVIDIA GeForce RTX 5080"), Some(572));
+        assert_eq!(nv_50_wheel, "cu128");
+
+        let (nv_old_wheel, _, _) =
+            select_pytorch_wheel(Some("NVIDIA GeForce RTX 3060"), Some(535));
+        assert_eq!(nv_old_wheel, "cu124");
+
+        let (cpu_wheel, cpu_url, _) = select_pytorch_wheel(None, None);
+        assert_eq!(cpu_wheel, "cpu");
+        assert_eq!(cpu_url, "https://download.pytorch.org/whl/cpu");
     }
 }
