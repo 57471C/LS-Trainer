@@ -28,6 +28,33 @@ The Windows NSIS installer configures the Python training environment automatica
 - **Hardware Verification**: At the conclusion of setup, it verifies `torch.xpu.is_available()` and `torch.cuda.is_available()` and prints the active training accelerator. During RF-DETR training, `torch.xpu.is_available()` is preferred first (`xpu`), followed by `torch.cuda.is_available()` (`cuda`), with `cpu` as the final fallback.
 - **Low-Friction**: No extra user steps are needed after clicking Finish—the application is ready to run immediately.
 
+## Linux Setup (Linux Mint, Ubuntu, Debian)
+
+For Linux systems (including single or multi-GPU Intel Arc Pro workstations):
+
+```bash
+chmod +x setup-linux.sh
+./setup-linux.sh
+```
+
+The script automatically detects:
+1. **Intel Arc / XPU GPUs** (via `lspci`, `xpu-smi`, and DRM sysfs), pulling the official PyTorch XPU build (`https://download.pytorch.org/whl/xpu`).
+2. **NVIDIA GPUs** (via `nvidia-smi`), installing CUDA 12.8 or 12.4 builds.
+3. **CPU Fallback** when no discrete GPU is found.
+
+### Intel Arc Compute Prerequisites (Linux Mint / Ubuntu)
+Before training on Intel Arc GPUs under Linux:
+- Install compute runtime and Level Zero packages:
+  ```bash
+  sudo apt update && sudo apt install -y intel-opencl-icd intel-level-zero-gpu level-zero
+  ```
+- Ensure your user belongs to the `render` and `video` groups to access `/dev/dri/renderD*` devices:
+  ```bash
+  sudo usermod -aG render,video $USER
+  ```
+  *(Log out and log back in for group membership to take effect)*
+
+
 ## Stack
 
 - Tauri 2
