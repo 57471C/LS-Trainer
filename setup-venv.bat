@@ -29,9 +29,9 @@ echo [*] Target directory: "%APP_DIR%"
 echo [*] Checking for existing virtual environment...
 
 if exist "%VENV_DIR%\Scripts\python.exe" (
-    "%VENV_DIR%\Scripts\python.exe" -c "import ultralytics" >nul 2>&1
+    "%VENV_DIR%\Scripts\python.exe" -c "import ultralytics, rfdetr, vernier" >nul 2>&1
     if !ERRORLEVEL! EQU 0 (
-        echo [*] Virtual environment and ultralytics already installed and ready at:
+        echo [*] Virtual environment, ultralytics, and rfdetr already installed and ready at:
         echo     "%VENV_DIR%"
         set "VENV_PYTHON=%VENV_DIR%\Scripts\python.exe"
         goto :GPU_CHECK
@@ -167,6 +167,13 @@ if !ERRORLEVEL! NEQ 0 (
     echo ========================================================
     if not defined UNATTENDED pause
     exit /b !ERRORLEVEL!
+)
+
+echo.
+echo [*] Installing rfdetr and COCO/ONNX training dependencies...
+"%VENV_PYTHON%" -m pip install rfdetr pytorch_lightning "torchmetrics[detection]<1.9.0,>=1.8.2" vernier faster-coco-eval hotcoco pycocotools scipy peft onnx onnxruntime
+if !ERRORLEVEL! NEQ 0 (
+    echo [!] Warning: rfdetr installation returned non-zero exit code. Continuing...
 )
 
 :GPU_CHECK

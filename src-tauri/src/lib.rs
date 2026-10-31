@@ -45,6 +45,12 @@ pub struct TrainingRequest {
     /// Ultralytics task: "detect" or "segment". A `-seg` weight forces "segment".
     #[serde(default = "default_task")]
     pub task: String,
+    #[serde(default = "default_model_family")]
+    pub model_family: String,
+}
+
+fn default_model_family() -> String {
+    "YOLO".to_string()
 }
 
 fn default_batch() -> u32 {
@@ -116,6 +122,10 @@ pub struct TrainingResponse {
     pub success: bool,
     pub results_dir: String,
     pub message: String,
+    #[serde(default)]
+    pub map50: Option<f64>,
+    #[serde(default)]
+    pub map50_95: Option<f64>,
 }
 
 fn get_project_root() -> PathBuf {
@@ -884,17 +894,29 @@ fn resolve_and_fix_data_yaml(
 #[tauri::command]
 async fn pick_dataset_file() -> Option<String> {
     let file = rfd::AsyncFileDialog::new()
-        .add_filter("Dataset Archive (*.tar, *.tar.gz, *.tgz)", &["tar", "tar.gz", "tgz"])
-        .set_title("Select Dataset Archive")
+        .add_filter(
+            "Dataset Archive / Manifest (*.tar, *.tar.gz, *.tgz, *.json, *.yaml, *.yml)",
+            &["tar", "tar.gz", "tgz", "json", "yaml", "yml"],
+        )
+        .set_title("Select Dataset Archive or COCO/YOLO Manifest")
         .pick_file()
         .await;
     file.map(|f| to_display_path(f.path()))
 }
 
 #[tauri::command]
+async fn pick_dataset_folder() -> Option<String> {
+    let folder = rfd::AsyncFileDialog::new()
+        .set_title("Select Dataset Folder (COCO or YOLO)")
+        .pick_folder()
+        .await;
+    folder.map(|f| to_display_path(f.path()))
+}
+
+#[tauri::command]
 async fn pick_model_file() -> Option<String> {
     let file = rfd::AsyncFileDialog::new()
-        .add_filter("YOLO Checkpoint (*.pt)", &["pt"])
+        .add_filter("Model Checkpoint (*.pt, *.pth)", &["pt", "pth"])
         .set_title("Select Model Checkpoint")
         .pick_file()
         .await;
@@ -1156,8 +1178,71 @@ fn result_from_stats(stats: &LabelStats) -> LabelCheckResult {
     }
 }
 
+fn path_is_candidate_coco_json(path: &str) -> bool {
+    let lower = path.replace('\\', "/").to_ascii_lowercase();
+    if lower.contains("__macosx/") || !lower.ends_with(".json") {
+        return false;
+    }
+    let file_name = lower.rsplit('/').next().unwrap_or(&lower);
+    if file_name.starts_with("._") {
+        return false;
+    }
+    file_name.starts_with("instances_")
+        || file_name.ends_with(".coco.json")
+        || file_name == "annotations.json"
+}
+
+fn scan_coco_json_text(text: &str, stats: &mut LabelStats) {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    let Some(anns) = val.get("annotations").and_then(|v| v.as_array()) else {
+        return;
+    };
+    let mut counted = false;
+    let mut items_in_file = 0u32;
+    for ann in anns {
+        if items_in_file >= MAX_LINES_PER_FILE * 4 {
+            break;
+        }
+        let has_polygon = ann
+            .get("segmentation")
+            .map(|seg| match seg {
+                serde_json::Value::Array(polys) => polys.iter().any(|p| {
+                    p.as_array()
+                        .map(|coords| coords.len() >= 6)
+                        .unwrap_or(false)
+                }),
+                serde_json::Value::Object(obj) => obj.contains_key("counts"),
+                _ => false,
+            })
+            .unwrap_or(false);
+        let has_bbox = ann
+            .get("bbox")
+            .and_then(|b| b.as_array())
+            .map(|arr| arr.len() >= 4)
+            .unwrap_or(false);
+
+        if has_polygon {
+            stats.polygons += 1;
+            stats.lines_scanned += 1;
+            items_in_file += 1;
+            counted = true;
+        } else if has_bbox {
+            stats.bboxes += 1;
+            stats.lines_scanned += 1;
+            items_in_file += 1;
+            counted = true;
+        }
+    }
+    if counted {
+        stats.files_scanned += 1;
+    }
+}
+
 fn inspect_label_tree(root: &Path) -> LabelCheckResult {
     let mut stats = LabelStats::default();
+    let mut coco_files: Vec<PathBuf> = Vec::new();
     for entry in walkdir::WalkDir::new(root)
         .max_depth(6)
         .into_iter()
@@ -1170,6 +1255,10 @@ fn inspect_label_tree(root: &Path) -> LabelCheckResult {
             continue;
         }
         let path_str = entry.path().to_string_lossy().to_string();
+        if path_is_candidate_coco_json(&path_str) {
+            coco_files.push(entry.path().to_path_buf());
+            continue;
+        }
         if !path_is_candidate_label(&path_str) {
             continue;
         }
@@ -1184,11 +1273,22 @@ fn inspect_label_tree(root: &Path) -> LabelCheckResult {
         let text = String::from_utf8_lossy(slice);
         scan_label_text(&text, &mut stats);
     }
+    if stats.lines_scanned == 0 && !coco_files.is_empty() {
+        for coco_path in coco_files {
+            if label_sample_complete(&stats) {
+                break;
+            }
+            if let Ok(text) = std::fs::read_to_string(&coco_path) {
+                scan_coco_json_text(&text, &mut stats);
+            }
+        }
+    }
     result_from_stats(&stats)
 }
 
 fn scan_tar_archive<R: Read>(mut archive: tar::Archive<R>) -> Result<LabelCheckResult, String> {
     let mut stats = LabelStats::default();
+    let mut coco_payloads: Vec<String> = Vec::new();
     let entries = archive
         .entries()
         .map_err(|e| format!("Failed to read dataset archive: {e}"))?;
@@ -1203,6 +1303,15 @@ fn scan_tar_archive<R: Read>(mut archive: tar::Archive<R>) -> Result<LabelCheckR
                 .map_err(|e| format!("Failed to read archive entry path: {e}"))?;
             path.to_string_lossy().to_string()
         };
+        if path_is_candidate_coco_json(&path_str) && coco_payloads.len() < 4 {
+            let mut buf = Vec::new();
+            let mut limited = (&mut entry).take(16 * 1024 * 1024);
+            let _ = limited.read_to_end(&mut buf);
+            if let Ok(text) = String::from_utf8(buf) {
+                coco_payloads.push(text);
+            }
+            continue;
+        }
         if !path_is_candidate_label(&path_str) {
             continue;
         }
@@ -1211,6 +1320,11 @@ fn scan_tar_archive<R: Read>(mut archive: tar::Archive<R>) -> Result<LabelCheckR
         let _ = limited.read_to_end(&mut buf);
         let text = String::from_utf8_lossy(&buf);
         scan_label_text(&text, &mut stats);
+    }
+    if stats.lines_scanned == 0 && !coco_payloads.is_empty() {
+        for text in &coco_payloads {
+            scan_coco_json_text(text, &mut stats);
+        }
     }
     Ok(result_from_stats(&stats))
 }
@@ -1243,8 +1357,15 @@ fn inspect_dataset_path(path: &Path) -> Result<LabelCheckResult, String> {
         return Ok(inspect_label_tree(path));
     }
     let lower = path.to_string_lossy().to_lowercase();
-    if lower.ends_with(".yaml") || lower.ends_with(".yml") {
-        let root = path.parent().unwrap_or(path);
+    if lower.ends_with(".yaml") || lower.ends_with(".yml") || lower.ends_with(".json") {
+        let mut root = path.parent().unwrap_or(path);
+        if let Some(dir_name) = root.file_name().map(|n| n.to_string_lossy().to_lowercase()) {
+            if matches!(dir_name.as_str(), "annotations" | "train" | "valid" | "val" | "test") {
+                if let Some(grandparent) = root.parent() {
+                    root = grandparent;
+                }
+            }
+        }
         return Ok(inspect_label_tree(root));
     }
     if lower.ends_with(".tar") || lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
@@ -1296,6 +1417,7 @@ fn save_run_config_metadata(
     let payload = serde_json::json!({
         "run_name": request.run_name,
         "dataset_path": request.dataset_path,
+        "model_family": request.model_family,
         "model_choice": request.model_choice,
         "resolved_model": resolved_model,
         "task": resolve_train_task(request),
@@ -1329,6 +1451,960 @@ fn save_run_config_metadata(
     }
 }
 
+fn is_rfdetr_request(request: &TrainingRequest) -> bool {
+    if request.model_family.eq_ignore_ascii_case("RF-DETR")
+        || request.model_family.eq_ignore_ascii_case("RFDETR")
+    {
+        return true;
+    }
+    let choice = request.model_choice.trim().to_ascii_lowercase();
+    choice.starts_with("rf-detr") || choice.starts_with("rfdetr") || choice.ends_with(".pth")
+}
+
+fn copy_or_hardlink_file(src: &Path, dst: &Path) -> Result<(), String> {
+    if dst.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create image directory {}: {e}", parent.display()))?;
+    }
+    if std::fs::hard_link(src, dst).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(src, dst).map(|_| ()).map_err(|e| {
+        format!(
+            "Failed to copy dataset image '{}' to '{}': {e}",
+            src.display(),
+            dst.display()
+        )
+    })
+}
+
+fn find_coco_dataset_root(base_dir: &Path) -> Option<PathBuf> {
+    let candidates = [
+        base_dir.join("annotations").join("instances_train.json"),
+        base_dir.join("train").join("_annotations.coco.json"),
+        base_dir.join("export_manifest.json"),
+    ];
+    for c in candidates {
+        if c.is_file() {
+            return Some(base_dir.to_path_buf());
+        }
+    }
+
+    for entry in walkdir::WalkDir::new(base_dir)
+        .max_depth(3)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        let path = entry.path();
+        if name == "instances_train.json" {
+            if let Some(ann_dir) = path.parent() {
+                if let Some(root) = ann_dir.parent() {
+                    return Some(root.to_path_buf());
+                }
+            }
+        } else if name == "_annotations.coco.json" {
+            if let Some(split_dir) = path.parent() {
+                if split_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().eq_ignore_ascii_case("train"))
+                    .unwrap_or(false)
+                {
+                    if let Some(root) = split_dir.parent() {
+                        return Some(root.to_path_buf());
+                    }
+                }
+            }
+        } else if name == "export_manifest.json" {
+            if let Some(root) = path.parent() {
+                return Some(root.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
+fn resolve_coco_image_source(
+    dataset_root: &Path,
+    split: &str,
+    file_name: &str,
+    manifest_map: &std::collections::HashMap<String, PathBuf>,
+) -> Option<PathBuf> {
+    let clean_rel = file_name.trim_start_matches(['/', '\\']);
+    let basename = Path::new(clean_rel)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| clean_rel.to_string());
+
+    let candidates = [
+        dataset_root.join("images").join(split).join(&basename),
+        dataset_root.join("images").join(clean_rel),
+        dataset_root.join(split).join(&basename),
+        dataset_root.join(clean_rel),
+        dataset_root.join("images").join(&basename),
+    ];
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    if let Some(mapped) = manifest_map
+        .get(&format!("{split}/{basename}"))
+        .or_else(|| manifest_map.get(&basename))
+    {
+        if mapped.is_file() {
+            return Some(mapped.clone());
+        }
+    }
+    None
+}
+
+fn populate_rfdetr_split_from_coco(
+    dataset_root: &Path,
+    coco_json_path: &Path,
+    source_split: &str,
+    target_split_dir: &Path,
+    manifest_map: &std::collections::HashMap<String, PathBuf>,
+) -> Result<usize, String> {
+    std::fs::create_dir_all(target_split_dir).map_err(|e| {
+        format!(
+            "Failed to create RF-DETR split folder '{}': {e}",
+            target_split_dir.display()
+        )
+    })?;
+
+    let raw_text = std::fs::read_to_string(coco_json_path).map_err(|e| {
+        format!(
+            "Failed to read COCO annotation file '{}': {e}",
+            coco_json_path.display()
+        )
+    })?;
+    let mut coco: serde_json::Value = serde_json::from_str(&raw_text).map_err(|e| {
+        format!(
+            "Invalid COCO JSON in '{}': {e}",
+            coco_json_path.display()
+        )
+    })?;
+
+    // Ensure COCO supercategory exists on every category (required by rfdetr/pycocotools)
+    if let Some(categories) = coco.get_mut("categories").and_then(|v| v.as_array_mut()) {
+        for cat in categories.iter_mut() {
+            if let Some(obj) = cat.as_object_mut() {
+                if !obj.contains_key("supercategory") {
+                    obj.insert(
+                        "supercategory".to_string(),
+                        serde_json::Value::String("defect".to_string()),
+                    );
+                }
+            }
+        }
+    }
+
+    if !coco.get("info").map(|v| v.is_object()).unwrap_or(false) {
+        if let Some(root_obj) = coco.as_object_mut() {
+            root_obj.insert(
+                "info".to_string(),
+                serde_json::json!({
+                    "description": "LS-Marker COCO dataset prepared by LS-Trainer",
+                    "version": "1.0"
+                }),
+            );
+        }
+    }
+    if !coco.get("licenses").map(|v| v.is_array()).unwrap_or(false) {
+        if let Some(root_obj) = coco.as_object_mut() {
+            root_obj.insert("licenses".to_string(), serde_json::json!([]));
+        }
+    }
+
+    let mut linked_images = 0usize;
+    if let Some(images) = coco.get_mut("images").and_then(|v| v.as_array_mut()) {
+        for img in images.iter_mut() {
+            let Some(obj) = img.as_object_mut() else {
+                continue;
+            };
+            let Some(orig_name) = obj.get("file_name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let basename = Path::new(orig_name)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| orig_name.to_string());
+
+            if let Some(src_img) =
+                resolve_coco_image_source(dataset_root, source_split, orig_name, manifest_map)
+            {
+                let dst_img = target_split_dir.join(&basename);
+                copy_or_hardlink_file(&src_img, &dst_img)?;
+                linked_images += 1;
+            }
+            obj.insert(
+                "file_name".to_string(),
+                serde_json::Value::String(basename),
+            );
+        }
+    }
+
+    let out_ann_path = target_split_dir.join("_annotations.coco.json");
+    let serialized = serde_json::to_string_pretty(&coco)
+        .map_err(|e| format!("Failed to serialize COCO JSON: {e}"))?;
+    std::fs::write(&out_ann_path, serialized).map_err(|e| {
+        format!(
+            "Failed to write '{}': {e}",
+            out_ann_path.display()
+        )
+    })?;
+
+    Ok(linked_images)
+}
+
+fn prepare_rfdetr_coco_dataset(
+    dataset_input: &Path,
+    on_log: &Channel<String>,
+) -> Result<PathBuf, String> {
+    let base_dir = if dataset_input.is_file() {
+        let lower = dataset_input.to_string_lossy().to_ascii_lowercase();
+        if lower.ends_with(".tar") || lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let temp_dir = std::env::temp_dir().join(format!("ls_trainer_coco_{timestamp}"));
+            let _ = on_log.send(format!(
+                "[LS-Trainer] Unpacking dataset archive '{}' to '{}'...",
+                dataset_input.display(),
+                temp_dir.display()
+            ));
+            unpack_archive(dataset_input, &temp_dir)?;
+            let _ = on_log.send("[LS-Trainer] Unpacked dataset archive.".to_string());
+            temp_dir
+        } else if lower.ends_with(".json") {
+            let parent = dataset_input.parent().unwrap_or(dataset_input);
+            if parent
+                .file_name()
+                .map(|n| {
+                    let s = n.to_string_lossy().to_ascii_lowercase();
+                    s == "annotations" || s == "train" || s == "valid" || s == "val"
+                })
+                .unwrap_or(false)
+            {
+                parent.parent().unwrap_or(parent).to_path_buf()
+            } else {
+                parent.to_path_buf()
+            }
+        } else if lower.ends_with(".yaml") || lower.ends_with(".yml") {
+            dataset_input
+                .parent()
+                .unwrap_or(dataset_input)
+                .to_path_buf()
+        } else {
+            return Err(format!(
+                "Unsupported dataset file for RF-DETR: {}",
+                dataset_input.display()
+            ));
+        }
+    } else if dataset_input.is_dir() {
+        dataset_input.to_path_buf()
+    } else {
+        return Err(format!(
+            "Dataset path does not exist: {}",
+            dataset_input.display()
+        ));
+    };
+
+    let dataset_root = find_coco_dataset_root(&base_dir).unwrap_or_else(|| base_dir.clone());
+
+    // Case 1: Already in Roboflow COCO layout (`train/_annotations.coco.json`)
+    let rf_train_ann = dataset_root.join("train").join("_annotations.coco.json");
+    let rf_valid_ann = dataset_root.join("valid").join("_annotations.coco.json");
+    let rf_test_ann = dataset_root.join("test").join("_annotations.coco.json");
+    if rf_train_ann.is_file() {
+        let _ = on_log.send(format!(
+            "[LS-Trainer] Detected COCO dataset layout in '{}'",
+            dataset_root.display()
+        ));
+        let empty_map = std::collections::HashMap::new();
+        if !rf_valid_ann.is_file() {
+            let val_alt = dataset_root.join("val").join("_annotations.coco.json");
+            let src_ann = if val_alt.is_file() {
+                (&val_alt, "val")
+            } else {
+                (&rf_train_ann, "train")
+            };
+            let _ = populate_rfdetr_split_from_coco(
+                &dataset_root,
+                src_ann.0,
+                src_ann.1,
+                &dataset_root.join("valid"),
+                &empty_map,
+            )?;
+        }
+        if !rf_test_ann.is_file() {
+            let src_ann = if rf_valid_ann.is_file() {
+                (&rf_valid_ann, "valid")
+            } else {
+                (&rf_train_ann, "train")
+            };
+            let _ = populate_rfdetr_split_from_coco(
+                &dataset_root,
+                src_ann.0,
+                src_ann.1,
+                &dataset_root.join("test"),
+                &empty_map,
+            )?;
+        }
+        return Ok(dataset_root);
+    }
+
+    // Case 2: LS-Marker COCO layout (`annotations/instances_train.json` + `annotations/instances_val.json`)
+    let ls_train_ann = dataset_root
+        .join("annotations")
+        .join("instances_train.json");
+    let ls_val_ann = dataset_root.join("annotations").join("instances_val.json");
+    if ls_train_ann.is_file() {
+        let _ = on_log.send(format!(
+            "[LS-Trainer] Detected LS-Marker COCO export in '{}'. Preparing RF-DETR splits...",
+            dataset_root.display()
+        ));
+
+        let mut manifest_map = std::collections::HashMap::new();
+        let manifest_path = dataset_root.join("export_manifest.json");
+        if manifest_path.is_file() {
+            if let Ok(text) = std::fs::read_to_string(&manifest_path) {
+                if let Ok(manifest_json) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(items) = manifest_json.get("images").and_then(|v| v.as_array()) {
+                        for item in items {
+                            let file_name = item
+                                .get("file_name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            let split = item
+                                .get("split")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("train");
+                            if let Some(src_path) =
+                                item.get("source_image_path").and_then(|v| v.as_str())
+                            {
+                                let p = PathBuf::from(src_path);
+                                if !file_name.is_empty() {
+                                    manifest_map.insert(format!("{split}/{file_name}"), p.clone());
+                                    manifest_map.insert(file_name.to_string(), p);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let train_count = populate_rfdetr_split_from_coco(
+            &dataset_root,
+            &ls_train_ann,
+            "train",
+            &dataset_root.join("train"),
+            &manifest_map,
+        )?;
+
+        let (val_ann_to_use, val_split_name) = if ls_val_ann.is_file() {
+            (&ls_val_ann, "val")
+        } else {
+            (&ls_train_ann, "train")
+        };
+        let val_count = populate_rfdetr_split_from_coco(
+            &dataset_root,
+            val_ann_to_use,
+            val_split_name,
+            &dataset_root.join("valid"),
+            &manifest_map,
+        )?;
+        let _ = populate_rfdetr_split_from_coco(
+            &dataset_root,
+            val_ann_to_use,
+            val_split_name,
+            &dataset_root.join("test"),
+            &manifest_map,
+        )?;
+
+        let _ = on_log.send(format!(
+            "[LS-Trainer] Prepared RF-DETR COCO splits: {train_count} train images, {val_count} valid images."
+        ));
+        return Ok(dataset_root);
+    }
+
+    Err(format!(
+        "COCO annotations not found in '{}'. Expected LS-Marker COCO export (annotations/instances_train.json) or COCO split folder (train/_annotations.coco.json).",
+        dataset_root.display()
+    ))
+}
+
+fn resolve_rfdetr_class_and_pretrain(
+    model_choice: &str,
+    task: &str,
+) -> (&'static str, &'static str, u32) {
+    let lower = model_choice.trim().to_ascii_lowercase();
+    let is_seg = task.eq_ignore_ascii_case("segment") || lower.contains("-seg");
+
+    if is_seg {
+        if lower.contains("nano") || lower.ends_with("n-seg") {
+            ("RFDETRSegNano", "rf-detr-seg-nano.pt", 12)
+        } else if lower.contains("medium") || lower.ends_with("m-seg") {
+            ("RFDETRSegMedium", "rf-detr-seg-medium.pt", 24)
+        } else if lower.contains("large") || lower.ends_with("l-seg") {
+            ("RFDETRSegLarge", "rf-detr-seg-large.pt", 24)
+        } else if lower.contains("preview") {
+            ("RFDETRSegPreview", "rf-detr-seg-preview.pt", 24)
+        } else {
+            ("RFDETRSegSmall", "rf-detr-seg-small.pt", 24)
+        }
+    } else if lower.contains("nano") || lower == "rf-detr-n" {
+        ("RFDETRNano", "rf-detr-nano.pth", 32)
+    } else if lower.contains("small") || lower == "rf-detr-s" {
+        ("RFDETRSmall", "rf-detr-small.pth", 32)
+    } else if lower.contains("large") || lower == "rf-detr-l" {
+        ("RFDETRLarge", "rf-detr-large.pth", 32)
+    } else if lower.contains("base") || lower == "rf-detr-b" {
+        ("RFDETRBase", "rf-detr-base.pth", 56)
+    } else {
+        ("RFDETRMedium", "rf-detr-medium.pth", 32)
+    }
+}
+
+fn snap_rfdetr_resolution(imgsz: u32, block_size: u32) -> u32 {
+    let b = block_size.max(1);
+    let rounded = ((imgsz + b / 2) / b) * b;
+    rounded.max(b)
+}
+
+fn get_venv_python(project_root: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let p = project_root.join(".venv").join("Scripts").join("python.exe");
+    #[cfg(not(target_os = "windows"))]
+    let p = project_root.join(".venv").join("bin").join("python");
+
+    if p.is_file() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+fn ensure_rfdetr_installed(project_root: &Path, on_log: &Channel<String>) {
+    let Some(python_exe) = get_venv_python(project_root) else {
+        return;
+    };
+
+    let mut check_cmd = Command::new(&python_exe);
+    check_cmd.args([
+        "-c",
+        "import rfdetr, pytorch_lightning, pycocotools, vernier, hotcoco, faster_coco_eval, onnx; from rfdetr.training import build_trainer",
+    ]);
+    #[cfg(windows)]
+    {
+        check_cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    if let Ok(status) = check_cmd.status() {
+        if status.success() {
+            return;
+        }
+    }
+
+    let _ = on_log.send(
+        "[LS-Trainer] Installing rfdetr (Apache 2.0) and COCO training dependencies into .venv..."
+            .to_string(),
+    );
+    let mut install_cmd = Command::new(&python_exe);
+    install_cmd.args([
+        "-m",
+        "pip",
+        "install",
+        "rfdetr",
+        "pytorch_lightning",
+        "torchmetrics[detection]<1.9.0,>=1.8.2",
+        "vernier",
+        "faster-coco-eval>=1.6.5",
+        "hotcoco>=1.3.0",
+        "pycocotools>=2.0.8",
+        "scipy",
+        "peft",
+        "onnx",
+        "onnxruntime",
+    ]);
+    install_cmd
+        .env("PYTHONUNBUFFERED", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        install_cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    if let Ok(mut child) = install_cmd.spawn() {
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let on_log_out = on_log.clone();
+        let t1 = std::thread::spawn(move || {
+            if let Some(out) = stdout {
+                stream_reader_lines(out, &on_log_out);
+            }
+        });
+        let on_log_err = on_log.clone();
+        let t2 = std::thread::spawn(move || {
+            if let Some(err) = stderr {
+                stream_reader_lines(err, &on_log_err);
+            }
+        });
+        let _ = t1.join();
+        let _ = t2.join();
+        let _ = child.wait();
+    }
+}
+
+fn extract_final_metrics_from_results_dir(abs_results_dir: &Path) -> (Option<f64>, Option<f64>) {
+    let metrics_json_path = abs_results_dir.join("ls_trainer_metrics.json");
+    if metrics_json_path.is_file() {
+        if let Ok(text) = std::fs::read_to_string(&metrics_json_path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                let map50 = val.get("map50").and_then(|v| v.as_f64());
+                let map50_95 = val.get("map50_95").and_then(|v| v.as_f64());
+                if map50.is_some() || map50_95.is_some() {
+                    return (map50, map50_95);
+                }
+            }
+        }
+    }
+
+    // Fallback: parse Ultralytics results.csv or RF-DETR metrics.csv
+    for csv_name in ["results.csv", "metrics.csv"] {
+        let csv_path = abs_results_dir.join(csv_name);
+        if !csv_path.is_file() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&csv_path) else {
+            continue;
+        };
+        let mut lines = content.lines().filter(|l| !l.trim().is_empty());
+        let Some(header_line) = lines.next() else {
+            continue;
+        };
+        let headers: Vec<String> = header_line
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .collect();
+
+        let idx_map50 = headers.iter().position(|h| {
+            h == "metrics/map50(b)"
+                || h == "metrics/map50(m)"
+                || h == "val/map_50"
+                || h == "val/ema_map_50"
+                || h == "val/segm_map_50"
+        });
+        let idx_map50_95 = headers.iter().position(|h| {
+            h == "metrics/map50-95(b)"
+                || h == "metrics/map50-95(m)"
+                || h == "val/map_50_95"
+                || h == "val/ema_map_50_95"
+                || h == "val/segm_map_50_95"
+        });
+
+        let mut best_50: Option<f64> = None;
+        let mut best_50_95: Option<f64> = None;
+        for row in lines {
+            let cols: Vec<&str> = row.split(',').map(|c| c.trim()).collect();
+            if let Some(i50) = idx_map50 {
+                if let Some(v) = cols.get(i50).and_then(|s| s.parse::<f64>().ok()) {
+                    best_50 = Some(best_50.map_or(v, |prev| prev.max(v)));
+                }
+            }
+            if let Some(i95) = idx_map50_95 {
+                if let Some(v) = cols.get(i95).and_then(|s| s.parse::<f64>().ok()) {
+                    best_50_95 = Some(best_50_95.map_or(v, |prev| prev.max(v)));
+                }
+            }
+        }
+        if best_50.is_some() || best_50_95.is_some() {
+            return (best_50, best_50_95);
+        }
+    }
+
+    (None, None)
+}
+
+async fn start_rfdetr_training(
+    project_root: PathBuf,
+    run_name: String,
+    yolo_task: String,
+    abs_results_dir: PathBuf,
+    results_dir: String,
+    dataset_input: PathBuf,
+    request: TrainingRequest,
+    on_log: Channel<String>,
+) -> Result<TrainingResponse, String> {
+    let coco_root = prepare_rfdetr_coco_dataset(&dataset_input, &on_log)?;
+
+    if yolo_task == "segment" {
+        let label_check = inspect_label_tree(&coco_root);
+        if let Some(warning) = label_check.warning {
+            let _ = on_log.send(format!("[LS-Trainer] Warning: {warning}"));
+        } else {
+            let _ = on_log.send(format!(
+                "[LS-Trainer] Segmentation labels OK: polygon annotations found ({} files, {} annotations).",
+                label_check.files_scanned, label_check.lines_scanned
+            ));
+        }
+    }
+
+    ensure_rfdetr_installed(&project_root, &on_log);
+
+    let (rfdetr_class, default_weights_name, block_size) =
+        resolve_rfdetr_class_and_pretrain(&request.model_choice, &yolo_task);
+    let snapped_res = snap_rfdetr_resolution(request.imgsz, block_size);
+    if snapped_res != request.imgsz {
+        let _ = on_log.send(format!(
+            "[LS-Trainer] Adjusted RF-DETR resolution from {} to {} (nearest multiple of block_size={block_size}).",
+            request.imgsz, snapped_res
+        ));
+    }
+
+    let models_dir = project_root.join("models");
+    let _ = std::fs::create_dir_all(&models_dir);
+    let custom_path = Path::new(request.model_choice.trim());
+    let resolved_pretrain = if custom_path.is_file() {
+        custom_path.to_string_lossy().to_string()
+    } else {
+        default_weights_name.to_string()
+    };
+
+    let device_input = request.device.trim();
+    let effective_device = if device_input.is_empty()
+        || device_input.eq_ignore_ascii_case("auto")
+        || device_input.eq_ignore_ascii_case("gpu")
+        || device_input.eq_ignore_ascii_case("cuda")
+        || device_input == "0"
+    {
+        if is_cuda_available(&project_root) {
+            let _ = on_log.send("[LS-Trainer] CUDA available, selecting device=cuda".to_string());
+            "cuda".to_string()
+        } else {
+            let _ = on_log.send("[LS-Trainer] No CUDA detected, using device=cpu".to_string());
+            "cpu".to_string()
+        }
+    } else {
+        device_input.to_string()
+    };
+
+    let _ = std::fs::create_dir_all(&abs_results_dir);
+    let runner_script_path = abs_results_dir.join("ls_trainer_rfdetr_run.py");
+
+    let runner_script = r#"import json
+import os
+import sys
+import traceback
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+def main():
+    cfg_path = sys.argv[1]
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    models_dir = cfg["models_dir"]
+    os.makedirs(models_dir, exist_ok=True)
+    os.chdir(models_dir)
+
+    import rfdetr
+    import rfdetr.training as rf_training
+    import rfdetr.training.trainer as rf_trainer_mod
+    from pytorch_lightning import Callback
+
+    try:
+        import rfdetr.utilities.console as rf_console
+        from rich.console import Console
+        rf_console._get_rich_console = lambda _trainer: Console(
+            force_terminal=False,
+            legacy_windows=False,
+            color_system=None,
+        )
+    except Exception:
+        pass
+
+    class_name = cfg["rfdetr_class"]
+    dataset_dir = cfg["dataset_dir"]
+    output_dir = cfg["output_dir"]
+    epochs = int(cfg["epochs"])
+    batch_size = max(1, int(cfg["batch_size"]))
+    resolution = int(cfg["resolution"])
+    device = cfg["device"]
+    pretrain_weights = cfg["pretrain_weights"]
+    freeze_backbone = bool(cfg.get("freeze_backbone", False))
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    best_state = {"map50": 0.0, "map50_95": 0.0}
+
+    def to_float(v):
+        if v is None:
+            return None
+        if hasattr(v, "item"):
+            try:
+                return float(v.item())
+            except Exception:
+                pass
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    class LSTrainerProgressCallback(Callback):
+        def on_train_epoch_start(self, trainer, pl_module):
+            ep = int(trainer.current_epoch) + 1
+            total = int(trainer.max_epochs)
+            print(f"Epoch {ep}/{total} - RF-DETR ({class_name}) training...", flush=True)
+
+        def on_validation_epoch_end(self, trainer, pl_module):
+            if getattr(trainer, "sanity_checking", False):
+                return
+            ep = int(trainer.current_epoch) + 1
+            total = int(trainer.max_epochs)
+            metrics = trainer.callback_metrics or {}
+
+            m50 = None
+            for k in ("val/segm_mAP_50", "val/ema_segm_mAP_50", "val/mAP_50", "val/ema_mAP_50"):
+                val = to_float(metrics.get(k))
+                if val is not None and (m50 is None or val > m50):
+                    m50 = val
+
+            m50_95 = None
+            for k in ("val/segm_mAP_50_95", "val/ema_segm_mAP_50_95", "val/mAP_50_95", "val/ema_mAP_50_95"):
+                val = to_float(metrics.get(k))
+                if val is not None and (m50_95 is None or val > m50_95):
+                    m50_95 = val
+
+            if m50 is not None and m50 > best_state["map50"]:
+                best_state["map50"] = m50
+            if m50_95 is not None and m50_95 > best_state["map50_95"]:
+                best_state["map50_95"] = m50_95
+
+            m50_disp = m50 if m50 is not None else best_state["map50"]
+            m95_disp = m50_95 if m50_95 is not None else best_state["map50_95"]
+            print(
+                f"[LS-Trainer Metrics] Epoch {ep}/{total} | mAP50={m50_disp:.4f} | mAP50-95={m95_disp:.4f}",
+                flush=True,
+            )
+
+    orig_build_trainer = rf_training.build_trainer
+
+    def hooked_build_trainer(*args, **kw):
+        trainer = orig_build_trainer(*args, **kw)
+        trainer.callbacks.append(LSTrainerProgressCallback())
+        return trainer
+
+    rf_training.build_trainer = hooked_build_trainer
+    rf_trainer_mod.build_trainer = hooked_build_trainer
+
+    eval_backend = "faster_coco_eval"
+    for candidate in ("vernier", "hotcoco", "faster_coco_eval"):
+        try:
+            __import__(candidate)
+            eval_backend = candidate
+            break
+        except ImportError:
+            continue
+
+    model_cls = getattr(rfdetr, class_name)
+    print(
+        f"[LS-Trainer] Initializing {class_name} (resolution={resolution}, pretrain_weights={pretrain_weights}, eval_backend={eval_backend})...",
+        flush=True,
+    )
+    model = model_cls(resolution=resolution, pretrain_weights=pretrain_weights, device=device)
+
+    train_kwargs = {
+        "dataset_dir": dataset_dir,
+        "output_dir": output_dir,
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "resolution": resolution,
+        "device": device,
+        "num_workers": 0,
+        "run_test": False,
+        "progress_bar": False,
+        "tensorboard": False,
+        "eval_backend": eval_backend,
+    }
+    if freeze_backbone:
+        train_kwargs["lr_encoder"] = 0.0
+
+    print(f"Epoch 1/{epochs} - Starting RF-DETR training loop...", flush=True)
+    model.train(**train_kwargs)
+
+    metrics_file = os.path.join(output_dir, "ls_trainer_metrics.json")
+    with open(metrics_file, "w", encoding="utf-8") as mf:
+        json.dump(best_state, mf, indent=2)
+
+    print(
+        f"[LS-Trainer Metrics] Final | mAP50={best_state['map50']:.4f} | mAP50-95={best_state['map50_95']:.4f}",
+        flush=True,
+    )
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        traceback.print_exc()
+        sys.exit(1)
+"#;
+
+    std::fs::write(&runner_script_path, runner_script)
+        .map_err(|e| format!("Failed to write RF-DETR runner script: {e}"))?;
+
+    let runner_cfg_path = abs_results_dir.join("ls_trainer_rfdetr_args.json");
+    let runner_cfg = serde_json::json!({
+        "rfdetr_class": rfdetr_class,
+        "models_dir": models_dir.to_string_lossy(),
+        "dataset_dir": coco_root.to_string_lossy(),
+        "output_dir": abs_results_dir.to_string_lossy(),
+        "epochs": request.epochs,
+        "batch_size": request.batch,
+        "resolution": snapped_res,
+        "device": effective_device,
+        "pretrain_weights": resolved_pretrain,
+        "freeze_backbone": request.freeze_backbone,
+        "task": yolo_task,
+    });
+    std::fs::write(
+        &runner_cfg_path,
+        serde_json::to_string_pretty(&runner_cfg).unwrap_or_default(),
+    )
+    .map_err(|e| format!("Failed to write RF-DETR config JSON: {e}"))?;
+
+    let python_exe = get_venv_python(&project_root).unwrap_or_else(|| PathBuf::from("python"));
+    let exact_command = format!(
+        "\"{}\" \"{}\" \"{}\"",
+        python_exe.display(),
+        runner_script_path.display(),
+        runner_cfg_path.display()
+    );
+
+    let _ = on_log.send("[LS-Trainer Status] Training in progress...".to_string());
+    let _ = on_log.send(format!(
+        "[LS-Trainer] Active config: family=RF-DETR | task={} | model={} ({}) | resolution={} | epochs={} | batch={} | freeze_backbone={} | device={}",
+        yolo_task,
+        request.model_choice,
+        rfdetr_class,
+        snapped_res,
+        request.epochs,
+        request.batch,
+        request.freeze_backbone,
+        effective_device
+    ));
+    let _ = on_log.send(format!("[LS-Trainer] Executing: {exact_command}"));
+
+    let mut cmd = Command::new(&python_exe);
+    cmd.args([
+        runner_script_path.to_string_lossy().as_ref(),
+        runner_cfg_path.to_string_lossy().as_ref(),
+    ])
+    .current_dir(&project_root)
+    .env("PYTHONUNBUFFERED", "1")
+    .env("PYTHONUTF8", "1")
+    .env("PYTHONIOENCODING", "utf-8")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    match cmd.spawn() {
+        Ok(mut child) => {
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+
+            let on_log_stdout = on_log.clone();
+            let stdout_thread = std::thread::spawn(move || {
+                if let Some(out) = stdout {
+                    stream_reader_lines(out, &on_log_stdout);
+                }
+            });
+
+            let on_log_stderr = on_log.clone();
+            let stderr_thread = std::thread::spawn(move || {
+                if let Some(err) = stderr {
+                    stream_reader_lines(err, &on_log_stderr);
+                }
+            });
+
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+
+            let status = child
+                .wait()
+                .map_err(|e| format!("Failed while waiting for RF-DETR process: {e}"))?;
+
+            save_run_config_metadata(
+                &abs_results_dir,
+                &request,
+                &resolved_pretrain,
+                &effective_device,
+                &exact_command,
+                &on_log,
+            );
+
+            let (map50, map50_95) = extract_final_metrics_from_results_dir(&abs_results_dir);
+
+            if status.success() {
+                if let (Some(m50), Some(m95)) = (map50, map50_95) {
+                    let _ = on_log.send(format!(
+                        "[LS-Trainer] Final Metrics — mAP50: {:.1}% ({:.4}) | mAP50-95: {:.1}% ({:.4})",
+                        m50 * 100.0,
+                        m50,
+                        m95 * 100.0,
+                        m95
+                    ));
+                }
+                let _ = on_log.send(format!(
+                    "[LS-Trainer] RF-DETR training completed successfully! Results saved to: {results_dir} (run '{run_name}')"
+                ));
+                Ok(TrainingResponse {
+                    success: true,
+                    results_dir,
+                    message: "Training complete".to_string(),
+                    map50,
+                    map50_95,
+                })
+            } else {
+                let _ = on_log.send(format!(
+                    "[LS-Trainer] RF-DETR exited with code: {:?}",
+                    status.code()
+                ));
+                Ok(TrainingResponse {
+                    success: false,
+                    results_dir,
+                    message: format!("Process exited with code {:?}", status.code()),
+                    map50,
+                    map50_95,
+                })
+            }
+        }
+        Err(err) => Err(format!("Failed to launch RF-DETR process: {err}")),
+    }
+}
+
 #[tauri::command]
 async fn start_training(
     _app: tauri::AppHandle,
@@ -1358,6 +2434,19 @@ async fn start_training(
         return Err(msg);
     }
 
+    if is_rfdetr_request(&request) {
+        return start_rfdetr_training(
+            project_root,
+            run_name,
+            yolo_task,
+            abs_results_dir,
+            results_dir,
+            dataset_input,
+            request,
+            on_log,
+        )
+        .await;
+    }
 
     // Determine data.yaml path: unpack if archive, or find inside directory
     let raw_data_yaml_path = if dataset_input.is_file() {
@@ -1628,7 +2717,18 @@ async fn start_training(
                 &on_log,
             );
 
+            let (map50, map50_95) = extract_final_metrics_from_results_dir(&abs_results_dir);
+
             if status.success() {
+                if let (Some(m50), Some(m95)) = (map50, map50_95) {
+                    let _ = on_log.send(format!(
+                        "[LS-Trainer] Final Metrics — mAP50: {:.1}% ({:.4}) | mAP50-95: {:.1}% ({:.4})",
+                        m50 * 100.0,
+                        m50,
+                        m95 * 100.0,
+                        m95
+                    ));
+                }
                 let _ = on_log.send(format!(
                     "[LS-Trainer] Training completed successfully! Results saved to: {results_dir}"
                 ));
@@ -1636,6 +2736,8 @@ async fn start_training(
                     success: true,
                     results_dir,
                     message: "Training complete".to_string(),
+                    map50,
+                    map50_95,
                 })
             } else {
                 let _ = on_log.send(format!(
@@ -1646,6 +2748,8 @@ async fn start_training(
                     success: false,
                     results_dir,
                     message: format!("Process exited with code {:?}", status.code()),
+                    map50,
+                    map50_95,
                 })
             }
         }
@@ -1676,6 +2780,8 @@ async fn start_training(
                 success: true,
                 results_dir,
                 message: "Command prepared and verified".to_string(),
+                map50: None,
+                map50_95: None,
             })
         }
     }
@@ -1709,19 +2815,20 @@ async fn open_folder(path: String) -> Result<(), String> {
     }
 
     // Use the same checkpoint / candidate path logic as ONNX export:
-    // Check if target is a direct file, or contains weights/best.pt, or best.pt
+    // Check if target is a direct file, or contains weights/best.pt, best.onnx, best.pt, or RF-DETR checkpoint_best_total.pth
     let target_file = if target.is_file() {
         Some(target.clone())
     } else {
-        let candidate_weights = target.join("weights").join("best.pt");
-        let candidate_direct = target.join("best.pt");
-        if candidate_weights.is_file() {
-            Some(candidate_weights)
-        } else if candidate_direct.is_file() {
-            Some(candidate_direct)
-        } else {
-            None
-        }
+        let candidates = [
+            target.join("weights").join("best.onnx"),
+            target.join("weights").join("best.pt"),
+            target.join("best.onnx"),
+            target.join("best.pt"),
+            target.join("checkpoint_best_total.pth"),
+            target.join("checkpoint_best_ema.pth"),
+            target.join("checkpoint_best_regular.pth"),
+        ];
+        candidates.into_iter().find(|p| p.is_file())
     };
 
     let dir_to_open = if let Some(ref file) = target_file {
@@ -1789,6 +2896,242 @@ async fn open_folder(path: String) -> Result<(), String> {
     Ok(())
 }
 
+fn find_rfdetr_checkpoint_in_dir(results_path: &Path) -> Option<PathBuf> {
+    if results_path.is_file()
+        && results_path
+            .extension()
+            .map(|e| e.to_string_lossy().eq_ignore_ascii_case("pth"))
+            .unwrap_or(false)
+    {
+        return Some(results_path.to_path_buf());
+    }
+
+    let direct_candidates = [
+        results_path.join("checkpoint_best_total.pth"),
+        results_path.join("checkpoint_best_ema.pth"),
+        results_path.join("checkpoint_best_regular.pth"),
+        results_path.join("checkpoint.pth"),
+    ];
+    for c in direct_candidates {
+        if c.is_file() {
+            return Some(c);
+        }
+    }
+    None
+}
+
+async fn export_rfdetr_to_onnx(
+    project_root: &Path,
+    results_path: &Path,
+    checkpoint_path: &Path,
+    request: &ExportRequest,
+    on_log: &Channel<String>,
+) -> Result<ExportResponse, String> {
+    ensure_rfdetr_installed(project_root, on_log);
+
+    let output_dir = if results_path.is_dir() {
+        results_path.to_path_buf()
+    } else {
+        checkpoint_path
+            .parent()
+            .unwrap_or(project_root)
+            .to_path_buf()
+    };
+
+    // Determine RF-DETR model class and task from saved run metadata if available
+    let mut model_choice = "rf-detr-medium".to_string();
+    let mut task = "detect".to_string();
+    let config_path = output_dir.join("ls_trainer_config.json");
+    if config_path.is_file() {
+        if let Ok(text) = std::fs::read_to_string(&config_path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(mc) = json.get("model_choice").and_then(|v| v.as_str()) {
+                    model_choice = mc.to_string();
+                }
+                if let Some(t) = json.get("task").and_then(|v| v.as_str()) {
+                    task = t.to_string();
+                }
+            }
+        }
+    }
+
+    let (rfdetr_class, _, block_size) = resolve_rfdetr_class_and_pretrain(&model_choice, &task);
+    let raw_imgsz = if request.imgsz == 0 {
+        default_export_imgsz()
+    } else {
+        request.imgsz
+    };
+    let export_res = snap_rfdetr_resolution(raw_imgsz, block_size);
+    let device = if is_cuda_available(project_root) {
+        "cuda"
+    } else {
+        "cpu"
+    };
+
+    let ckpt_display = checkpoint_path.to_string_lossy().replace('\\', "/");
+    let _ = on_log.send(format!(
+        "[LS-Trainer] Found RF-DETR checkpoint: {ckpt_display}"
+    ));
+    let _ = on_log.send(format!(
+        "[LS-Trainer] Exporting {rfdetr_class} to ONNX (shape=({export_res}, {export_res}), dynamic={}, simplify={})...",
+        request.dynamic, request.simplify
+    ));
+
+    let export_script_path = output_dir.join("ls_trainer_rfdetr_export.py");
+    let export_script = r#"import json
+import os
+import sys
+import traceback
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+def main():
+    cfg_path = sys.argv[1]
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    import rfdetr
+
+    class_name = cfg["rfdetr_class"]
+    ckpt_path = cfg["checkpoint_path"]
+    output_dir = cfg["output_dir"]
+    resolution = int(cfg["resolution"])
+    dynamic_batch = bool(cfg["dynamic"])
+    device = cfg["device"]
+
+    os.makedirs(output_dir, exist_ok=True)
+    model_cls = getattr(rfdetr, class_name)
+    if hasattr(model_cls, "from_checkpoint"):
+        model = model_cls.from_checkpoint(
+            ckpt_path,
+            resolution=resolution,
+            device=device,
+            trust_checkpoint=True,
+        )
+    else:
+        model = model_cls(
+            pretrain_weights=ckpt_path,
+            resolution=resolution,
+            device=device,
+        )
+    onnx_file = model.export(
+        output_dir=output_dir,
+        opset_version=17,
+        shape=(resolution, resolution),
+        dynamic_batch=dynamic_batch,
+        output_name="best",
+    )
+    print(f"[LS-Trainer] Exported RF-DETR ONNX model to: {onnx_file}", flush=True)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)
+"#;
+
+    std::fs::write(&export_script_path, export_script)
+        .map_err(|e| format!("Failed to write RF-DETR ONNX export script: {e}"))?;
+
+    let export_cfg_path = output_dir.join("ls_trainer_rfdetr_export_args.json");
+    let export_cfg = serde_json::json!({
+        "rfdetr_class": rfdetr_class,
+        "checkpoint_path": checkpoint_path.to_string_lossy(),
+        "output_dir": output_dir.to_string_lossy(),
+        "resolution": export_res,
+        "dynamic": request.dynamic,
+        "simplify": request.simplify,
+        "device": device,
+    });
+    std::fs::write(
+        &export_cfg_path,
+        serde_json::to_string_pretty(&export_cfg).unwrap_or_default(),
+    )
+    .map_err(|e| format!("Failed to write RF-DETR export config: {e}"))?;
+
+    let python_exe = get_venv_python(project_root).unwrap_or_else(|| PathBuf::from("python"));
+    let mut cmd = Command::new(&python_exe);
+    cmd.args([
+        export_script_path.to_string_lossy().as_ref(),
+        export_cfg_path.to_string_lossy().as_ref(),
+    ])
+    .current_dir(project_root)
+    .env("PYTHONUNBUFFERED", "1")
+    .env("PYTHONUTF8", "1")
+    .env("PYTHONIOENCODING", "utf-8")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    match cmd.spawn() {
+        Ok(mut child) => {
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let on_log_out = on_log.clone();
+            let t1 = std::thread::spawn(move || {
+                if let Some(out) = stdout {
+                    stream_reader_lines(out, &on_log_out);
+                }
+            });
+            let on_log_err = on_log.clone();
+            let t2 = std::thread::spawn(move || {
+                if let Some(err) = stderr {
+                    stream_reader_lines(err, &on_log_err);
+                }
+            });
+            let _ = t1.join();
+            let _ = t2.join();
+
+            let status = child
+                .wait()
+                .map_err(|e| format!("Failed while waiting for RF-DETR ONNX export: {e}"))?;
+
+            let expected_onnx = output_dir.join("best.onnx");
+            let onnx_str = to_display_path(&expected_onnx);
+            if status.success() && expected_onnx.is_file() {
+                let _ = on_log.send(format!(
+                    "[LS-Trainer] ONNX export completed successfully! File: {onnx_str}"
+                ));
+                let _ = on_log.send(
+                    "[LS-Trainer] Note: This model is optimized and ready for inference in LS-Vision."
+                        .to_string(),
+                );
+                Ok(ExportResponse {
+                    success: true,
+                    onnx_path: onnx_str,
+                    message: "ONNX export completed successfully".to_string(),
+                })
+            } else {
+                let err_msg = format!(
+                    "RF-DETR ONNX export failed with status code: {:?}",
+                    status.code()
+                );
+                let _ = on_log.send(format!("[LS-Trainer Error] {err_msg}"));
+                Ok(ExportResponse {
+                    success: false,
+                    onnx_path: String::new(),
+                    message: err_msg,
+                })
+            }
+        }
+        Err(err) => Err(format!("Failed to launch RF-DETR ONNX export: {err}")),
+    }
+}
+
 #[tauri::command]
 async fn export_to_onnx(
     _app: tauri::AppHandle,
@@ -1806,6 +3149,17 @@ async fn export_to_onnx(
         "[LS-Trainer] Preparing ONNX export for results in '{}'...",
         results_path.display()
     ));
+
+    if let Some(rfdetr_ckpt) = find_rfdetr_checkpoint_in_dir(&results_path) {
+        return export_rfdetr_to_onnx(
+            &project_root,
+            &results_path,
+            &rfdetr_ckpt,
+            &request,
+            &on_log,
+        )
+        .await;
+    }
 
     // Look for best.pt in weights/best.pt, best.pt, or recursively
     let candidate_weights = results_path.join("weights").join("best.pt");
@@ -2025,6 +3379,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             pick_dataset_file,
+            pick_dataset_folder,
             pick_model_file,
             inspect_dataset_labels,
             start_training,
@@ -2108,9 +3463,49 @@ mod label_tests {
     }
 
     #[test]
+    fn coco_json_scan_detects_bboxes_and_polygons() {
+        let mut bbox_stats = LabelStats::default();
+        let coco_bbox = r#"{
+            "images": [{"id": 1, "file_name": "a.jpg", "width": 640, "height": 480}],
+            "annotations": [{"id": 1, "image_id": 1, "category_id": 0, "bbox": [10, 10, 50, 50], "segmentation": []}],
+            "categories": [{"id": 0, "name": "bolt"}]
+        }"#;
+        scan_coco_json_text(coco_bbox, &mut bbox_stats);
+        assert_eq!(bbox_stats.bboxes, 1);
+        assert_eq!(bbox_stats.polygons, 0);
+
+        let mut poly_stats = LabelStats::default();
+        let coco_poly = r#"{
+            "images": [{"id": 1, "file_name": "a.jpg", "width": 640, "height": 480}],
+            "annotations": [{"id": 1, "image_id": 1, "category_id": 0, "bbox": [10, 10, 50, 50], "segmentation": [[10, 10, 60, 10, 60, 60]]}],
+            "categories": [{"id": 0, "name": "bolt"}]
+        }"#;
+        scan_coco_json_text(coco_poly, &mut poly_stats);
+        assert_eq!(poly_stats.polygons, 1);
+        assert_eq!(poly_stats.bboxes, 0);
+    }
+
+    #[test]
+    fn rfdetr_resolution_snapping_and_model_mapping() {
+        let (cls_n, weights_n, block_n) =
+            resolve_rfdetr_class_and_pretrain("rf-detr-nano", "detect");
+        assert_eq!(cls_n, "RFDETRNano");
+        assert_eq!(weights_n, "rf-detr-nano.pth");
+        assert_eq!(snap_rfdetr_resolution(640, block_n), 640);
+        assert_eq!(snap_rfdetr_resolution(960, block_n), 960);
+        assert_eq!(snap_rfdetr_resolution(1280, block_n), 1280);
+
+        let (cls_seg, _, block_seg) =
+            resolve_rfdetr_class_and_pretrain("rf-detr-seg-small", "segment");
+        assert_eq!(cls_seg, "RFDETRSegSmall");
+        assert_eq!(snap_rfdetr_resolution(640, block_seg), 648);
+    }
+
+    #[test]
     fn seg_weight_forces_segment_task() {
         let request = TrainingRequest {
             dataset_path: String::new(),
+            model_family: "YOLO".to_string(),
             model_choice: "yolo11s-seg.pt".to_string(),
             run_name: String::new(),
             epochs: 1,
@@ -2137,6 +3532,7 @@ mod label_tests {
     fn task_selector_segment_without_seg_filename() {
         let request = TrainingRequest {
             dataset_path: String::new(),
+            model_family: "YOLO".to_string(),
             model_choice: r"C:\runs\segment\best.pt".to_string(),
             run_name: String::new(),
             epochs: 1,

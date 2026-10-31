@@ -5,7 +5,8 @@ import { onMount } from "svelte";
 type ModelMode = "continue" | "fresh";
 type TrainTask = "detect" | "segment";
 type ImageSize = 640 | 960 | 1280;
-type YoloModel =
+type ModelFamily = "YOLO" | "RF-DETR" | "RT-DETR" | "YOLOX";
+type BaseModelId =
 	| "yolo11n.pt"
 	| "yolo11s.pt"
 	| "yolo11m.pt"
@@ -18,13 +19,39 @@ type YoloModel =
 	| "yolo26x.pt"
 	| "yolo11s-seg.pt"
 	| "yolo11m-seg.pt"
-	| "yolo26s-seg.pt";
+	| "yolo26s-seg.pt"
+	| "rf-detr-nano"
+	| "rf-detr-small"
+	| "rf-detr-medium"
+	| "rf-detr-base"
+	| "rf-detr-large"
+	| "rf-detr-seg-nano"
+	| "rf-detr-seg-small"
+	| "rf-detr-seg-medium"
+	| "rf-detr-seg-large"
+	| "rf-detr-seg-preview"
+	| "rtdetr-r18"
+	| "rtdetr-r34"
+	| "rtdetr-r50"
+	| "rtdetr-l.pt"
+	| "rtdetr-x.pt"
+	| "yolox-nano"
+	| "yolox-tiny"
+	| "yolox-s"
+	| "yolox-m"
+	| "yolox-l"
+	| "yolox-x";
 type AugPreset = "off" | "light" | "medium" | "bench" | "custom";
+
+const STORAGE_KEY_FAMILY = "ls_trainer.model_family";
+const STORAGE_KEY_SHOW_SEG = "ls_trainer.show_segmentation_models";
 
 interface TrainingResponse {
 	success: boolean;
 	results_dir: string;
 	message: string;
+	map50?: number | null;
+	map50_95?: number | null;
 }
 
 interface ExportResponse {
@@ -53,112 +80,389 @@ interface LabelCheckResult {
 	warning: string | null;
 }
 
+interface ModelFamilyInfo {
+	id: ModelFamily;
+	label: string;
+	vendor: string;
+	badge: string;
+	supported: boolean;
+	defaultDetectModel: BaseModelId;
+	defaultSegModel: BaseModelId | null;
+	description: string;
+}
+
+const modelFamilies: ModelFamilyInfo[] = [
+	{
+		id: "YOLO",
+		label: "YOLO",
+		vendor: "Ultralytics",
+		badge: "Active",
+		supported: true,
+		defaultDetectModel: "yolo11m.pt",
+		defaultSegModel: "yolo11s-seg.pt",
+		description: "Ultralytics YOLO11 & YOLO26 detection and segmentation",
+	},
+	{
+		id: "RF-DETR",
+		label: "RF-DETR",
+		vendor: "Roboflow",
+		badge: "Active",
+		supported: true,
+		defaultDetectModel: "rf-detr-medium",
+		defaultSegModel: "rf-detr-seg-small",
+		description: "Roboflow DINOv2 real-time vision transformer (Apache 2.0)",
+	},
+	{
+		id: "RT-DETR",
+		label: "RT-DETR",
+		vendor: "Baidu / Ultralytics",
+		badge: "Coming soon",
+		supported: false,
+		defaultDetectModel: "rtdetr-l.pt",
+		defaultSegModel: null,
+		description: "Real-Time Detection Transformer end-to-end detector",
+	},
+	{
+		id: "YOLOX",
+		label: "YOLOX",
+		vendor: "Megvii",
+		badge: "Coming soon",
+		supported: false,
+		defaultDetectModel: "yolox-s",
+		defaultSegModel: null,
+		description: "Anchor-free decoupled-head detector (Apache 2.0)",
+	},
+];
+
 const freshModelOptions: {
-	id: YoloModel;
-	family: "YOLO11" | "YOLO26";
+	id: BaseModelId;
+	family: ModelFamily;
+	group: string;
 	task: TrainTask;
 	label: string;
 	desc: string;
 }[] = [
+	// YOLO11 Detection
 	{
 		id: "yolo11n.pt",
-		family: "YOLO11",
+		family: "YOLO",
+		group: "YOLO11 Series",
 		task: "detect",
 		label: "YOLO11n",
 		desc: "Nano (fastest, lightweight)",
 	},
 	{
 		id: "yolo11s.pt",
-		family: "YOLO11",
+		family: "YOLO",
+		group: "YOLO11 Series",
 		task: "detect",
 		label: "YOLO11s",
 		desc: "Small (balanced fast)",
 	},
 	{
 		id: "yolo11m.pt",
-		family: "YOLO11",
+		family: "YOLO",
+		group: "YOLO11 Series",
 		task: "detect",
 		label: "YOLO11m",
 		desc: "Medium (default, high accuracy)",
 	},
 	{
 		id: "yolo11l.pt",
-		family: "YOLO11",
+		family: "YOLO",
+		group: "YOLO11 Series",
 		task: "detect",
 		label: "YOLO11l",
 		desc: "Large (extra accuracy)",
 	},
 	{
 		id: "yolo11x.pt",
-		family: "YOLO11",
+		family: "YOLO",
+		group: "YOLO11 Series",
 		task: "detect",
 		label: "YOLO11x",
 		desc: "XLarge (maximum capacity)",
 	},
+	// YOLO26 Detection
 	{
 		id: "yolo26n.pt",
-		family: "YOLO26",
+		family: "YOLO",
+		group: "YOLO26 Series",
 		task: "detect",
 		label: "YOLO26n",
 		desc: "Nano (next-gen lightweight)",
 	},
 	{
 		id: "yolo26s.pt",
-		family: "YOLO26",
+		family: "YOLO",
+		group: "YOLO26 Series",
 		task: "detect",
 		label: "YOLO26s",
 		desc: "Small (next-gen balanced)",
 	},
 	{
 		id: "yolo26m.pt",
-		family: "YOLO26",
+		family: "YOLO",
+		group: "YOLO26 Series",
 		task: "detect",
 		label: "YOLO26m",
 		desc: "Medium (next-gen high accuracy)",
 	},
 	{
 		id: "yolo26l.pt",
-		family: "YOLO26",
+		family: "YOLO",
+		group: "YOLO26 Series",
 		task: "detect",
 		label: "YOLO26l",
 		desc: "Large (next-gen extra accuracy)",
 	},
 	{
 		id: "yolo26x.pt",
-		family: "YOLO26",
+		family: "YOLO",
+		group: "YOLO26 Series",
 		task: "detect",
 		label: "YOLO26x",
 		desc: "XLarge (next-gen maximum capacity)",
 	},
+	// YOLO Segmentation (-seg)
 	{
 		id: "yolo11s-seg.pt",
-		family: "YOLO11",
+		family: "YOLO",
+		group: "YOLO11 Segmentation (-seg)",
 		task: "segment",
 		label: "YOLO11s-seg",
 		desc: "Small instance segmentation",
 	},
 	{
 		id: "yolo11m-seg.pt",
-		family: "YOLO11",
+		family: "YOLO",
+		group: "YOLO11 Segmentation (-seg)",
 		task: "segment",
 		label: "YOLO11m-seg",
 		desc: "Medium instance segmentation",
 	},
 	{
 		id: "yolo26s-seg.pt",
-		family: "YOLO26",
+		family: "YOLO",
+		group: "YOLO26 Segmentation (-seg)",
 		task: "segment",
 		label: "YOLO26s-seg",
 		desc: "Small next-gen segmentation",
 	},
+	// RF-DETR Detection (Nano / Small / Medium / Large / Base)
+	{
+		id: "rf-detr-nano",
+		family: "RF-DETR",
+		group: "RF-DETR Detection",
+		task: "detect",
+		label: "RF-DETR Nano",
+		desc: "Nano (ultra-fast real-time transformer)",
+	},
+	{
+		id: "rf-detr-small",
+		family: "RF-DETR",
+		group: "RF-DETR Detection",
+		task: "detect",
+		label: "RF-DETR Small",
+		desc: "Small (balanced low-latency transformer)",
+	},
+	{
+		id: "rf-detr-medium",
+		family: "RF-DETR",
+		group: "RF-DETR Detection",
+		task: "detect",
+		label: "RF-DETR Medium",
+		desc: "Medium (default, high accuracy industrial detector)",
+	},
+	{
+		id: "rf-detr-large",
+		family: "RF-DETR",
+		group: "RF-DETR Detection",
+		task: "detect",
+		label: "RF-DETR Large",
+		desc: "Large (128M backbone, maximum accuracy)",
+	},
+	{
+		id: "rf-detr-base",
+		family: "RF-DETR",
+		group: "RF-DETR Detection",
+		task: "detect",
+		label: "RF-DETR Base",
+		desc: "Base (29M DINOv2 backbone)",
+	},
+	// RF-DETR Segmentation (-seg)
+	{
+		id: "rf-detr-seg-nano",
+		family: "RF-DETR",
+		group: "RF-DETR Segmentation (-seg)",
+		task: "segment",
+		label: "RF-DETR Seg Nano",
+		desc: "Nano instance segmentation",
+	},
+	{
+		id: "rf-detr-seg-small",
+		family: "RF-DETR",
+		group: "RF-DETR Segmentation (-seg)",
+		task: "segment",
+		label: "RF-DETR Seg Small",
+		desc: "Small instance segmentation (default)",
+	},
+	{
+		id: "rf-detr-seg-medium",
+		family: "RF-DETR",
+		group: "RF-DETR Segmentation (-seg)",
+		task: "segment",
+		label: "RF-DETR Seg Medium",
+		desc: "Medium instance segmentation",
+	},
+	{
+		id: "rf-detr-seg-large",
+		family: "RF-DETR",
+		group: "RF-DETR Segmentation (-seg)",
+		task: "segment",
+		label: "RF-DETR Seg Large",
+		desc: "Large instance segmentation",
+	},
+	{
+		id: "rf-detr-seg-preview",
+		family: "RF-DETR",
+		group: "RF-DETR Segmentation (-seg)",
+		task: "segment",
+		label: "RF-DETR-seg Preview",
+		desc: "Instance segmentation head (Preview)",
+	},
+	// RT-DETR
+	{
+		id: "rtdetr-r18",
+		family: "RT-DETR",
+		group: "RT-DETR Series",
+		task: "detect",
+		label: "RT-DETR-R18",
+		desc: "ResNet-18 (lightweight real-time DETR)",
+	},
+	{
+		id: "rtdetr-r34",
+		family: "RT-DETR",
+		group: "RT-DETR Series",
+		task: "detect",
+		label: "RT-DETR-R34",
+		desc: "ResNet-34 (balanced speed & accuracy)",
+	},
+	{
+		id: "rtdetr-r50",
+		family: "RT-DETR",
+		group: "RT-DETR Series",
+		task: "detect",
+		label: "RT-DETR-R50",
+		desc: "ResNet-50 (high accuracy transformer)",
+	},
+	{
+		id: "rtdetr-l.pt",
+		family: "RT-DETR",
+		group: "RT-DETR Series",
+		task: "detect",
+		label: "RT-DETR-L",
+		desc: "HGNetv2 Large (default, high accuracy)",
+	},
+	{
+		id: "rtdetr-x.pt",
+		family: "RT-DETR",
+		group: "RT-DETR Series",
+		task: "detect",
+		label: "RT-DETR-X",
+		desc: "HGNetv2 XLarge (maximum capacity)",
+	},
+	// YOLOX
+	{
+		id: "yolox-nano",
+		family: "YOLOX",
+		group: "YOLOX Series",
+		task: "detect",
+		label: "YOLOX-Nano",
+		desc: "Nano (0.9M params, edge/embedded)",
+	},
+	{
+		id: "yolox-tiny",
+		family: "YOLOX",
+		group: "YOLOX Series",
+		task: "detect",
+		label: "YOLOX-Tiny",
+		desc: "Tiny (5.1M params, fast lightweight)",
+	},
+	{
+		id: "yolox-s",
+		family: "YOLOX",
+		group: "YOLOX Series",
+		task: "detect",
+		label: "YOLOX-S",
+		desc: "Small (9.0M params, default balanced)",
+	},
+	{
+		id: "yolox-m",
+		family: "YOLOX",
+		group: "YOLOX Series",
+		task: "detect",
+		label: "YOLOX-M",
+		desc: "Medium (25.3M params, high accuracy)",
+	},
+	{
+		id: "yolox-l",
+		family: "YOLOX",
+		group: "YOLOX Series",
+		task: "detect",
+		label: "YOLOX-L",
+		desc: "Large (54.2M params, extra accuracy)",
+	},
+	{
+		id: "yolox-x",
+		family: "YOLOX",
+		group: "YOLOX Series",
+		task: "detect",
+		label: "YOLOX-X",
+		desc: "XLarge (99.1M params, maximum capacity)",
+	},
 ];
+
+function loadSavedFamily(): ModelFamily {
+	if (typeof window === "undefined") return "YOLO";
+	try {
+		const raw = window.localStorage.getItem(STORAGE_KEY_FAMILY);
+		if (
+			raw === "YOLO" ||
+			raw === "RF-DETR" ||
+			raw === "RT-DETR" ||
+			raw === "YOLOX"
+		) {
+			return raw;
+		}
+	} catch {
+		// ignore localStorage read errors
+	}
+	return "YOLO";
+}
+
+function loadSavedShowSeg(): boolean {
+	if (typeof window === "undefined") return false;
+	try {
+		return window.localStorage.getItem(STORAGE_KEY_SHOW_SEG) === "true";
+	} catch {
+		return false;
+	}
+}
+
+const initialFamily = loadSavedFamily();
+const initialShowSeg = loadSavedShowSeg();
+const initialFamilyMeta =
+	modelFamilies.find((f) => f.id === initialFamily) ?? modelFamilies[0];
 
 let datasetPath = $state<string>("");
 let datasetFileName = $state<string>("");
 let modelMode = $state<ModelMode>("fresh");
+let selectedFamily = $state<ModelFamily>(initialFamily);
+let showSegmentationModels = $state<boolean>(initialShowSeg);
 let existingModelPath = $state<string>("");
 let existingModelFileName = $state<string>("");
-let freshModel = $state<YoloModel>("yolo11m.pt");
+let freshModel = $state<BaseModelId>(initialFamilyMeta.defaultDetectModel);
 let trainTask = $state<TrainTask>("detect");
 let freezeBackbone = $state<boolean>(false);
 const freezeLayersCount = 10;
@@ -277,12 +581,127 @@ function applyAugPreset(preset: "off" | "light" | "medium" | "bench") {
 	}
 }
 
+function persistModelPreferences(family: ModelFamily, showSeg: boolean) {
+	if (typeof window === "undefined") return;
+	try {
+		window.localStorage.setItem(STORAGE_KEY_FAMILY, family);
+		window.localStorage.setItem(STORAGE_KEY_SHOW_SEG, String(showSeg));
+	} catch {
+		// ignore localStorage write errors
+	}
+}
+
+$effect(() => {
+	persistModelPreferences(selectedFamily, showSegmentationModels);
+});
+
+const selectedFamilyInfo = $derived(
+	modelFamilies.find((f) => f.id === selectedFamily) ?? modelFamilies[0],
+);
+
+const familySegModelCount = $derived(
+	freshModelOptions.filter(
+		(o) =>
+			o.family === selectedFamily &&
+			(o.task === "segment" || /-seg/i.test(o.id)),
+	).length,
+);
+
+const visibleModelOptions = $derived(
+	freshModelOptions.filter(
+		(o) =>
+			o.family === selectedFamily &&
+			(showSegmentationModels || (o.task !== "segment" && !/-seg/i.test(o.id))),
+	),
+);
+
+const visibleModelGroups = $derived.by(() => {
+	const groups: { name: string; options: typeof freshModelOptions }[] = [];
+	for (const opt of visibleModelOptions) {
+		const existing = groups.find((g) => g.name === opt.group);
+		if (existing) {
+			existing.options.push(opt);
+		} else {
+			groups.push({ name: opt.group, options: [opt] });
+		}
+	}
+	return groups;
+});
+
+function selectModelFamily(family: ModelFamily) {
+	if (isTraining) return;
+	selectedFamily = family;
+	const meta = modelFamilies.find((f) => f.id === family) ?? modelFamilies[0];
+	const allowed = freshModelOptions.filter(
+		(o) =>
+			o.family === family &&
+			(showSegmentationModels || (o.task !== "segment" && !/-seg/i.test(o.id))),
+	);
+	if (!allowed.some((o) => o.id === freshModel)) {
+		if (
+			trainTask === "segment" &&
+			showSegmentationModels &&
+			meta.defaultSegModel
+		) {
+			freshModel = meta.defaultSegModel;
+		} else {
+			freshModel = meta.defaultDetectModel;
+			trainTask = "detect";
+		}
+	}
+}
+
+function toggleShowSegmentationModels(nextValue: boolean) {
+	if (isTraining) return;
+	showSegmentationModels = nextValue;
+	if (!nextValue) {
+		const current = freshModelOptions.find((o) => o.id === freshModel);
+		if (current && (current.task === "segment" || /-seg/i.test(current.id))) {
+			const meta =
+				modelFamilies.find((f) => f.id === selectedFamily) ?? modelFamilies[0];
+			freshModel = meta.defaultDetectModel;
+			trainTask = "detect";
+		}
+	}
+}
+
 function selectTrainTask(task: TrainTask) {
 	if (isTraining) return;
 	trainTask = task;
-	const current = freshModelOptions.find((o) => o.id === freshModel);
-	if (!current || current.task !== task) {
-		freshModel = task === "segment" ? "yolo11s-seg.pt" : "yolo11m.pt";
+	const meta =
+		modelFamilies.find((f) => f.id === selectedFamily) ?? modelFamilies[0];
+	if (task === "segment") {
+		if (!showSegmentationModels) {
+			showSegmentationModels = true;
+		}
+		const current = freshModelOptions.find((o) => o.id === freshModel);
+		if (
+			!current ||
+			current.family !== selectedFamily ||
+			current.task !== "segment"
+		) {
+			if (meta.defaultSegModel) {
+				freshModel = meta.defaultSegModel;
+			}
+		}
+	} else {
+		const current = freshModelOptions.find((o) => o.id === freshModel);
+		if (
+			!current ||
+			current.family !== selectedFamily ||
+			current.task !== "detect"
+		) {
+			freshModel = meta.defaultDetectModel;
+		}
+	}
+}
+
+function handleFreshModelChange(nextModel: BaseModelId) {
+	freshModel = nextModel;
+	const found = freshModelOptions.find((o) => o.id === nextModel);
+	if (found) {
+		trainTask =
+			found.task === "segment" || /-seg/i.test(found.id) ? "segment" : "detect";
 	}
 }
 
@@ -312,22 +731,22 @@ const isSegmentationRun = $derived(
 	trainTask === "segment" || /-seg/i.test(effectiveModelName),
 );
 
-const visibleModelOptions = $derived(
-	freshModelOptions.filter((o) => o.task === trainTask),
-);
-
 const activeTaskLabel = $derived(isSegmentationRun ? "segment" : "detect");
 
 const activeRunConfigBanner = $derived(
 	`${activeTaskLabel} · ${activeModelLabel} · ${activeFreezeLabel} · ${activeAugSummary}`,
 );
 
-// Epoch countdown & rolling ETA tracking
+// Epoch countdown, rolling ETA & validation metrics tracking
 let currentEpoch = $state<number>(0);
 let totalEpochs = $state<number>(0);
 let currentEpochStartTime = $state<number | null>(null);
 let recentEpochDurations = $state<number[]>([]);
 let firstEpochEstimatedSec = $state<number | null>(null);
+let finalMetrics = $state<{ map50: number | null; map50_95: number | null }>({
+	map50: null,
+	map50_95: null,
+});
 
 const remainingEpochs = $derived(Math.max(0, totalEpochs - currentEpoch));
 const rollingAvgEpochSec = $derived(
@@ -360,6 +779,11 @@ const epochProgressPercent = $derived(
 		: 0,
 );
 
+function formatMetricPercent(v: number | null | undefined): string {
+	if (v === null || v === undefined || Number.isNaN(v)) return "—";
+	return `${(v * 100).toFixed(1)}%`;
+}
+
 function shortenGpuName(name: string): string {
 	return name
 		.replace(/^NVIDIA GeForce\s+/i, "")
@@ -373,7 +797,22 @@ function processIncomingLogLine(line: string) {
 		return;
 	}
 
-	// Detect Ultralytics epoch progress row e.g. "     12/80      2.41G ..." or "Epoch 12/80"
+	// Parse live/final mAP metrics emitted by RF-DETR or YOLO
+	const metricsMatch = line.match(
+		/mAP50=([0-9]*\.?[0-9]+)\s*\|\s*mAP50-95=([0-9]*\.?[0-9]+)/i,
+	);
+	if (metricsMatch) {
+		const m50 = Number.parseFloat(metricsMatch[1]);
+		const m95 = Number.parseFloat(metricsMatch[2]);
+		if (!Number.isNaN(m50) && !Number.isNaN(m95)) {
+			finalMetrics = {
+				map50: m50,
+				map50_95: m95,
+			};
+		}
+	}
+
+	// Detect Ultralytics or RF-DETR epoch progress row e.g. "     12/80      2.41G ..." or "Epoch 12/80"
 	const yoloRowMatch =
 		line.match(/^\s*(\d+)\s*\/\s*(\d+)\s+\S+\s+\d+(?:\.\d+)?/) ||
 		line.match(/^\s*(\d+)\s*\/\s*(\d+)\s+.*?\d+%\|/) ||
@@ -516,7 +955,7 @@ $effect(() => {
 		labelWarning = null;
 		labelCheckPending = false;
 		labelCheckNote =
-			"Polygon check runs in the desktop app when a dataset archive is selected.";
+			"Polygon check runs in the desktop app when a dataset archive or folder is selected.";
 		return;
 	}
 
@@ -535,7 +974,7 @@ $effect(() => {
 				labelCheckNote = `Polygon annotations detected (${result.files_scanned} label files).`;
 			} else {
 				labelWarning =
-					"No polygon annotations were found. Instance segmentation needs label lines with more than 5 values.";
+					"No polygon annotations were found. Instance segmentation needs polygon masks.";
 			}
 		})
 		.catch((err) => {
@@ -576,6 +1015,9 @@ const isModelSelected = $derived(
 		? Boolean(existingModelPath.trim() || existingModelFileName.trim())
 		: Boolean(freshModel),
 );
+const isSelectedFamilySupported = $derived(
+	modelMode === "continue" || selectedFamilyInfo.supported,
+);
 const isTorchReady = $derived(
 	!isCheckingGpu &&
 		!isRepairingCuda &&
@@ -584,7 +1026,11 @@ const isTorchReady = $derived(
 			: Boolean(gpuInfo.cuda_available || gpuInfo.cpu_fallback_confirmed)),
 );
 const isFormValid = $derived(
-	isDatasetSelected && isModelSelected && !isTraining && isTorchReady,
+	isDatasetSelected &&
+		isModelSelected &&
+		isSelectedFamilySupported &&
+		!isTraining &&
+		isTorchReady,
 );
 
 $effect(() => {
@@ -679,6 +1125,24 @@ async function handlePickDataset() {
 	datasetInputRef?.click();
 }
 
+async function handlePickDatasetFolder() {
+	if (isTauri()) {
+		try {
+			const picked = await invoke<string | null>("pick_dataset_folder");
+			if (picked) {
+				const norm = normalizePath(picked);
+				datasetPath = norm;
+				const cleanName = norm.replace(/\\/g, "/").split("/").pop();
+				datasetFileName = cleanName || norm;
+			}
+			return;
+		} catch (err) {
+			console.warn("Native folder picker unavailable:", err);
+		}
+	}
+	datasetInputRef?.click();
+}
+
 function handleDatasetFileInputChange(event: Event) {
 	const target = event.currentTarget as HTMLInputElement;
 	const file = target.files?.[0];
@@ -757,6 +1221,7 @@ async function handleStartTraining() {
 	currentEpochStartTime = null;
 	recentEpochDurations = [];
 	firstEpochEstimatedSec = null;
+	finalMetrics = { map50: null, map50_95: null };
 	statusMessage = "Training in progress...";
 
 	const effectiveRunName = runName.trim() || "BB-Parts-v3";
@@ -765,11 +1230,18 @@ async function handleStartTraining() {
 		modelMode === "continue"
 			? existingModelPath.trim() || existingModelFileName.trim()
 			: freshModel;
+	const effectiveFamily: ModelFamily =
+		modelMode === "continue"
+			? /\.pth$/i.test(effectiveModel) || /^rf-?detr/i.test(effectiveModel)
+				? "RF-DETR"
+				: selectedFamily
+			: selectedFamily;
 
 	const effectiveCopyPaste = copyPaste ? 0.3 : 0.0;
 	const taskName = isSegmentationRun ? "segment" : "detect";
 	const requestPayload = {
 		dataset_path: effectiveDataset,
+		model_family: effectiveFamily,
 		model_choice: effectiveModel,
 		run_name: effectiveRunName,
 		epochs: Number(epochs),
@@ -807,6 +1279,15 @@ async function handleStartTraining() {
 			if (response.success && totalEpochs > 0) {
 				currentEpoch = totalEpochs;
 			}
+			if (
+				(response.map50 !== undefined && response.map50 !== null) ||
+				(response.map50_95 !== undefined && response.map50_95 !== null)
+			) {
+				finalMetrics = {
+					map50: response.map50 ?? finalMetrics.map50,
+					map50_95: response.map50_95 ?? finalMetrics.map50_95,
+				};
+			}
 			resultsDir = normalizePath(response.results_dir);
 			if (
 				response.success &&
@@ -831,18 +1312,24 @@ async function handleStartTraining() {
 	} else {
 		// Browser development preview simulation
 		const freezeArgStr = freezeBackbone ? ` freeze=${freezeLayersCount}` : "";
+		const isRfDetrSim = effectiveFamily === "RF-DETR";
 		logs = [
 			"[LS-Trainer] Running outside Tauri webview (Browser Mode)",
-			`[LS-Trainer] Simulated training run '${effectiveRunName}'`,
-			`[LS-Trainer] Ultralytics task="${taskName}"`,
+			`[LS-Trainer] Simulated training run '${effectiveRunName}' (${effectiveFamily})`,
+			isRfDetrSim
+				? `[LS-Trainer] Prepared LS-Marker COCO splits for RF-DETR (${effectiveModel})`
+				: `[LS-Trainer] Ultralytics task="${taskName}"`,
 			`[LS-Trainer] Active config: ${activeRunConfigBanner}`,
-			`[LS-Trainer] Command: yolo ${taskName} train task=${taskName} data="${effectiveDataset}" model="${effectiveModel}" name="${effectiveRunName}" epochs=${epochs} batch=${batch} imgsz=${imageSize} device="${device}" amp=${amp}${freezeArgStr} mosaic=${mosaic} close_mosaic=${closeMosaic} mixup=${mixup} copy_paste=${effectiveCopyPaste} degrees=${degrees} flipud=${flipud} translate=${translate} scale=${scale}`,
-			"[LS-Trainer] Unpacking archive simulation complete.",
+			isRfDetrSim
+				? `[LS-Trainer] Command: python ls_trainer_rfdetr_run.py --model ${effectiveModel} --dataset "${effectiveDataset}" --epochs ${epochs} --batch ${batch} --resolution ${imageSize}`
+				: `[LS-Trainer] Command: yolo ${taskName} train task=${taskName} data="${effectiveDataset}" model="${effectiveModel}" name="${effectiveRunName}" epochs=${epochs} batch=${batch} imgsz=${imageSize} device="${device}" amp=${amp}${freezeArgStr} mosaic=${mosaic} close_mosaic=${closeMosaic} mixup=${mixup} copy_paste=${effectiveCopyPaste} degrees=${degrees} flipud=${flipud} translate=${translate} scale=${scale}`,
 			`[LS-Trainer] Starting ${activeModelLabel} epochs (1/${epochs})...`,
+			`[LS-Trainer Metrics] Final | mAP50=0.9140 | mAP50-95=0.7280`,
 			"[LS-Trainer] Training finished successfully.",
 		];
 		currentEpoch = Number(epochs);
 		totalEpochs = Number(epochs);
+		finalMetrics = { map50: 0.914, map50_95: 0.728 };
 		resultsDir = normalizePath(
 			`C:/Scripts/LS-Trainer/runs/${taskName}/${effectiveRunName}/`,
 		);
@@ -1016,46 +1503,80 @@ async function handleExportToOnnx() {
 						<label for="dataset-file-input" class="text-xs font-semibold tracking-wider text-zinc-300 uppercase">
 							Dataset
 						</label>
-						<span class="text-xs text-zinc-500">Supported: .tar, .tar.gz</span>
+						<span class="text-xs text-zinc-500">
+							{selectedFamily === "RF-DETR"
+								? "LS-Marker COCO (.tar, .tar.gz, or folder)"
+								: "Supported: .tar, .tar.gz, or folder"}
+						</span>
 					</div>
 
 					<input
 						id="dataset-file-input"
 						bind:this={datasetInputRef}
 						type="file"
-						accept=".tar,.tar.gz,application/x-tar,application/gzip,application/x-gzip"
+						accept=".tar,.tar.gz,.tgz,.json,.yaml,.yml,application/x-tar,application/gzip,application/x-gzip"
 						onchange={handleDatasetFileInputChange}
 						class="hidden"
 					/>
 
 					{#if !datasetFileName}
-						<button
-							type="button"
-							onclick={handlePickDataset}
-							disabled={isTraining}
-							class="group flex w-full flex-col items-center justify-center rounded-lg border-2 border-dashed border-zinc-700/80 bg-zinc-950/40 p-5 text-center transition-all hover:border-amber-500/70 hover:bg-zinc-900/60 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500/40 disabled:opacity-50"
-						>
-							<svg
-								class="mb-2 h-6 w-6 text-zinc-400 transition-colors group-hover:text-amber-400"
-								aria-hidden="true"
-								fill="none"
-								stroke="currentColor"
-								viewBox="0 0 24 24"
+						<div class="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+							<button
+								type="button"
+								onclick={handlePickDataset}
+								disabled={isTraining}
+								class="group flex w-full flex-col items-center justify-center rounded-lg border-2 border-dashed border-zinc-700/80 bg-zinc-950/40 p-4 text-center transition-all hover:border-amber-500/70 hover:bg-zinc-900/60 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500/40 disabled:opacity-50"
 							>
-								<path
-									stroke-linecap="round"
-									stroke-linejoin="round"
-									stroke-width="1.75"
-									d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
-								/>
-							</svg>
-							<p class="text-sm font-medium text-zinc-200">
-								Choose dataset archive
-							</p>
-							<p class="mt-0.5 text-xs text-zinc-500">
-								Select a .tar or .tar.gz file from local disk
-							</p>
-						</button>
+								<svg
+									class="mb-1.5 h-6 w-6 text-zinc-400 transition-colors group-hover:text-amber-400"
+									aria-hidden="true"
+									fill="none"
+									stroke="currentColor"
+									viewBox="0 0 24 24"
+								>
+									<path
+										stroke-linecap="round"
+										stroke-linejoin="round"
+										stroke-width="1.75"
+										d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
+									/>
+								</svg>
+								<p class="text-sm font-medium text-zinc-200">
+									Choose dataset archive
+								</p>
+								<p class="mt-0.5 text-xs text-zinc-500">
+									LS-Marker .tar / .tar.gz export or manifest
+								</p>
+							</button>
+
+							<button
+								type="button"
+								onclick={handlePickDatasetFolder}
+								disabled={isTraining}
+								class="group flex w-full flex-col items-center justify-center rounded-lg border-2 border-dashed border-zinc-700/80 bg-zinc-950/40 p-4 text-center transition-all hover:border-amber-500/70 hover:bg-zinc-900/60 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500/40 disabled:opacity-50"
+							>
+								<svg
+									class="mb-1.5 h-6 w-6 text-zinc-400 transition-colors group-hover:text-amber-400"
+									aria-hidden="true"
+									fill="none"
+									stroke="currentColor"
+									viewBox="0 0 24 24"
+								>
+									<path
+										stroke-linecap="round"
+										stroke-linejoin="round"
+										stroke-width="1.75"
+										d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"
+									/>
+								</svg>
+								<p class="text-sm font-medium text-zinc-200">
+									Choose dataset folder
+								</p>
+								<p class="mt-0.5 text-xs text-zinc-500">
+									Unpacked LS-Marker COCO or YOLO directory
+								</p>
+							</button>
+						</div>
 					{:else}
 						<div class="flex items-center justify-between rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 px-4">
 							<div class="flex items-center gap-3 min-w-0">
@@ -1078,7 +1599,7 @@ async function handleExportToOnnx() {
 										{datasetFileName}
 									</p>
 									<p class="truncate text-xs text-amber-400/90" title={normalizePath(datasetPath) || datasetFileName}>
-										{normalizePath(datasetPath) || "Archive selected"}
+										{normalizePath(datasetPath) || "Dataset selected"}
 									</p>
 								</div>
 							</div>
@@ -1089,7 +1610,15 @@ async function handleExportToOnnx() {
 									disabled={isTraining}
 									class="rounded bg-zinc-800 px-2.5 py-1 text-xs font-medium text-zinc-300 transition hover:bg-zinc-700 hover:text-white disabled:opacity-50"
 								>
-									Change
+									Archive
+								</button>
+								<button
+									type="button"
+									onclick={handlePickDatasetFolder}
+									disabled={isTraining}
+									class="rounded bg-zinc-800 px-2.5 py-1 text-xs font-medium text-zinc-300 transition hover:bg-zinc-700 hover:text-white disabled:opacity-50"
+								>
+									Folder
 								</button>
 								<button
 									type="button"
@@ -1162,7 +1691,7 @@ async function handleExportToOnnx() {
 							/>
 							<div>
 								<span class="block text-sm font-medium text-zinc-200">Continue from existing</span>
-								<span class="block text-xs text-zinc-400">Resume from custom .pt checkpoint</span>
+								<span class="block text-xs text-zinc-400">Resume from custom .pt or .pth checkpoint</span>
 							</div>
 						</label>
 					</div>
@@ -1229,46 +1758,145 @@ async function handleExportToOnnx() {
 
 					<!-- Dynamic Model Inputs based on choice -->
 					{#if modelMode === "fresh"}
-						<div class="space-y-1.5 pt-1">
-							<label for="fresh-model-select" class="block text-xs font-medium text-zinc-400">
-								Select Base Architecture
-							</label>
-							<select
-								id="fresh-model-select"
-								bind:value={freshModel}
-								disabled={isTraining}
-								class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
-							>
-								{#if visibleModelOptions.some((o) => o.family === "YOLO11")}
-									<optgroup label={trainTask === "segment" ? "YOLO11 Segmentation" : "YOLO11 Series"}>
-										{#each visibleModelOptions.filter((o) => o.family === "YOLO11") as opt (opt.id)}
-											<option value={opt.id}>
-												{opt.label} ({opt.id}) — {opt.desc}
-											</option>
-										{/each}
-									</optgroup>
+						<div class="space-y-3 pt-1">
+							<!-- Model Family Switcher -->
+							<div class="space-y-1.5">
+								<div class="flex items-center justify-between">
+									<span class="block text-xs font-medium text-zinc-400">
+										Model Family
+									</span>
+									<span class="font-mono text-[11px] text-zinc-500">
+										{selectedFamilyInfo.vendor}
+									</span>
+								</div>
+								<div
+									role="radiogroup"
+									aria-label="Model Family"
+									class="grid grid-cols-2 gap-1.5 rounded-lg border border-zinc-800/90 bg-zinc-950/60 p-1 sm:grid-cols-4"
+								>
+									{#each modelFamilies as fam (fam.id)}
+										{@const isSelected = selectedFamily === fam.id}
+										<button
+											type="button"
+											role="radio"
+											aria-checked={isSelected}
+											disabled={isTraining}
+											onclick={() => selectModelFamily(fam.id)}
+											class={`group relative flex flex-col items-start justify-between rounded-md px-2.5 py-2 text-left transition-all ${
+												isSelected
+													? fam.supported
+														? "border border-amber-500/60 bg-amber-500/15 text-zinc-100 shadow-[inset_0_1px_0_rgba(245,158,11,0.2)]"
+														: "border border-zinc-600/80 bg-zinc-800/90 text-zinc-100"
+													: "border border-transparent bg-transparent text-zinc-400 hover:bg-zinc-900/80 hover:text-zinc-200"
+											} disabled:opacity-50`}
+										>
+											<div class="flex w-full items-center justify-between gap-1">
+												<span class="font-mono text-xs font-semibold tracking-tight">
+													{fam.label}
+												</span>
+												{#if fam.supported}
+													<span
+														class={`h-1.5 w-1.5 rounded-full ${
+															isSelected
+																? "bg-amber-400 shadow-[0_0_6px_rgba(245,158,11,0.8)]"
+																: "bg-emerald-500/70"
+														}`}
+														title="Supported in training pipeline"
+													></span>
+												{:else}
+													<span class="rounded border border-zinc-700/80 bg-zinc-900/90 px-1 py-0.5 font-mono text-[9px] uppercase tracking-wider text-zinc-400">
+														Soon
+													</span>
+												{/if}
+											</div>
+											<span class="mt-0.5 text-[10px] text-zinc-500 group-hover:text-zinc-400">
+												{fam.vendor}
+											</span>
+										</button>
+									{/each}
+								</div>
+							</div>
+
+							<!-- Architecture Size Selector + Show Segmentation Toggle -->
+							<div class="space-y-1.5">
+								<div class="flex flex-wrap items-center justify-between gap-2">
+									<label for="fresh-model-select" class="block text-xs font-medium text-zinc-400">
+										Select Base Architecture ({selectedFamilyInfo.label})
+									</label>
+									<label
+										class={`inline-flex cursor-pointer items-center gap-2 rounded-md border px-2.5 py-1 text-xs transition select-none ${
+											showSegmentationModels
+												? "border-amber-500/40 bg-amber-500/10 text-amber-200"
+												: "border-zinc-800 bg-zinc-950/50 text-zinc-400 hover:border-zinc-700 hover:text-zinc-300"
+										} ${isTraining ? "opacity-50 pointer-events-none" : ""}`}
+									>
+										<input
+											type="checkbox"
+											checked={showSegmentationModels}
+											disabled={isTraining}
+											onchange={(e) => toggleShowSegmentationModels(e.currentTarget.checked)}
+											class="h-3.5 w-3.5 rounded border-zinc-700 bg-zinc-900 text-amber-500 focus:ring-amber-500 focus:ring-offset-zinc-950"
+										/>
+										<span>Show segmentation models</span>
+										<span class="rounded bg-zinc-800/90 px-1.5 py-0.2 font-mono text-[10px] text-zinc-400">
+											{familySegModelCount}
+										</span>
+									</label>
+								</div>
+
+								<select
+									id="fresh-model-select"
+									value={freshModel}
+									onchange={(e) => handleFreshModelChange(e.currentTarget.value as BaseModelId)}
+									disabled={isTraining}
+									class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+								>
+									{#each visibleModelGroups as group (group.name)}
+										<optgroup label={group.name}>
+											{#each group.options as opt (opt.id)}
+												<option value={opt.id}>
+													{opt.label} ({opt.id}){ !selectedFamilyInfo.supported ? " [Coming soon]" : "" } — {opt.desc}
+												</option>
+											{/each}
+										</optgroup>
+									{/each}
+								</select>
+
+								{#if !showSegmentationModels && familySegModelCount > 0}
+									<p class="text-[11px] text-zinc-500">
+										{familySegModelCount} segmentation (`-seg`) variant{familySegModelCount === 1 ? "" : "s"} hidden. Enable “Show segmentation models” to include polygon mask weights.
+									</p>
+								{:else if showSegmentationModels && familySegModelCount === 0}
+									<p class="text-[11px] text-zinc-500">
+										No `-seg` / segmentation checkpoints are cataloged for {selectedFamilyInfo.label} yet.
+									</p>
 								{/if}
-								{#if visibleModelOptions.some((o) => o.family === "YOLO26")}
-									<optgroup label={trainTask === "segment" ? "YOLO26 Segmentation" : "YOLO26 Series"}>
-										{#each visibleModelOptions.filter((o) => o.family === "YOLO26") as opt (opt.id)}
-											<option value={opt.id}>
-												{opt.label} ({opt.id}) — {opt.desc}
-											</option>
-										{/each}
-									</optgroup>
-								{/if}
-							</select>
+							</div>
+
+							{#if !selectedFamilyInfo.supported}
+								<div class="flex items-start gap-2.5 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3.5 py-2.5 text-xs leading-relaxed text-amber-200/90">
+									<svg class="mt-0.5 h-4 w-4 shrink-0 text-amber-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+										<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+									</svg>
+									<div>
+										<span class="font-semibold text-amber-300">{selectedFamilyInfo.label} backend coming soon.</span>
+										<span class="block text-amber-100/80">
+											Model catalog and size presets are ready to inspect, but training execution is currently wired to <button type="button" onclick={() => selectModelFamily("YOLO")} class="font-mono underline decoration-amber-400/70 hover:text-amber-200">YOLO</button> and <button type="button" onclick={() => selectModelFamily("RF-DETR")} class="font-mono underline decoration-amber-400/70 hover:text-amber-200">RF-DETR</button>.
+										</span>
+									</div>
+								</div>
+							{/if}
 						</div>
 					{:else}
 						<div class="space-y-1.5 pt-1">
 							<label for="model-file-input" class="block text-xs font-medium text-zinc-400">
-								Checkpoint File (.pt)
+								Checkpoint File (.pt / .pth)
 							</label>
 							<input
 								id="model-file-input"
 								bind:this={modelInputRef}
 								type="file"
-								accept=".pt"
+								accept=".pt,.pth"
 								onchange={handleExistingModelFileInputChange}
 								class="hidden"
 							/>
@@ -1283,7 +1911,7 @@ async function handleExportToOnnx() {
 									<svg class="h-4 w-4 text-amber-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
 										<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
 									</svg>
-									<span>Select existing checkpoint (.pt)</span>
+									<span>Select existing checkpoint (.pt / .pth)</span>
 								</button>
 							{:else}
 								<div class="flex items-center justify-between rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 px-4">
@@ -2160,7 +2788,7 @@ async function handleExportToOnnx() {
 						<span>
 							<span class="block text-sm font-medium text-zinc-200">Auto-export ONNX on completion</span>
 							<span class="block text-xs text-zinc-400">
-								After a successful run, export best.pt with format="onnx", the selected image size, dynamic=False, and simplify=True.
+								After a successful run, export the best checkpoint to ONNX with the selected image size, dynamic=False, and simplify=True.
 							</span>
 						</span>
 					</label>
@@ -2171,9 +2799,16 @@ async function handleExportToOnnx() {
 								<span class="font-mono text-sm font-semibold text-amber-300 whitespace-pre">
 									{epochCountdownText}
 								</span>
-								<span class="font-mono text-xs font-medium text-amber-400/90">
-									{epochProgressPercent}%
-								</span>
+								<div class="flex items-center gap-3">
+									{#if finalMetrics.map50 !== null || finalMetrics.map50_95 !== null}
+										<span class="rounded border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 font-mono text-xs font-medium text-emerald-300">
+											mAP50: {formatMetricPercent(finalMetrics.map50)} · mAP50-95: {formatMetricPercent(finalMetrics.map50_95)}
+										</span>
+									{/if}
+									<span class="font-mono text-xs font-medium text-amber-400/90">
+										{epochProgressPercent}%
+									</span>
+								</div>
 							</div>
 							<div class="font-mono text-[11px] text-zinc-300/90 truncate" title={activeRunConfigBanner}>
 								{activeRunConfigBanner}
@@ -2214,6 +2849,11 @@ async function handleExportToOnnx() {
 								<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
 							</svg>
 							<span class="text-zinc-950 font-medium">Training in progress...</span>
+						{:else if modelMode === "fresh" && !selectedFamilyInfo.supported}
+							<svg class="h-4 w-4 text-zinc-500" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+								<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+							</svg>
+							<span>{selectedFamilyInfo.label} Training — Coming Soon</span>
 						{:else}
 							<svg class="h-4 w-4" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
 								<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
@@ -2393,6 +3033,27 @@ async function handleExportToOnnx() {
 								</div>
 							</div>
 
+							{#if finalMetrics.map50 !== null || finalMetrics.map50_95 !== null}
+								<div class="grid grid-cols-2 gap-2 rounded-md border border-zinc-800/80 bg-zinc-950/70 px-3 py-2">
+									<div>
+										<span class="block text-[10px] font-medium uppercase tracking-wider text-zinc-400">
+											Final mAP50
+										</span>
+										<span class="font-mono text-sm font-semibold text-emerald-400">
+											{formatMetricPercent(finalMetrics.map50)}
+										</span>
+									</div>
+									<div>
+										<span class="block text-[10px] font-medium uppercase tracking-wider text-zinc-400">
+											Final mAP50-95
+										</span>
+										<span class="font-mono text-sm font-semibold text-amber-300">
+											{formatMetricPercent(finalMetrics.map50_95)}
+										</span>
+									</div>
+								</div>
+							{/if}
+
 							<!-- Convert to ONNX -->
 							<div class="pt-1 border-t border-amber-500/20">
 								<button
@@ -2400,7 +3061,7 @@ async function handleExportToOnnx() {
 									onclick={handleExportToOnnx}
 									disabled={isExportingOnnx}
 									class="inline-flex items-center gap-1.5 rounded bg-amber-500 hover:bg-amber-400 text-zinc-950 font-semibold px-2.5 py-1 text-xs transition shadow-sm hover:shadow active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
-									title="Export trained best.pt model to ONNX format"
+									title="Export best checkpoint to ONNX format"
 								>
 									{#if isExportingOnnx}
 										<svg class="h-3.5 w-3.5 animate-spin" aria-hidden="true" fill="none" viewBox="0 0 24 24">
