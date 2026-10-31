@@ -70,6 +70,9 @@ interface GpuInfo {
 	torch_version: string | null;
 	needs_repair: boolean;
 	status_summary: string;
+	recommended_workers?: number;
+	physical_cores?: number;
+	logical_cores?: number;
 }
 
 interface LabelCheckResult {
@@ -470,6 +473,7 @@ let runName = $state<string>("");
 let epochs = $state<number>(60);
 let batch = $state<number>(4);
 let imageSize = $state<ImageSize>(960);
+let workersOverride = $state<string>("auto");
 let device = $state<string>("0");
 let isCustomDevice = $state<boolean>(false);
 let customDevice = $state<string>("");
@@ -733,8 +737,18 @@ const isSegmentationRun = $derived(
 
 const activeTaskLabel = $derived(isSegmentationRun ? "segment" : "detect");
 
+const autoDetectedWorkers = $derived(gpuInfo?.recommended_workers ?? 4);
+const effectiveWorkers = $derived(
+	workersOverride === "auto" ? autoDetectedWorkers : Number(workersOverride),
+);
+const activeWorkersLabel = $derived(
+	workersOverride === "auto"
+		? `workers=${effectiveWorkers} (auto)`
+		: `workers=${effectiveWorkers}`,
+);
+
 const activeRunConfigBanner = $derived(
-	`${activeTaskLabel} · ${activeModelLabel} · ${activeFreezeLabel} · ${activeAugSummary}`,
+	`${activeTaskLabel} · ${activeModelLabel} · ${activeWorkersLabel} · ${activeFreezeLabel} · ${activeAugSummary}`,
 );
 
 // Epoch countdown, rolling ETA & validation metrics tracking
@@ -1247,6 +1261,7 @@ async function handleStartTraining() {
 		epochs: Number(epochs),
 		batch: Number(batch),
 		imgsz: Number(imageSize),
+		workers: workersOverride === "auto" ? null : Number(workersOverride),
 		device,
 		amp: Boolean(amp),
 		freeze_backbone: Boolean(freezeBackbone),
@@ -2115,21 +2130,53 @@ async function handleExportToOnnx() {
 							</div>
 						</div>
 
-						<!-- Image size -->
-						<div class="space-y-1.5">
-							<label for="image-size-select" class="flex h-5 items-center text-xs font-medium text-zinc-400">
-								Image size
-							</label>
-							<select
-								id="image-size-select"
-								bind:value={imageSize}
-								disabled={isTraining}
-								class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
-							>
-								<option value={640}>640 px</option>
-								<option value={960}>960 px</option>
-								<option value={1280}>1280 px</option>
-							</select>
+						<!-- Image size & DataLoader Workers -->
+						<div class="grid grid-cols-2 gap-3">
+							<div class="space-y-1.5">
+								<label for="image-size-select" class="flex h-5 items-center text-xs font-medium text-zinc-400">
+									Image size
+								</label>
+								<select
+									id="image-size-select"
+									bind:value={imageSize}
+									disabled={isTraining}
+									class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+								>
+									<option value={640}>640 px</option>
+									<option value={960}>960 px</option>
+									<option value={1280}>1280 px</option>
+								</select>
+							</div>
+
+							<div class="space-y-1.5">
+								<label
+									for="workers-select"
+									class="flex h-5 items-center justify-between gap-1 text-xs font-medium text-zinc-400"
+									title={gpuInfo?.physical_cores
+										? `Detected ${gpuInfo.physical_cores} physical / ${gpuInfo.logical_cores ?? gpuInfo.physical_cores} logical CPU cores (capped at 8, 1 core reserved)`
+										: "DataLoader worker processes (auto-detected from physical CPU cores, capped at 8)"}
+								>
+									<span>Workers</span>
+									<span class="font-mono text-[10px] text-zinc-500">
+										{workersOverride === "auto" ? `auto=${autoDetectedWorkers}` : `=${effectiveWorkers}`}
+									</span>
+								</label>
+								<select
+									id="workers-select"
+									bind:value={workersOverride}
+									disabled={isTraining}
+									class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-2.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+								>
+									<option value="auto">Auto ({autoDetectedWorkers})</option>
+									<option value="0">0 (main)</option>
+									<option value="1">1 worker</option>
+									<option value="2">2 workers</option>
+									<option value="4">4 workers</option>
+									<option value="6">6 workers</option>
+									<option value="7">7 workers</option>
+									<option value="8">8 workers</option>
+								</select>
+							</div>
 						</div>
 
 						<!-- Device -->

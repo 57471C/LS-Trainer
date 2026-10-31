@@ -47,6 +47,9 @@ pub struct TrainingRequest {
     pub task: String,
     #[serde(default = "default_model_family")]
     pub model_family: String,
+    /// Optional manual override for DataLoader `num_workers`. `None` = auto-detect from physical CPU cores.
+    #[serde(default)]
+    pub workers: Option<u32>,
 }
 
 fn default_model_family() -> String {
@@ -184,6 +187,82 @@ pub struct GpuInfo {
     pub torch_version: Option<String>,
     pub needs_repair: bool,
     pub status_summary: String,
+    #[serde(default = "default_recommended_workers")]
+    pub recommended_workers: u32,
+    #[serde(default = "default_physical_cores")]
+    pub physical_cores: u32,
+    #[serde(default = "default_logical_cores")]
+    pub logical_cores: u32,
+}
+
+fn default_recommended_workers() -> u32 {
+    4
+}
+
+fn default_physical_cores() -> u32 {
+    4
+}
+
+fn default_logical_cores() -> u32 {
+    8
+}
+
+/// Compute a sensible DataLoader `num_workers` value:
+/// - Prefer physical cores (`psutil.cpu_count(logical=False)` if available, else `logical_cores // 2`).
+/// - Cap at 8 and leave at least one core free.
+pub fn compute_recommended_workers(physical_cores: Option<u32>, logical_cores: u32) -> u32 {
+    let logical = logical_cores.max(1);
+    let phys = physical_cores
+        .filter(|&c| c > 0)
+        .unwrap_or_else(|| (logical / 2).max(1));
+    if phys <= 1 {
+        if logical > 1 {
+            1
+        } else {
+            0
+        }
+    } else {
+        (phys - 1).min(8)
+    }
+}
+
+fn detect_cpu_worker_info(project_root: &Path) -> (u32, u32, u32) {
+    let fallback_logical = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(4)
+        .max(1);
+    let fallback_phys = (fallback_logical / 2).max(1);
+
+    if let Some(python_exe) = get_venv_python(project_root) {
+        let mut cmd = Command::new(&python_exe);
+        cmd.args([
+            "-c",
+            "import os; l = os.cpu_count() or 1; p = None\ntry:\n    import psutil\n    p = psutil.cpu_count(logical=False)\nexcept Exception:\n    pass\nphys = int(p) if (p and p > 0) else max(1, l // 2)\nprint(f'CPU_INFO|{phys}|{l}')",
+        ]);
+        #[cfg(windows)]
+        {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        if let Ok(out) = cmd.output() {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                for line in text.lines() {
+                    if let Some(rest) = line.trim().strip_prefix("CPU_INFO|") {
+                        let parts: Vec<&str> = rest.split('|').collect();
+                        if parts.len() >= 2 {
+                            let phys = parts[0].parse::<u32>().ok().unwrap_or(fallback_phys).max(1);
+                            let log = parts[1].parse::<u32>().ok().unwrap_or(fallback_logical).max(1);
+                            let rec = compute_recommended_workers(Some(phys), log);
+                            return (rec, phys, log);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let rec = compute_recommended_workers(Some(fallback_phys), fallback_logical);
+    (rec, fallback_phys, fallback_logical)
 }
 
 fn parse_driver_version(raw: &str) -> (String, Option<u32>) {
@@ -390,6 +469,9 @@ async fn get_gpu_info() -> GpuInfo {
         torch_version: None,
         needs_repair: false,
         status_summary: "CPU fallback confirmed".to_string(),
+        recommended_workers: default_recommended_workers(),
+        physical_cores: default_physical_cores(),
+        logical_cores: default_logical_cores(),
     })
 }
 
@@ -397,6 +479,7 @@ fn detect_gpu_info(project_root: &Path) -> GpuInfo {
     let (hw_gpu_name, driver_version, driver_major) = detect_hardware_gpu();
     let (recommended_wheel, _index_url, cuda_label) =
         select_pytorch_wheel(hw_gpu_name.as_deref(), driver_major);
+    let (recommended_workers, physical_cores, logical_cores) = detect_cpu_worker_info(project_root);
 
     #[cfg(target_os = "windows")]
     let venv_python = project_root.join(".venv").join("Scripts").join("python.exe");
@@ -483,6 +566,9 @@ fn detect_gpu_info(project_root: &Path) -> GpuInfo {
             torch_version: torch_ver,
             needs_repair,
             status_summary,
+            recommended_workers,
+            physical_cores,
+            logical_cores,
         };
     }
 
@@ -505,6 +591,9 @@ fn detect_gpu_info(project_root: &Path) -> GpuInfo {
         torch_version: torch_ver,
         needs_repair,
         status_summary,
+        recommended_workers,
+        physical_cores,
+        logical_cores,
     }
 }
 
@@ -1400,6 +1489,7 @@ fn save_run_config_metadata(
     request: &TrainingRequest,
     resolved_model: &str,
     effective_device: &str,
+    effective_workers: u32,
     exact_command: &str,
     on_log: &Channel<String>,
 ) {
@@ -1427,6 +1517,8 @@ fn save_run_config_metadata(
         "batch": request.batch,
         "imgsz": request.imgsz,
         "device": effective_device,
+        "workers": effective_workers,
+        "workers_override": request.workers,
         "amp": request.amp,
         "augmentation": {
             "mosaic": request.mosaic,
@@ -2098,10 +2190,20 @@ async fn start_rfdetr_training(
         device_input.to_string()
     };
 
+    let (auto_workers, phys_cores, log_cores) = detect_cpu_worker_info(&project_root);
+    let (effective_workers, worker_source) = match request.workers {
+        Some(custom_w) => (custom_w.min(8), "manual override"),
+        None => (auto_workers, "auto-detected"),
+    };
+    let _ = on_log.send(format!(
+        "[LS-Trainer] DataLoader workers: {effective_workers} ({worker_source}; {phys_cores} physical / {log_cores} logical CPU cores, capped at 8)"
+    ));
+
     let _ = std::fs::create_dir_all(&abs_results_dir);
     let runner_script_path = abs_results_dir.join("ls_trainer_rfdetr_run.py");
 
     let runner_script = r#"import json
+import multiprocessing
 import os
 import sys
 import traceback
@@ -2116,6 +2218,19 @@ if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+
+def detect_num_workers(cfg):
+    if "num_workers" in cfg and cfg["num_workers"] is not None:
+        return max(0, min(8, int(cfg["num_workers"])))
+    phys = None
+    try:
+        import psutil
+        phys = psutil.cpu_count(logical=False)
+    except Exception:
+        phys = None
+    logical = os.cpu_count() or 2
+    base_cores = phys if (phys is not None and phys > 0) else max(1, logical // 2)
+    return min(8, max(1, base_cores - 1))
 
 def main():
     cfg_path = sys.argv[1]
@@ -2151,6 +2266,7 @@ def main():
     device = cfg["device"]
     pretrain_weights = cfg["pretrain_weights"]
     freeze_backbone = bool(cfg.get("freeze_backbone", False))
+    num_workers = detect_num_workers(cfg)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -2170,6 +2286,15 @@ def main():
             return None
 
     class LSTrainerProgressCallback(Callback):
+        def on_fit_start(self, trainer, pl_module):
+            dm = getattr(trainer, "datamodule", None)
+            if dm is not None and hasattr(dm, "_num_workers"):
+                dm._num_workers = num_workers
+            print(
+                f"[LS-Trainer] RF-DETR DataLoaders configured: train_dataloader num_workers={num_workers}, val_dataloader num_workers={num_workers}",
+                flush=True,
+            )
+
         def on_train_epoch_start(self, trainer, pl_module):
             ep = int(trainer.current_epoch) + 1
             total = int(trainer.max_epochs)
@@ -2227,7 +2352,7 @@ def main():
 
     model_cls = getattr(rfdetr, class_name)
     print(
-        f"[LS-Trainer] Initializing {class_name} (resolution={resolution}, pretrain_weights={pretrain_weights}, eval_backend={eval_backend})...",
+        f"[LS-Trainer] Initializing {class_name} (resolution={resolution}, pretrain_weights={pretrain_weights}, eval_backend={eval_backend}, num_workers={num_workers})...",
         flush=True,
     )
     model = model_cls(resolution=resolution, pretrain_weights=pretrain_weights, device=device)
@@ -2239,7 +2364,7 @@ def main():
         "batch_size": batch_size,
         "resolution": resolution,
         "device": device,
-        "num_workers": 0,
+        "num_workers": num_workers,
         "run_test": False,
         "progress_bar": False,
         "tensorboard": False,
@@ -2248,7 +2373,7 @@ def main():
     if freeze_backbone:
         train_kwargs["lr_encoder"] = 0.0
 
-    print(f"Epoch 1/{epochs} - Starting RF-DETR training loop...", flush=True)
+    print(f"Epoch 1/{epochs} - Starting RF-DETR training loop (num_workers={num_workers})...", flush=True)
     model.train(**train_kwargs)
 
     metrics_file = os.path.join(output_dir, "ls_trainer_metrics.json")
@@ -2261,6 +2386,7 @@ def main():
     )
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     try:
         main()
     except Exception as exc:
@@ -2281,6 +2407,7 @@ if __name__ == "__main__":
         "batch_size": request.batch,
         "resolution": snapped_res,
         "device": effective_device,
+        "num_workers": effective_workers,
         "pretrain_weights": resolved_pretrain,
         "freeze_backbone": request.freeze_backbone,
         "task": yolo_task,
@@ -2301,13 +2428,14 @@ if __name__ == "__main__":
 
     let _ = on_log.send("[LS-Trainer Status] Training in progress...".to_string());
     let _ = on_log.send(format!(
-        "[LS-Trainer] Active config: family=RF-DETR | task={} | model={} ({}) | resolution={} | epochs={} | batch={} | freeze_backbone={} | device={}",
+        "[LS-Trainer] Active config: family=RF-DETR | task={} | model={} ({}) | resolution={} | epochs={} | batch={} | workers={} | freeze_backbone={} | device={}",
         yolo_task,
         request.model_choice,
         rfdetr_class,
         snapped_res,
         request.epochs,
         request.batch,
+        effective_workers,
         request.freeze_backbone,
         effective_device
     ));
@@ -2361,6 +2489,7 @@ if __name__ == "__main__":
                 &request,
                 &resolved_pretrain,
                 &effective_device,
+                effective_workers,
                 &exact_command,
                 &on_log,
             );
@@ -2515,12 +2644,22 @@ async fn start_training(
         resolve_or_download_model_weights(&project_root, &request.model_choice, &on_log);
     let _ = on_log.send("[LS-Trainer Status] Training in progress...".to_string());
 
+    let (auto_workers, phys_cores, log_cores) = detect_cpu_worker_info(&project_root);
+    let (effective_workers, worker_source) = match request.workers {
+        Some(custom_w) => (custom_w.min(8), "manual override"),
+        None => (auto_workers, "auto-detected"),
+    };
+    let _ = on_log.send(format!(
+        "[LS-Trainer] DataLoader workers: {effective_workers} ({worker_source}; {phys_cores} physical / {log_cores} logical CPU cores, capped at 8)"
+    ));
+
     let data_arg = format!("data={data_str}");
     let model_arg = format!("model={resolved_model}");
     let name_arg = format!("name={run_name}");
     let epochs_arg = format!("epochs={}", request.epochs);
     let batch_arg = format!("batch={}", request.batch);
     let imgsz_arg = format!("imgsz={}", request.imgsz);
+    let workers_arg = format!("workers={effective_workers}");
     let amp_arg = format!("amp={}", if request.amp { "True" } else { "False" });
     let mosaic_arg = format!("mosaic={}", request.mosaic);
     let mixup_arg = format!("mixup={}", request.mixup);
@@ -2542,9 +2681,10 @@ async fn start_training(
         "[LS-Trainer] Ultralytics task=\"{yolo_task}\""
     ));
     let _ = on_log.send(format!(
-        "[LS-Trainer] Active config: task={} | model={} | freeze={} | mosaic={} | close_mosaic={} | mixup={} | copy_paste={} | degrees={} | flipud={} | translate={} | scale={} | amp={}",
+        "[LS-Trainer] Active config: task={} | model={} | workers={} | freeze={} | mosaic={} | close_mosaic={} | mixup={} | copy_paste={} | degrees={} | flipud={} | translate={} | scale={} | amp={}",
         yolo_task,
         request.model_choice,
+        effective_workers,
         if request.freeze_backbone {
             format!("{freeze_layers_val} layers")
         } else {
@@ -2604,6 +2744,7 @@ async fn start_training(
         epochs_arg,
         batch_arg,
         imgsz_arg,
+        workers_arg,
         device_arg,
         amp_arg,
     ];
@@ -2713,6 +2854,7 @@ async fn start_training(
                 &request,
                 &resolved_model,
                 &effective_device,
+                effective_workers,
                 &exact_command,
                 &on_log,
             );
@@ -2759,6 +2901,7 @@ async fn start_training(
                 &request,
                 &resolved_model,
                 &effective_device,
+                effective_workers,
                 &exact_command,
                 &on_log,
             );
@@ -2920,6 +3063,55 @@ fn find_rfdetr_checkpoint_in_dir(results_path: &Path) -> Option<PathBuf> {
     None
 }
 
+fn embed_onnx_model_type_metadata(
+    project_root: &Path,
+    onnx_path: &Path,
+    model_type: &str,
+    model_family: &str,
+    on_log: &Channel<String>,
+) {
+    if !onnx_path.is_file() {
+        return;
+    }
+    let Some(python_exe) = get_venv_python(project_root) else {
+        return;
+    };
+
+    let py_snippet = r#"import sys, onnx
+onnx_path, model_type, model_family = sys.argv[1], sys.argv[2], sys.argv[3]
+m = onnx.load(onnx_path)
+props = {p.key: p.value for p in m.metadata_props}
+props["ls_model_type"] = model_type
+props["ls_model_family"] = model_family
+del m.metadata_props[:]
+for k, v in props.items():
+    entry = m.metadata_props.add()
+    entry.key = str(k)
+    entry.value = str(v)
+onnx.save(m, onnx_path)
+"#;
+
+    let mut cmd = Command::new(&python_exe);
+    cmd.args([
+        "-c",
+        py_snippet,
+        onnx_path.to_string_lossy().as_ref(),
+        model_type,
+        model_family,
+    ]);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    if let Ok(status) = cmd.status() {
+        if status.success() {
+            let _ = on_log.send(format!(
+                "[LS-Trainer] Embedded ONNX metadata: ls_model_type=\"{model_type}\" (ls_model_family=\"{model_family}\")"
+            ));
+        }
+    }
+}
+
 async fn export_rfdetr_to_onnx(
     project_root: &Path,
     results_path: &Path,
@@ -2994,6 +3186,49 @@ if hasattr(sys.stderr, "reconfigure"):
     except Exception:
         pass
 
+def embed_rfdetr_onnx_metadata(onnx_file, class_name, task, resolution, output_dir, model):
+    import onnx
+    m = onnx.load(str(onnx_file))
+    props = {p.key: p.value for p in m.metadata_props}
+    props["ls_model_type"] = "rfdetr"
+    props["ls_model_family"] = "RF-DETR"
+    props["ls_model_name"] = str(class_name)
+    props["task"] = str(task)
+    props["imgsz"] = f"[{resolution}, {resolution}]"
+
+    class_names = None
+    tc_path = os.path.join(output_dir, "training_config.json")
+    if os.path.isfile(tc_path):
+        try:
+            with open(tc_path, "r", encoding="utf-8") as tf:
+                tc = json.load(tf)
+                if isinstance(tc.get("class_names"), list) and tc["class_names"]:
+                    class_names = [str(c) for c in tc["class_names"]]
+        except Exception:
+            pass
+    if not class_names:
+        raw_names = getattr(model, "class_names", None)
+        if isinstance(raw_names, dict):
+            class_names = [str(v) for _, v in sorted(raw_names.items())]
+        elif isinstance(raw_names, (list, tuple)) and raw_names:
+            class_names = [str(c) for c in raw_names]
+
+    if class_names:
+        names_dict = {i: name for i, name in enumerate(class_names)}
+        props["names"] = str(names_dict)
+        props["class_names"] = json.dumps(class_names)
+
+    del m.metadata_props[:]
+    for k, v in props.items():
+        entry = m.metadata_props.add()
+        entry.key = str(k)
+        entry.value = str(v)
+    onnx.save(m, str(onnx_file))
+    print(
+        f'[LS-Trainer] Embedded ONNX metadata: ls_model_type="rfdetr" (ls_model_family="RF-DETR", model={class_name}, task={task}, imgsz={resolution})',
+        flush=True,
+    )
+
 def main():
     cfg_path = sys.argv[1]
     with open(cfg_path, "r", encoding="utf-8") as f:
@@ -3007,6 +3242,7 @@ def main():
     resolution = int(cfg["resolution"])
     dynamic_batch = bool(cfg["dynamic"])
     device = cfg["device"]
+    task = cfg.get("task", "detect")
 
     os.makedirs(output_dir, exist_ok=True)
     model_cls = getattr(rfdetr, class_name)
@@ -3026,10 +3262,12 @@ def main():
     onnx_file = model.export(
         output_dir=output_dir,
         opset_version=17,
+        verbose=False,
         shape=(resolution, resolution),
         dynamic_batch=dynamic_batch,
         output_name="best",
     )
+    embed_rfdetr_onnx_metadata(onnx_file, class_name, task, resolution, output_dir, model)
     print(f"[LS-Trainer] Exported RF-DETR ONNX model to: {onnx_file}", flush=True)
 
 if __name__ == "__main__":
@@ -3052,6 +3290,7 @@ if __name__ == "__main__":
         "dynamic": request.dynamic,
         "simplify": request.simplify,
         "device": device,
+        "task": task,
     });
     std::fs::write(
         &export_cfg_path,
@@ -3322,6 +3561,13 @@ async fn export_to_onnx(
             let onnx_str = to_display_path(&expected_onnx);
 
             if status.success() {
+                embed_onnx_model_type_metadata(
+                    &project_root,
+                    &expected_onnx,
+                    "yolo",
+                    "YOLO",
+                    &on_log,
+                );
                 let _ = on_log.send(format!(
                     "[LS-Trainer] ONNX export completed successfully! File: {onnx_str}"
                 ));
@@ -3512,6 +3758,7 @@ mod label_tests {
             imgsz: 1280,
             device: "cpu".to_string(),
             batch: 4,
+            workers: None,
             amp: true,
             freeze_backbone: false,
             freeze_layers: 10,
@@ -3539,6 +3786,7 @@ mod label_tests {
             imgsz: 1280,
             device: "cpu".to_string(),
             batch: 4,
+            workers: None,
             amp: true,
             freeze_backbone: false,
             freeze_layers: 10,
@@ -3553,5 +3801,17 @@ mod label_tests {
             task: "segment".to_string(),
         };
         assert_eq!(resolve_train_task(&request), "segment");
+    }
+
+    #[test]
+    fn worker_detection_caps_and_reserves_core() {
+        // 8 physical cores -> 7 workers (leaves 1 free)
+        assert_eq!(compute_recommended_workers(Some(8), 8), 7);
+        // 16 physical cores -> capped at 8
+        assert_eq!(compute_recommended_workers(Some(16), 32), 8);
+        // Fallback when physical_cores is None: logical // 2 - 1
+        assert_eq!(compute_recommended_workers(None, 12), 5);
+        assert_eq!(compute_recommended_workers(None, 2), 1);
+        assert_eq!(compute_recommended_workers(Some(1), 1), 0);
     }
 }
