@@ -1333,7 +1333,7 @@ async function handleExportToOnnx() {
 											aria-checked={isSelected}
 											disabled={isTraining}
 											onclick={() => selectModelFamily(fam.id)}
-											class={`group relative flex flex-col items-start justify-between rounded-md px-2.5 py-2 text-left transition-all ${
+											class={`group relative flex min-w-0 flex-col items-start justify-between rounded-md px-2.5 py-2 text-left transition-all ${
 												isSelected
 													? fam.supported
 														? "border border-amber-500/60 bg-amber-500/15 text-zinc-100 shadow-[inset_0_1px_0_rgba(245,158,11,0.2)]"
@@ -1341,8 +1341,8 @@ async function handleExportToOnnx() {
 													: "border border-transparent bg-transparent text-zinc-400 hover:bg-zinc-900/80 hover:text-zinc-200"
 											} disabled:opacity-50`}
 										>
-											<div class="flex w-full items-center justify-between gap-1">
-												<span class="font-mono text-xs font-semibold tracking-tight">
+											<div class="flex w-full items-center justify-between gap-1 min-w-0">
+												<span class="font-mono text-xs font-semibold tracking-tight truncate">
 													{fam.label}
 												</span>
 												{#if fam.supported}
@@ -1360,7 +1360,7 @@ async function handleExportToOnnx() {
 													</span>
 												{/if}
 											</div>
-											<span class="mt-0.5 text-[10px] text-zinc-500 group-hover:text-zinc-400">
+											<span class="mt-0.5 w-full truncate text-[10px] text-zinc-500 group-hover:text-zinc-400">
 												{fam.vendor}
 											</span>
 										</button>
@@ -1400,7 +1400,7 @@ async function handleExportToOnnx() {
 									value={freshModel}
 									onchange={(e) => handleFreshModelChange(e.currentTarget.value as BaseModelId)}
 									disabled={isTraining}
-									class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+									class="w-full min-w-0 max-w-full truncate rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
 								>
 									{#each visibleModelGroups as group (group.name)}
 										<optgroup label={group.name}>
@@ -1517,16 +1517,16 @@ async function handleExportToOnnx() {
 					{/if}
 
 					<!-- Freeze backbone checkbox -->
-					<div class="relative flex items-center justify-between rounded-lg border border-zinc-800/90 bg-zinc-950/40 px-3.5 py-2.5">
-						<div class="flex items-center gap-2.5">
+					<div class="relative flex items-center justify-between gap-3 rounded-lg border border-zinc-800/90 bg-zinc-950/40 px-3.5 py-2.5">
+						<div class="flex items-center gap-2.5 min-w-0">
 							<input
 								id="freeze-backbone-checkbox"
 								type="checkbox"
 								bind:checked={freezeBackbone}
 								disabled={isTraining}
-								class="h-4 w-4 rounded border-zinc-700 bg-zinc-900 accent-amber-500 focus:ring-amber-500 disabled:opacity-50"
+								class="h-4 w-4 shrink-0 rounded border-zinc-700 bg-zinc-900 accent-amber-500 focus:ring-amber-500 disabled:opacity-50"
 							/>
-							<label for="freeze-backbone-checkbox" class="cursor-pointer text-sm font-medium text-zinc-200 select-none">
+							<label for="freeze-backbone-checkbox" class="cursor-pointer text-sm font-medium text-zinc-200 select-none truncate">
 								Freeze backbone (first {freezeLayersCount} layers)
 							</label>
 							<button
@@ -1535,7 +1535,7 @@ async function handleExportToOnnx() {
 									e.stopPropagation();
 									activeTooltip = activeTooltip === "freeze" ? null : "freeze";
 								}}
-								class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
+								class="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
 								aria-label="Freeze backbone help"
 								title="Freezes early layers so the model mainly learns the new head. Useful when you have limited labeled data."
 							>
@@ -1543,7 +1543,7 @@ async function handleExportToOnnx() {
 							</button>
 						</div>
 
-						<span class={`font-mono text-xs ${freezeBackbone ? "text-amber-400 font-medium" : "text-zinc-500"}`}>
+						<span class={`shrink-0 font-mono text-xs ${freezeBackbone ? "text-amber-400 font-medium" : "text-zinc-500"}`}>
 							{freezeBackbone ? `freeze=${freezeLayersCount}` : "freeze=0"}
 						</span>
 
@@ -1588,7 +1588,7 @@ async function handleExportToOnnx() {
 							bind:value={runName}
 							disabled={isTraining}
 							placeholder="BB-Parts-v3"
-							class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+							class="w-full min-w-0 rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
 						/>
 					</div>
 					<p class="text-xs text-zinc-500">Run identifier for checkpoint directories and evaluation metrics</p>
@@ -1632,103 +1632,100 @@ async function handleExportToOnnx() {
 						</div>
 					{/if}
 
-					<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-						<!-- Epochs and Batch -->
-						<div class="grid grid-cols-2 gap-3">
-							<div class="space-y-1.5">
-								<label for="epochs-input" class="flex h-5 items-center text-xs font-medium text-zinc-400">
-									Epochs
-								</label>
-								<input
-									id="epochs-input"
-									type="number"
-									min="1"
-									step="1"
-									bind:value={epochs}
-									disabled={isTraining}
-									class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
-								/>
-							</div>
-
-							<div class="space-y-1.5">
-								<label for="batch-input" class="flex h-5 items-center text-xs font-medium text-zinc-400">
-									Batch
-								</label>
-								<input
-									id="batch-input"
-									type="number"
-									min="1"
-									step="1"
-									bind:value={batch}
-									disabled={isTraining}
-									class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
-								/>
-							</div>
+					<div class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-3">
+						<!-- Epochs -->
+						<div class="space-y-1.5 min-w-0">
+							<label for="epochs-input" class="flex h-5 items-center text-xs font-medium text-zinc-400 truncate">
+								Epochs
+							</label>
+							<input
+								id="epochs-input"
+								type="number"
+								min="1"
+								step="1"
+								bind:value={epochs}
+								disabled={isTraining}
+								class="h-[42px] w-full min-w-0 rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+							/>
 						</div>
 
-						<!-- Image size & DataLoader Workers -->
-						<div class="grid grid-cols-2 gap-3">
-							<div class="space-y-1.5">
-								<label for="image-size-select" class="flex h-5 items-center text-xs font-medium text-zinc-400">
-									Image size
-								</label>
-								<select
-									id="image-size-select"
-									bind:value={imageSize}
-									disabled={isTraining}
-									class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
-								>
-									<option value={640}>640 px</option>
-									<option value={960}>960 px</option>
-									<option value={1280}>1280 px</option>
-								</select>
-							</div>
+						<!-- Batch -->
+						<div class="space-y-1.5 min-w-0">
+							<label for="batch-input" class="flex h-5 items-center text-xs font-medium text-zinc-400 truncate">
+								Batch
+							</label>
+							<input
+								id="batch-input"
+								type="number"
+								min="1"
+								step="1"
+								bind:value={batch}
+								disabled={isTraining}
+								class="h-[42px] w-full min-w-0 rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+							/>
+						</div>
 
-							<div class="space-y-1.5">
-								<label
-									for="workers-select"
-									class="flex h-5 items-center justify-between gap-1 text-xs font-medium text-zinc-400"
-									title={gpuInfo?.physical_cores
-										? `Detected ${gpuInfo.physical_cores} physical / ${gpuInfo.logical_cores ?? gpuInfo.physical_cores} logical CPU cores (capped at 8, 1 core reserved)`
-										: "DataLoader worker processes (auto-detected from physical CPU cores, capped at 8)"}
-								>
-									<span>Workers</span>
-									<span class="font-mono text-[10px] text-zinc-500">
-										{workersOverride === "auto" ? `auto=${autoDetectedWorkers}` : `=${effectiveWorkers}`}
-									</span>
-								</label>
-								<select
-									id="workers-select"
-									bind:value={workersOverride}
-									disabled={isTraining}
-									class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-2.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
-								>
-									<option value="auto">Auto ({autoDetectedWorkers})</option>
-									<option value="0">0 (main)</option>
-									<option value="1">1 worker</option>
-									<option value="2">2 workers</option>
-									<option value="4">4 workers</option>
-									<option value="6">6 workers</option>
-									<option value="7">7 workers</option>
-									<option value="8">8 workers</option>
-								</select>
+						<!-- Image size -->
+						<div class="space-y-1.5 min-w-0">
+							<label for="image-size-select" class="flex h-5 items-center text-xs font-medium text-zinc-400 truncate">
+								Image size
+							</label>
+							<select
+								id="image-size-select"
+								bind:value={imageSize}
+								disabled={isTraining}
+								class="h-[42px] w-full min-w-0 max-w-full truncate rounded-lg border border-zinc-700/80 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+							>
+								<option value={640}>640 px</option>
+								<option value={960}>960 px</option>
+								<option value={1280}>1280 px</option>
+							</select>
+						</div>
+
+						<!-- DataLoader Workers -->
+						<div class="space-y-1.5 min-w-0">
+							<div
+								class="flex h-5 items-center justify-between gap-1 text-xs font-medium text-zinc-400 min-w-0"
+								title={gpuInfo?.physical_cores
+									? `Detected ${gpuInfo.physical_cores} physical / ${gpuInfo.logical_cores ?? gpuInfo.physical_cores} logical CPU cores (capped at 8, 1 core reserved)`
+									: "DataLoader worker processes (auto-detected from physical CPU cores, capped at 8)"}
+							>
+								<label for="workers-select" class="shrink-0 cursor-pointer">Workers</label>
+								<span class="font-mono text-[10px] text-zinc-500 truncate">
+									{workersOverride === "auto" ? `auto=${autoDetectedWorkers}` : `=${effectiveWorkers}`}
+								</span>
 							</div>
+							<select
+								id="workers-select"
+								bind:value={workersOverride}
+								disabled={isTraining}
+								class="h-[42px] w-full min-w-0 max-w-full truncate rounded-lg border border-zinc-700/80 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+							>
+								<option value="auto">Auto ({autoDetectedWorkers})</option>
+								<option value="0">0 (main)</option>
+								<option value="1">1 worker</option>
+								<option value="2">2 workers</option>
+								<option value="4">4 workers</option>
+								<option value="6">6 workers</option>
+								<option value="7">7 workers</option>
+								<option value="8">8 workers</option>
+							</select>
 						</div>
 
 						<!-- Device -->
 						<div class="space-y-1.5 min-w-0">
-							<div class="flex h-5 items-center justify-between gap-2 whitespace-nowrap">
-								<label for="device-select" class="block text-xs font-medium text-zinc-400 shrink-0">
+							<div class="flex h-5 items-center justify-between gap-1.5 min-w-0">
+								<label for="device-select" class="block text-xs font-medium text-zinc-400 shrink-0 cursor-pointer">
 									Device
 								</label>
 								{#if (gpuInfo?.xpu_available || gpuInfo?.cuda_available) && gpuInfo.device_name}
-									<span class="flex items-center gap-1.5 text-[11px] font-medium text-emerald-400 whitespace-nowrap truncate min-w-0" title={gpuInfo.device_name}>
+									<span class="flex items-center gap-1 text-[11px] font-medium text-emerald-400 truncate min-w-0" title={gpuInfo.device_name}>
 										<span class="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400"></span>
 										<span class="truncate">{shortenGpuName(gpuInfo.device_name)}</span>
 									</span>
 								{:else if gpuInfo && !gpuInfo.xpu_available && !gpuInfo.cuda_available}
-									<span class="text-[11px] text-zinc-500 whitespace-nowrap">
-										CPU only (No XPU/CUDA GPU)
+									<span class="text-[11px] text-zinc-500 truncate min-w-0" title="CPU only (No XPU/CUDA GPU)">
+										CPU only
 									</span>
 								{/if}
 							</div>
@@ -1746,7 +1743,7 @@ async function handleExportToOnnx() {
 									}
 								}}
 								disabled={isTraining}
-								class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+								class="h-[42px] w-full min-w-0 max-w-full truncate rounded-lg border border-zinc-700/80 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
 							>
 								{#if gpuInfo?.xpu_available}
 									<option value="xpu">
@@ -1756,7 +1753,7 @@ async function handleExportToOnnx() {
 									<option value="custom">Custom device...</option>
 								{:else if gpuInfo?.cuda_available}
 									<option value="0">
-										{gpuInfo.device_name ? `GPU 0: ${ gpuInfo.device_name }` : "GPU (device=0)"}
+										{gpuInfo.device_name ? `GPU 0: ${gpuInfo.device_name}` : "GPU (device=0)"}
 									</option>
 									<option value="cpu">CPU (device=cpu)</option>
 									<option value="custom">Custom device...</option>
@@ -1780,16 +1777,16 @@ async function handleExportToOnnx() {
 										device = customDevice.trim();
 									}}
 									disabled={isTraining}
-									class="mt-1.5 w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2 text-xs text-zinc-100 placeholder-zinc-500 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+									class="mt-1.5 h-[36px] w-full min-w-0 rounded-lg border border-zinc-700/80 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-100 placeholder-zinc-500 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
 								/>
 							{/if}
 						</div>
 
 						<!-- amp -->
-						<div class="space-y-1.5">
+						<div class="space-y-1.5 min-w-0">
 							<div class="relative flex h-5 items-center justify-between">
 								<div class="flex items-center gap-1.5">
-									<label for="amp-toggle" class="text-xs font-medium text-zinc-400">
+									<label for="amp-toggle" class="text-xs font-medium text-zinc-400 cursor-pointer">
 										amp
 									</label>
 									<button
@@ -1843,15 +1840,15 @@ async function handleExportToOnnx() {
 									if (!isTraining) amp = !amp;
 								}}
 								disabled={isTraining}
-								class={`flex h-[42px] w-full items-center justify-between rounded-lg border px-3.5 py-2 text-sm font-medium transition ${
+								class={`flex h-[42px] w-full min-w-0 items-center justify-between rounded-lg border px-3 py-2 text-sm font-medium transition ${
 									amp
 										? "border-amber-500/50 bg-amber-500/10 text-amber-300"
 										: "border-zinc-700/80 bg-zinc-900 text-zinc-400 hover:border-zinc-600"
 								} disabled:opacity-50`}
 							>
-								<span>{amp ? "Enabled (FP16)" : "Disabled (FP32)"}</span>
+								<span class="truncate">{amp ? "Enabled (FP16)" : "Disabled (FP32)"}</span>
 								<span
-									class={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ${
+									class={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ml-2 ${
 										amp ? "bg-amber-500" : "bg-zinc-700"
 									}`}
 								>
@@ -1869,17 +1866,20 @@ async function handleExportToOnnx() {
 				<!-- Section 5: Augmentation Controls -->
 				<section class="space-y-3.5 border-t border-zinc-800/80 pt-5">
 					<div class="flex flex-wrap items-center justify-between gap-2">
-						<div class="flex items-center gap-2">
-							<span class="block text-xs font-semibold tracking-wider text-zinc-300 uppercase">
+						<div class="flex items-center gap-2 min-w-0 max-w-full">
+							<span class="block text-xs font-semibold tracking-wider text-zinc-300 uppercase shrink-0">
 								Augmentation
 							</span>
-							<span class="rounded border border-zinc-800 bg-zinc-950/60 px-2 py-0.5 font-mono text-[11px] text-zinc-400">
+							<span
+								class="truncate rounded border border-zinc-800 bg-zinc-950/60 px-2 py-0.5 font-mono text-[11px] text-zinc-400 max-w-xs sm:max-w-md lg:max-w-lg"
+								title={activeAugSummary}
+							>
 								{activeAugSummary}
 							</span>
 						</div>
 
 						<!-- Preset buttons: Bench / Off / Light / Medium -->
-						<div class="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-950/60 p-0.5">
+						<div class="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-950/60 p-0.5 shrink-0">
 							<span class="px-2 text-[11px] text-zinc-500">Preset:</span>
 							<button
 								type="button"
@@ -1935,10 +1935,10 @@ async function handleExportToOnnx() {
 					<!-- Row 1: Mosaic (dropdown 0.0 / 0.5 / 1.0), MixUp (slider 0.0–0.5), Copy-paste (on/off) -->
 					<div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
 						<!-- Mosaic dropdown -->
-						<div class="space-y-1.5">
+						<div class="space-y-1.5 min-w-0">
 							<div class="relative flex h-5 items-center justify-between">
-								<div class="flex items-center gap-1.5">
-									<label for="mosaic-select" class="text-xs font-medium text-zinc-400">
+								<div class="flex items-center gap-1.5 min-w-0">
+									<label for="mosaic-select" class="text-xs font-medium text-zinc-400 truncate cursor-pointer">
 										Mosaic
 									</label>
 									<button
@@ -1947,7 +1947,7 @@ async function handleExportToOnnx() {
 											e.stopPropagation();
 											activeTooltip = activeTooltip === "mosaic" ? null : "mosaic";
 										}}
-										class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
+										class="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
 										aria-label="mosaic help"
 										title="Probability of stitching four images into one. 0.0 disables it. Useful to turn off for controlled industrial scenes."
 									>
@@ -1987,7 +1987,7 @@ async function handleExportToOnnx() {
 								id="mosaic-select"
 								bind:value={mosaic}
 								disabled={isTraining}
-								class="h-[42px] w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+								class="h-[42px] w-full min-w-0 max-w-full truncate rounded-lg border border-zinc-700/80 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
 							>
 								<option value={0.0}>0.0 — Off (Bench default)</option>
 								<option value={0.5}>0.5 — Moderate</option>
@@ -1996,10 +1996,10 @@ async function handleExportToOnnx() {
 						</div>
 
 						<!-- MixUp slider 0.0–0.5 -->
-						<div class="space-y-1.5">
+						<div class="space-y-1.5 min-w-0">
 							<div class="relative flex h-5 items-center justify-between">
-								<div class="flex items-center gap-1.5">
-									<label for="mixup-slider" class="text-xs font-medium text-zinc-400">
+								<div class="flex items-center gap-1.5 min-w-0">
+									<label for="mixup-slider" class="text-xs font-medium text-zinc-400 truncate cursor-pointer">
 										MixUp
 									</label>
 									<button
@@ -2008,14 +2008,14 @@ async function handleExportToOnnx() {
 											e.stopPropagation();
 											activeTooltip = activeTooltip === "mixup" ? null : "mixup";
 										}}
-										class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
+										class="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
 										aria-label="mixup help"
 										title="Probability of blending two images and their labels. Usually left at 0.0 for clean bench photos."
 									>
 										?
 									</button>
 								</div>
-								<span class="font-mono text-xs text-amber-400">{mixup.toFixed(2)}</span>
+								<span class="font-mono text-xs text-amber-400 shrink-0">{mixup.toFixed(2)}</span>
 
 								{#if activeTooltip === "mixup"}
 									<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -2054,16 +2054,16 @@ async function handleExportToOnnx() {
 									step="0.05"
 									bind:value={mixup}
 									disabled={isTraining}
-									class="w-full accent-amber-500 disabled:opacity-50"
+									class="w-full min-w-0 accent-amber-500 disabled:opacity-50 cursor-pointer"
 								/>
 							</div>
 						</div>
 
 						<!-- Copy-paste on/off -->
-						<div class="space-y-1.5">
+						<div class="space-y-1.5 min-w-0">
 							<div class="relative flex h-5 items-center justify-between">
-								<div class="flex items-center gap-1.5">
-									<label for="copy-paste-toggle" class="text-xs font-medium text-zinc-400">
+								<div class="flex items-center gap-1.5 min-w-0">
+									<label for="copy-paste-toggle" class="text-xs font-medium text-zinc-400 truncate cursor-pointer">
 										Copy-paste
 									</label>
 									<button
@@ -2072,7 +2072,7 @@ async function handleExportToOnnx() {
 											e.stopPropagation();
 											activeTooltip = activeTooltip === "copy_paste" ? null : "copy_paste";
 										}}
-										class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
+										class="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
 										aria-label="copy-paste help"
 										title="Copy-paste object patches across training images. Default off for clean bench work."
 									>
@@ -2117,15 +2117,15 @@ async function handleExportToOnnx() {
 									if (!isTraining) copyPaste = !copyPaste;
 								}}
 								disabled={isTraining}
-								class={`flex h-[42px] w-full items-center justify-between rounded-lg border px-3.5 py-2 text-sm font-medium transition ${
+								class={`flex h-[42px] w-full min-w-0 items-center justify-between rounded-lg border px-3 py-2 text-sm font-medium transition ${
 									copyPaste
 										? "border-amber-500/50 bg-amber-500/10 text-amber-300"
 										: "border-zinc-700/80 bg-zinc-900 text-zinc-400 hover:border-zinc-600"
 								} disabled:opacity-50`}
 							>
-								<span>{copyPaste ? "On (0.3)" : "Off (0.0)"}</span>
+								<span class="truncate">{copyPaste ? "On (0.3)" : "Off (0.0)"}</span>
 								<span
-									class={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ${
+									class={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ml-2 ${
 										copyPaste ? "bg-amber-500" : "bg-zinc-700"
 									}`}
 								>
@@ -2142,12 +2142,12 @@ async function handleExportToOnnx() {
 					<!-- Row 2: Degrees / Translate / Scale number inputs -->
 					<div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
 						<!-- Degrees -->
-						<div class="space-y-1.5">
-							<div class="flex h-5 items-center justify-between">
-								<label for="degrees-input" class="text-xs font-medium text-zinc-400" title="180° gives top-down rotational invariance on a bench.">
+						<div class="space-y-1.5 min-w-0">
+							<div class="flex h-5 items-center justify-between gap-1">
+								<label for="degrees-input" class="text-xs font-medium text-zinc-400 truncate cursor-pointer" title="180° gives top-down rotational invariance on a bench.">
 									Degrees (±rot)
 								</label>
-								<span class="font-mono text-[11px] text-zinc-500">0–180°</span>
+								<span class="font-mono text-[11px] text-zinc-500 shrink-0">0–180°</span>
 							</div>
 							<input
 								id="degrees-input"
@@ -2157,17 +2157,17 @@ async function handleExportToOnnx() {
 								step="1"
 								bind:value={degrees}
 								disabled={isTraining}
-								class="h-[42px] w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+								class="h-[42px] w-full min-w-0 rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
 							/>
 						</div>
 
 						<!-- Translate -->
-						<div class="space-y-1.5">
-							<div class="flex h-5 items-center justify-between">
-								<label for="translate-input" class="text-xs font-medium text-zinc-400">
+						<div class="space-y-1.5 min-w-0">
+							<div class="flex h-5 items-center justify-between gap-1">
+								<label for="translate-input" class="text-xs font-medium text-zinc-400 truncate cursor-pointer">
 									Translate (±shift)
 								</label>
-								<span class="font-mono text-[11px] text-zinc-500">0.0–1.0</span>
+								<span class="font-mono text-[11px] text-zinc-500 shrink-0">0.0–1.0</span>
 							</div>
 							<input
 								id="translate-input"
@@ -2177,15 +2177,15 @@ async function handleExportToOnnx() {
 								step="0.05"
 								bind:value={translate}
 								disabled={isTraining}
-								class="h-[42px] w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+								class="h-[42px] w-full min-w-0 rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
 							/>
 						</div>
 
 						<!-- Scale -->
-						<div class="space-y-1.5">
-							<div class="relative flex h-5 items-center justify-between">
-								<div class="flex items-center gap-1.5">
-									<label for="scale-input" class="text-xs font-medium text-zinc-400">
+						<div class="space-y-1.5 min-w-0">
+							<div class="relative flex h-5 items-center justify-between gap-1">
+								<div class="flex items-center gap-1.5 min-w-0">
+									<label for="scale-input" class="text-xs font-medium text-zinc-400 truncate cursor-pointer">
 										Scale (±zoom)
 									</label>
 									<button
@@ -2194,14 +2194,14 @@ async function handleExportToOnnx() {
 											e.stopPropagation();
 											activeTooltip = activeTooltip === "scale" ? null : "scale";
 										}}
-										class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
+										class="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
 										aria-label="scale help"
 										title="Random zoom range. Bench default 0.05 is ±5% for a fixed working distance."
 									>
 										?
 									</button>
 								</div>
-								<span class="font-mono text-[11px] text-zinc-500">0.0–1.0</span>
+								<span class="font-mono text-[11px] text-zinc-500 shrink-0">0.0–1.0</span>
 
 								{#if activeTooltip === "scale"}
 									<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -2239,16 +2239,16 @@ async function handleExportToOnnx() {
 								step="0.01"
 								bind:value={scale}
 								disabled={isTraining}
-								class="h-[42px] w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+								class="h-[42px] w-full min-w-0 rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
 							/>
 						</div>
 					</div>
 
 					<div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
-						<div class="space-y-1.5">
-							<div class="relative flex h-5 items-center justify-between">
-								<div class="flex items-center gap-1.5">
-									<label for="flipud-input" class="text-xs font-medium text-zinc-400">
+						<div class="space-y-1.5 min-w-0">
+							<div class="relative flex h-5 items-center justify-between gap-1">
+								<div class="flex items-center gap-1.5 min-w-0">
+									<label for="flipud-input" class="text-xs font-medium text-zinc-400 truncate cursor-pointer">
 										Flip UD
 									</label>
 									<button
@@ -2257,14 +2257,14 @@ async function handleExportToOnnx() {
 											e.stopPropagation();
 											activeTooltip = activeTooltip === "flipud" ? null : "flipud";
 										}}
-										class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
+										class="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
 										aria-label="flipud help"
 										title="Probability of a vertical flip. 0.5 gives top-down parts the same invariance as a horizontal flip."
 									>
 										?
 									</button>
 								</div>
-								<span class="font-mono text-[11px] text-zinc-500">0.0–1.0</span>
+								<span class="font-mono text-[11px] text-zinc-500 shrink-0">0.0–1.0</span>
 
 								{#if activeTooltip === "flipud"}
 									<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -2301,14 +2301,14 @@ async function handleExportToOnnx() {
 								step="0.05"
 								bind:value={flipud}
 								disabled={isTraining}
-								class="h-[42px] w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+								class="h-[42px] w-full min-w-0 rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
 							/>
 						</div>
 
-						<div class="space-y-1.5">
-							<div class="relative flex h-5 items-center justify-between">
-								<div class="flex items-center gap-1.5">
-									<label for="close-mosaic-input" class="text-xs font-medium text-zinc-400">
+						<div class="space-y-1.5 min-w-0">
+							<div class="relative flex h-5 items-center justify-between gap-1">
+								<div class="flex items-center gap-1.5 min-w-0">
+									<label for="close-mosaic-input" class="text-xs font-medium text-zinc-400 truncate cursor-pointer">
 										Close mosaic
 									</label>
 									<button
@@ -2317,14 +2317,14 @@ async function handleExportToOnnx() {
 											e.stopPropagation();
 											activeTooltip = activeTooltip === "close_mosaic" ? null : "close_mosaic";
 										}}
-										class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
+										class="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 text-[10px] font-bold text-zinc-400 transition hover:border-amber-500/80 hover:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-500"
 										aria-label="close mosaic help"
 										title="Turns mosaic off for the final N epochs. Bench default is 10."
 									>
 										?
 									</button>
 								</div>
-								<span class="font-mono text-[11px] text-zinc-500">epochs</span>
+								<span class="font-mono text-[11px] text-zinc-500 shrink-0">epochs</span>
 
 								{#if activeTooltip === "close_mosaic"}
 									<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -2360,7 +2360,7 @@ async function handleExportToOnnx() {
 								step="1"
 								bind:value={closeMosaic}
 								disabled={isTraining}
-								class="h-[42px] w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+								class="h-[42px] w-full min-w-0 rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
 							/>
 						</div>
 					</div>
@@ -2568,60 +2568,57 @@ async function handleExportToOnnx() {
 				{#if resultsDir}
 					<div class="m-3 mb-0 space-y-2.5 shrink-0">
 						<!-- Run directory card -->
-						<div class="relative rounded-lg border border-amber-500/40 bg-amber-500/10 p-3.5 text-zinc-200 space-y-2.5">
-							<!-- Absolute top-right action buttons: Open Folder & Copy Path -->
-							<div class="absolute top-2.5 right-2.5 flex items-center gap-1.5 z-10">
-								<!-- Open Folder -->
-								<button
-									type="button"
-									onclick={() => {
-										if (resultsDir) handleOpenFolder(resultsDir);
-									}}
-									class="inline-flex items-center gap-1.5 rounded bg-zinc-900/90 hover:bg-zinc-800 border border-zinc-700/80 px-2.5 py-1 text-xs font-medium text-zinc-200 transition hover:text-white"
-									title="Open results folder in file explorer"
-								>
-									<svg class="h-3.5 w-3.5 text-amber-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-										<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 19a2 2 0 01-2-2V7a2 2 0 012-2h4l2 2h4a2 2 0 012 2v1M5 19h14a2 2 0 002-2v-5a2 2 0 00-2-2H9a2 2 0 00-2 2v5a2 2 0 01-2 2z" />
-									</svg>
-									<span>Open Folder</span>
-								</button>
-
-								<!-- Copy Path -->
-								<button
-									type="button"
-									onclick={handleCopyResultsPath}
-									class="inline-flex items-center gap-1.5 rounded bg-zinc-900/90 hover:bg-zinc-800 border border-zinc-700/80 px-2.5 py-1 text-xs font-medium text-zinc-200 transition hover:text-white"
-									title="Copy directory path to clipboard"
-								>
-									{#if hasCopiedResultsPath}
-										<svg class="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-											<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7" />
-										</svg>
-										<span class="text-emerald-400 font-medium">Copied!</span>
-									{:else}
-										<svg class="h-3.5 w-3.5 text-zinc-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-											<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-										</svg>
-										<span>Copy Path</span>
-									{/if}
-								</button>
-							</div>
-
-							<div class="flex items-start justify-between gap-3 pr-48">
-								<div class="flex items-start gap-2.5 min-w-0">
-									<svg class="h-4 w-4 shrink-0 text-amber-400 mt-0.5" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+						<div class="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3.5 text-zinc-200 space-y-2.5">
+							<div class="flex flex-wrap items-center justify-between gap-2">
+								<div class="flex items-center gap-2 min-w-0">
+									<svg class="h-4 w-4 shrink-0 text-amber-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
 										<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
 									</svg>
-									<div class="min-w-0">
-										<p class="text-[11px] font-semibold uppercase tracking-wider text-amber-300">
-											Training Results Directory
-										</p>
-										<p class="mt-0.5 font-mono text-xs font-medium text-zinc-100 select-all break-all">
-											{normalizePath(resultsDir)}
-										</p>
-									</div>
+									<p class="text-[11px] font-semibold uppercase tracking-wider text-amber-300 truncate">
+										Training Results Directory
+									</p>
+								</div>
+								<div class="flex items-center gap-1.5 shrink-0">
+									<!-- Open Folder -->
+									<button
+										type="button"
+										onclick={() => {
+											if (resultsDir) handleOpenFolder(resultsDir);
+										}}
+										class="inline-flex items-center gap-1.5 rounded bg-zinc-900/90 hover:bg-zinc-800 border border-zinc-700/80 px-2.5 py-1 text-xs font-medium text-zinc-200 transition hover:text-white"
+										title="Open results folder in file explorer"
+									>
+										<svg class="h-3.5 w-3.5 text-amber-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+											<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 19a2 2 0 01-2-2V7a2 2 0 012-2h4l2 2h4a2 2 0 012 2v1M5 19h14a2 2 0 002-2v-5a2 2 0 00-2-2H9a2 2 0 00-2 2v5a2 2 0 01-2 2z" />
+										</svg>
+										<span>Open Folder</span>
+									</button>
+
+									<!-- Copy Path -->
+									<button
+										type="button"
+										onclick={handleCopyResultsPath}
+										class="inline-flex items-center gap-1.5 rounded bg-zinc-900/90 hover:bg-zinc-800 border border-zinc-700/80 px-2.5 py-1 text-xs font-medium text-zinc-200 transition hover:text-white"
+										title="Copy directory path to clipboard"
+									>
+										{#if hasCopiedResultsPath}
+											<svg class="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+												<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7" />
+											</svg>
+											<span class="text-emerald-400 font-medium">Copied!</span>
+										{:else}
+											<svg class="h-3.5 w-3.5 text-zinc-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+												<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+											</svg>
+											<span>Copy Path</span>
+										{/if}
+									</button>
 								</div>
 							</div>
+
+							<p class="font-mono text-xs font-medium text-zinc-100 select-all break-all min-w-0">
+								{normalizePath(resultsDir)}
+							</p>
 
 							{#if finalMetrics.map50 !== null || finalMetrics.map50_95 !== null}
 								<div class="grid grid-cols-2 gap-2 rounded-md border border-zinc-800/80 bg-zinc-950/70 px-3 py-2">
@@ -2671,62 +2668,63 @@ async function handleExportToOnnx() {
 
 						<!-- ONNX Success Card -->
 						{#if onnxPath}
-							<div class="relative rounded-lg border border-emerald-500/40 bg-emerald-500/10 p-3 text-zinc-200 space-y-2">
-								<!-- Absolute top-right action buttons for ONNX -->
-								<div class="absolute top-2.5 right-2.5 flex items-center gap-1.5 z-10">
-									<!-- Open Folder -->
-									<button
-										type="button"
-										onclick={() => {
-											if (onnxPath) handleOpenFolder(onnxPath);
-										}}
-										class="inline-flex items-center gap-1.5 rounded bg-zinc-900/90 hover:bg-zinc-800 border border-zinc-700/80 px-2.5 py-1 text-xs font-medium text-zinc-200 transition hover:text-white"
-										title="Open ONNX model folder in file explorer"
-									>
-										<svg class="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-											<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 19a2 2 0 01-2-2V7a2 2 0 012-2h4l2 2h4a2 2 0 012 2v1M5 19h14a2 2 0 002-2v-5a2 2 0 00-2-2H9a2 2 0 00-2 2v5a2 2 0 01-2 2z" />
-										</svg>
-										<span>Open Folder</span>
-									</button>
-
-									<!-- Copy ONNX Path -->
-									<button
-										type="button"
-										onclick={handleCopyOnnxPath}
-										class="inline-flex items-center gap-1.5 rounded bg-zinc-900/90 hover:bg-zinc-800 border border-zinc-700/80 px-2.5 py-1 text-xs font-medium text-zinc-200 transition hover:text-white"
-										title="Copy ONNX path to clipboard"
-									>
-										{#if hasCopiedOnnxPath}
-											<svg class="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+							<div class="rounded-lg border border-emerald-500/40 bg-emerald-500/10 p-3 text-zinc-200 space-y-2">
+								<div class="flex flex-wrap items-center justify-between gap-2">
+									<div class="flex items-center gap-2 min-w-0">
+										<div class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-400">
+											<svg class="h-3.5 w-3.5" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
 												<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7" />
 											</svg>
-											<span class="text-emerald-400 font-medium">Copied!</span>
-										{:else}
-											<svg class="h-3.5 w-3.5 text-zinc-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-												<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-											</svg>
-											<span>Copy ONNX Path</span>
-										{/if}
-									</button>
-								</div>
-
-								<div class="flex items-start gap-2.5 min-w-0 pr-48">
-									<div class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-400 mt-0.5">
-										<svg class="h-3.5 w-3.5" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-											<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7" />
-										</svg>
-									</div>
-									<div class="min-w-0">
-										<p class="text-[11px] font-semibold uppercase tracking-wider text-emerald-300">
+										</div>
+										<p class="text-[11px] font-semibold uppercase tracking-wider text-emerald-300 truncate">
 											ONNX Model Ready
 										</p>
-										<p class="mt-0.5 font-mono text-xs font-medium text-zinc-100 select-all break-all">
-											{normalizePath(onnxPath)}
-										</p>
-										<p class="mt-1 text-xs text-emerald-400/90 font-medium">
-											This model is optimized and ready for inference in LS-Vision.
-										</p>
 									</div>
+									<div class="flex items-center gap-1.5 shrink-0">
+										<!-- Open Folder -->
+										<button
+											type="button"
+											onclick={() => {
+												if (onnxPath) handleOpenFolder(onnxPath);
+											}}
+											class="inline-flex items-center gap-1.5 rounded bg-zinc-900/90 hover:bg-zinc-800 border border-zinc-700/80 px-2.5 py-1 text-xs font-medium text-zinc-200 transition hover:text-white"
+											title="Open ONNX model folder in file explorer"
+										>
+											<svg class="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+												<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 19a2 2 0 01-2-2V7a2 2 0 012-2h4l2 2h4a2 2 0 012 2v1M5 19h14a2 2 0 002-2v-5a2 2 0 00-2-2H9a2 2 0 00-2 2v5a2 2 0 01-2 2z" />
+											</svg>
+											<span>Open Folder</span>
+										</button>
+
+										<!-- Copy ONNX Path -->
+										<button
+											type="button"
+											onclick={handleCopyOnnxPath}
+											class="inline-flex items-center gap-1.5 rounded bg-zinc-900/90 hover:bg-zinc-800 border border-zinc-700/80 px-2.5 py-1 text-xs font-medium text-zinc-200 transition hover:text-white"
+											title="Copy ONNX path to clipboard"
+										>
+											{#if hasCopiedOnnxPath}
+												<svg class="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+													<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7" />
+												</svg>
+												<span class="text-emerald-400 font-medium">Copied!</span>
+											{:else}
+												<svg class="h-3.5 w-3.5 text-zinc-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+													<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+												</svg>
+												<span>Copy ONNX Path</span>
+											{/if}
+										</button>
+									</div>
+								</div>
+
+								<div class="space-y-1">
+									<p class="font-mono text-xs font-medium text-zinc-100 select-all break-all min-w-0">
+										{normalizePath(onnxPath)}
+									</p>
+									<p class="text-xs text-emerald-400/90 font-medium">
+										This model is optimized and ready for inference in LS-Vision.
+									</p>
 								</div>
 							</div>
 						{/if}
