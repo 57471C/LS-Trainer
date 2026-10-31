@@ -280,8 +280,20 @@ const isModelSelected = $derived(
 		? Boolean(existingModelPath.trim() || existingModelFileName.trim())
 		: Boolean(freshModel),
 );
-const isSelectedFamilySupported = $derived(
-	modelMode === "continue" || selectedFamilyInfo.supported,
+const selectedFreshModelOption = $derived(
+	freshModelOptions.find((o) => o.id === freshModel),
+);
+const isSelectedModelSupported = $derived(
+	modelMode === "continue" ||
+		(selectedFamilyInfo.supported &&
+			(selectedFreshModelOption?.supported ?? true)),
+);
+const selectedModelButtonLabel = $derived(
+	modelMode === "fresh" &&
+		selectedFreshModelOption &&
+		selectedFreshModelOption.supported === false
+		? selectedFreshModelOption.label
+		: selectedFamilyInfo.label,
 );
 const isTorchReady = $derived(
 	!isCheckingGpu &&
@@ -297,7 +309,7 @@ const isTorchReady = $derived(
 const isFormValid = $derived(
 	isDatasetSelected &&
 		isModelSelected &&
-		isSelectedFamilySupported &&
+		isSelectedModelSupported &&
 		!isTraining &&
 		isTorchReady,
 );
@@ -527,9 +539,11 @@ async function handleStartTraining() {
 			: freshModel;
 	const effectiveFamily: ModelFamily =
 		modelMode === "continue"
-			? /\.pth$/i.test(effectiveModel) || /^rf-?detr/i.test(effectiveModel)
-				? "RF-DETR"
-				: selectedFamily
+			? /rt-?detr/i.test(effectiveModel)
+				? "RT-DETR"
+				: /\.pth$/i.test(effectiveModel) || /^rf-?detr/i.test(effectiveModel)
+					? "RF-DETR"
+					: selectedFamily
 			: selectedFamily;
 
 	const effectiveCopyPaste = copyPaste ? 0.3 : 0.0;
@@ -609,16 +623,21 @@ async function handleStartTraining() {
 		// Browser development preview simulation
 		const freezeArgStr = freezeBackbone ? ` freeze=${freezeLayersCount}` : "";
 		const isRfDetrSim = effectiveFamily === "RF-DETR";
+		const isRtDetrSim = effectiveFamily === "RT-DETR";
 		logs = [
 			"[LS-Trainer] Running outside Tauri webview (Browser Mode)",
 			`[LS-Trainer] Simulated training run '${effectiveRunName}' (${effectiveFamily})`,
-			isRfDetrSim
-				? `[LS-Trainer] Prepared LS-Marker COCO splits for RF-DETR (${effectiveModel})`
-				: `[LS-Trainer] Ultralytics task="${taskName}"`,
+			isRtDetrSim
+				? `[LS-Trainer] Prepared LS-Marker COCO splits for RT-DETR (${effectiveModel})`
+				: isRfDetrSim
+					? `[LS-Trainer] Prepared LS-Marker COCO splits for RF-DETR (${effectiveModel})`
+					: `[LS-Trainer] Ultralytics task="${taskName}"`,
 			`[LS-Trainer] Active config: ${activeRunConfigBanner}`,
-			isRfDetrSim
-				? `[LS-Trainer] Command: python ls_trainer_rfdetr_run.py --model ${effectiveModel} --dataset "${effectiveDataset}" --epochs ${epochs} --batch ${batch} --resolution ${imageSize}`
-				: `[LS-Trainer] Command: yolo ${taskName} train task=${taskName} data="${effectiveDataset}" model="${effectiveModel}" name="${effectiveRunName}" epochs=${epochs} batch=${batch} imgsz=${imageSize} device="${device}" amp=${amp}${freezeArgStr} mosaic=${mosaic} close_mosaic=${closeMosaic} mixup=${mixup} copy_paste=${effectiveCopyPaste} degrees=${degrees} flipud=${flipud} translate=${translate} scale=${scale}`,
+			isRtDetrSim
+				? `[LS-Trainer] Command: python ls_trainer_rtdetr_run.py --model ${effectiveModel} --dataset "${effectiveDataset}" --epochs ${epochs} --batch ${batch} --resolution ${imageSize}`
+				: isRfDetrSim
+					? `[LS-Trainer] Command: python ls_trainer_rfdetr_run.py --model ${effectiveModel} --dataset "${effectiveDataset}" --epochs ${epochs} --batch ${batch} --resolution ${imageSize}`
+					: `[LS-Trainer] Command: yolo ${taskName} train task=${taskName} data="${effectiveDataset}" model="${effectiveModel}" name="${effectiveRunName}" epochs=${epochs} batch=${batch} imgsz=${imageSize} device="${device}" amp=${amp}${freezeArgStr} mosaic=${mosaic} close_mosaic=${closeMosaic} mixup=${mixup} copy_paste=${effectiveCopyPaste} degrees=${degrees} flipud=${flipud} translate=${translate} scale=${scale}`,
 			`[LS-Trainer] Starting ${activeModelLabel} epochs (1/${epochs})...`,
 			"[LS-Trainer Metrics] Final | mAP50=0.9140 | mAP50-95=0.7280",
 			"[LS-Trainer] Training finished successfully.",
@@ -813,8 +832,8 @@ async function handleExportToOnnx() {
 					{isTorchReady}
 					{isLogPanelOpen}
 					{modelMode}
-					selectedFamilySupported={selectedFamilyInfo.supported}
-					selectedFamilyLabel={selectedFamilyInfo.label}
+					selectedFamilySupported={isSelectedModelSupported}
+					selectedFamilyLabel={selectedModelButtonLabel}
 					{statusMessage}
 					{epochCountdownText}
 					{epochProgressPercent}

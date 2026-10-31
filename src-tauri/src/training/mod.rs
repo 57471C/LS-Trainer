@@ -1,6 +1,7 @@
 //! `start_training` entry point plus run metadata and metrics shared by both backends.
 
 pub(crate) mod rfdetr;
+pub(crate) mod rtdetr;
 pub(crate) mod yolo;
 
 use std::path::{Path, PathBuf};
@@ -8,7 +9,9 @@ use tauri::ipc::Channel;
 
 use crate::models::{TrainingRequest, TrainingResponse};
 use crate::process::{get_project_root, to_display_path};
+use crate::rtdetr::is_rtdetr_request;
 use crate::training::rfdetr::start_rfdetr_training;
+use crate::training::rtdetr::start_rtdetr_training;
 use crate::training::yolo::start_yolo_training;
 
 #[tauri::command]
@@ -38,6 +41,20 @@ pub async fn start_training(
         let msg = format!("Dataset path does not exist: {}", request.dataset_path);
         let _ = on_log.send(format!("[LS-Trainer] Error: {msg}"));
         return Err(msg);
+    }
+
+    if is_rtdetr_request(&request) {
+        return start_rtdetr_training(
+            project_root,
+            run_name,
+            yolo_task,
+            abs_results_dir,
+            results_dir,
+            dataset_input,
+            request,
+            on_log,
+        )
+        .await;
     }
 
     if is_rfdetr_request(&request) {

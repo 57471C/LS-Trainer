@@ -27,6 +27,7 @@ export type BaseModelId =
 	| "rf-detr-seg-medium"
 	| "rf-detr-seg-large"
 	| "rf-detr-seg-preview"
+	| "rtdetr-v2-r18"
 	| "rtdetr-r18"
 	| "rtdetr-r34"
 	| "rtdetr-r50"

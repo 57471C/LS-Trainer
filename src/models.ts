@@ -32,12 +32,12 @@ export const modelFamilies: ModelFamilyInfo[] = [
 	{
 		id: "RT-DETR",
 		label: "RT-DETR",
-		vendor: "Baidu / Ultralytics",
-		badge: "Coming soon",
-		supported: false,
-		defaultDetectModel: "rtdetr-l.pt",
+		vendor: "Baidu / PekingU",
+		badge: "Active",
+		supported: true,
+		defaultDetectModel: "rtdetr-v2-r18",
 		defaultSegModel: null,
-		description: "Real-Time Detection Transformer end-to-end detector",
+		description: "Real-Time Detection Transformer v2 (ResNet-18)",
 	},
 	{
 		id: "YOLOX",
@@ -58,6 +58,7 @@ export interface FreshModelOption {
 	task: TrainTask;
 	label: string;
 	desc: string;
+	supported?: boolean;
 }
 
 export const freshModelOptions: FreshModelOption[] = [
@@ -252,12 +253,22 @@ export const freshModelOptions: FreshModelOption[] = [
 	},
 	// RT-DETR
 	{
+		id: "rtdetr-v2-r18",
+		family: "RT-DETR",
+		group: "RT-DETRv2 Series",
+		task: "detect",
+		label: "RT-DETR v2-R18",
+		desc: "ResNet-18vd lightweight real-time transformer",
+		supported: true,
+	},
+	{
 		id: "rtdetr-r18",
 		family: "RT-DETR",
 		group: "RT-DETR Series",
 		task: "detect",
 		label: "RT-DETR-R18",
 		desc: "ResNet-18 (lightweight real-time DETR)",
+		supported: false,
 	},
 	{
 		id: "rtdetr-r34",
@@ -266,6 +277,7 @@ export const freshModelOptions: FreshModelOption[] = [
 		task: "detect",
 		label: "RT-DETR-R34",
 		desc: "ResNet-34 (balanced speed & accuracy)",
+		supported: false,
 	},
 	{
 		id: "rtdetr-r50",
@@ -274,6 +286,7 @@ export const freshModelOptions: FreshModelOption[] = [
 		task: "detect",
 		label: "RT-DETR-R50",
 		desc: "ResNet-50 (high accuracy transformer)",
+		supported: false,
 	},
 	{
 		id: "rtdetr-l.pt",
@@ -281,7 +294,8 @@ export const freshModelOptions: FreshModelOption[] = [
 		group: "RT-DETR Series",
 		task: "detect",
 		label: "RT-DETR-L",
-		desc: "HGNetv2 Large (default, high accuracy)",
+		desc: "HGNetv2 Large (high accuracy)",
+		supported: false,
 	},
 	{
 		id: "rtdetr-x.pt",
@@ -290,6 +304,7 @@ export const freshModelOptions: FreshModelOption[] = [
 		task: "detect",
 		label: "RT-DETR-X",
 		desc: "HGNetv2 XLarge (maximum capacity)",
+		supported: false,
 	},
 	// YOLOX
 	{

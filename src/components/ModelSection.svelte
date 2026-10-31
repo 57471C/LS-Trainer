@@ -50,6 +50,14 @@ const selectedFamilyInfo = $derived(
 	modelFamilies.find((f) => f.id === selectedFamily) ?? modelFamilies[0],
 );
 
+const selectedFreshModelOption = $derived(
+	freshModelOptions.find((o) => o.id === freshModel),
+);
+
+const isSelectedFreshModelSupported = $derived(
+	selectedFamilyInfo.supported && (selectedFreshModelOption?.supported ?? true),
+);
+
 const familySegModelCount = $derived(
 	freshModelOptions.filter(
 		(o) =>
@@ -417,7 +425,7 @@ function clearExistingModel() {
 						<optgroup label={group.name}>
 							{#each group.options as opt (opt.id)}
 								<option value={opt.id}>
-									{opt.label} ({opt.id}){ !selectedFamilyInfo.supported ? " [Coming soon]" : "" } — {opt.desc}
+									{opt.label} ({opt.id}){ (!selectedFamilyInfo.supported || opt.supported === false) ? " [Coming soon]" : "" } — {opt.desc}
 								</option>
 							{/each}
 						</optgroup>
@@ -443,7 +451,19 @@ function clearExistingModel() {
 					<div>
 						<span class="font-semibold text-amber-300">{selectedFamilyInfo.label} backend coming soon.</span>
 						<span class="block text-amber-100/80">
-							Model catalog and size presets are ready to inspect, but training execution is currently wired to <button type="button" onclick={() => selectModelFamily("YOLO")} class="font-mono underline decoration-amber-400/70 hover:text-amber-200">YOLO</button> and <button type="button" onclick={() => selectModelFamily("RF-DETR")} class="font-mono underline decoration-amber-400/70 hover:text-amber-200">RF-DETR</button>.
+							Model catalog and size presets are ready to inspect, but training execution is currently wired to <button type="button" onclick={() => selectModelFamily("YOLO")} class="font-mono underline decoration-amber-400/70 hover:text-amber-200">YOLO</button>, <button type="button" onclick={() => selectModelFamily("RF-DETR")} class="font-mono underline decoration-amber-400/70 hover:text-amber-200">RF-DETR</button>, and <button type="button" onclick={() => selectModelFamily("RT-DETR")} class="font-mono underline decoration-amber-400/70 hover:text-amber-200">RT-DETR</button>.
+						</span>
+					</div>
+				</div>
+			{:else if !isSelectedFreshModelSupported && modelMode === "fresh"}
+				<div class="flex items-start gap-2.5 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3.5 py-2.5 text-xs leading-relaxed text-amber-200/90">
+					<svg class="mt-0.5 h-4 w-4 shrink-0 text-amber-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+					</svg>
+					<div>
+						<span class="font-semibold text-amber-300">{selectedFreshModelOption?.label ?? freshModel} coming soon.</span>
+						<span class="block text-amber-100/80">
+							This variant is cataloged for reference. For RT-DETR training, select <button type="button" onclick={() => handleFreshModelChange("rtdetr-v2-r18")} class="font-mono underline decoration-amber-400/70 hover:text-amber-200">RT-DETR v2-R18</button>.
 						</span>
 					</div>
 				</div>

@@ -80,7 +80,7 @@ function clearDataset() {
 			Dataset
 		</label>
 		<span class="text-xs text-zinc-500">
-			{selectedFamily === "RF-DETR"
+			{selectedFamily === "RF-DETR" || selectedFamily === "RT-DETR"
 				? "LS-Marker COCO (.tar, .tar.gz, or folder)"
 				: "Supported: .tar, .tar.gz, or folder"}
 		</span>

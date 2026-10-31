@@ -1,6 +1,7 @@
 //! `export_to_onnx` entry point and ONNX `ls_model_type` metadata embedding.
 
 pub(crate) mod rfdetr;
+pub(crate) mod rtdetr;
 pub(crate) mod yolo;
 
 use std::path::{Path, PathBuf};
@@ -8,10 +9,12 @@ use std::process::Command;
 use tauri::ipc::Channel;
 
 use crate::export::rfdetr::export_rfdetr_to_onnx;
+use crate::export::rtdetr::export_rtdetr_to_onnx;
 use crate::export::yolo::export_yolo_to_onnx;
 use crate::models::{ExportRequest, ExportResponse};
 use crate::process::{get_project_root, get_venv_python, hide_console_window};
 use crate::rfdetr::find_rfdetr_checkpoint_in_dir;
+use crate::rtdetr::find_rtdetr_checkpoint_in_dir;
 
 #[tauri::command]
 pub async fn export_to_onnx(
@@ -30,6 +33,17 @@ pub async fn export_to_onnx(
         "[LS-Trainer] Preparing ONNX export for results in '{}'...",
         results_path.display()
     ));
+
+    if let Some(rtdetr_ckpt) = find_rtdetr_checkpoint_in_dir(&results_path) {
+        return export_rtdetr_to_onnx(
+            &project_root,
+            &results_path,
+            &rtdetr_ckpt,
+            &request,
+            &on_log,
+        )
+        .await;
+    }
 
     if let Some(rfdetr_ckpt) = find_rfdetr_checkpoint_in_dir(&results_path) {
         return export_rfdetr_to_onnx(
