@@ -29,7 +29,7 @@ echo [*] Target directory: "%APP_DIR%"
 echo [*] Checking for existing virtual environment...
 
 if exist "%VENV_DIR%\Scripts\python.exe" (
-    "%VENV_DIR%\Scripts\python.exe" -c "import ultralytics, rfdetr, vernier" >nul 2>&1
+    "%VENV_DIR%\Scripts\python.exe" -c "import importlib.util as u, sys; sys.exit(0 if all(u.find_spec(m) for m in ('ultralytics','rfdetr','vernier')) else 1)" >nul 2>&1
     if !ERRORLEVEL! EQU 0 (
         echo [*] Virtual environment, ultralytics, and rfdetr already installed and ready at:
         echo     "%VENV_DIR%"
@@ -149,13 +149,17 @@ if not exist "%VENV_PYTHON%" (
     exit /b 1
 )
 
-REM 4. Upgrades pip and installs ultralytics into that venv
+REM 4. Upgrades pip, installs matching PyTorch GPU/CPU build first, then installs ultralytics & rfdetr
 echo.
 echo [*] Upgrading pip in virtual environment...
 "%VENV_PYTHON%" -m pip install --upgrade pip
 if !ERRORLEVEL! NEQ 0 (
     echo [!] Warning: pip upgrade returned non-zero exit code. Continuing...
 )
+
+REM Install matching PyTorch (Intel Arc XPU -> NVIDIA CUDA -> CPU) BEFORE ultralytics/rfdetr
+REM so pip never pulls CUDA or generic PyPI torch packages onto an Intel Arc or CPU machine.
+call :ENSURE_PYTORCH_GPU
 
 echo.
 echo [*] Installing ultralytics...
@@ -177,113 +181,111 @@ if !ERRORLEVEL! NEQ 0 (
 )
 
 :GPU_CHECK
-REM 5. Auto-detect GPU & driver and install matching PyTorch CUDA wheel
+call :ENSURE_PYTORCH_GPU
+goto :COMPLETED
+
+:ENSURE_PYTORCH_GPU
+REM 5. Auto-detect GPU & driver and install matching PyTorch wheel.
+REM
+REM Detection priority:
+REM   1. Intel Arc / XPU GPU (Win32_VideoController matching "Intel" + "Arc", or torch.xpu)
+REM      -> Installs Intel Arc XPU build from https://download.pytorch.org/whl/xpu (no CUDA packages)
+REM   2. NVIDIA GPU (nvidia-smi or Win32_VideoController matching "NVIDIA")
+REM      -> Installs CUDA 12.8 (Blackwell / driver >= 560) or CUDA 12.4 build
+REM   3. CPU Fallback (neither Intel Arc nor NVIDIA detected)
+REM      -> Installs CPU-only build from https://download.pytorch.org/whl/cpu
 echo.
-echo [*] Detecting GPU and NVIDIA driver version...
+echo [*] Detecting GPU (Intel Arc XPU / NVIDIA CUDA / CPU fallback)...
+
+set "GPU_DETECT_OUT=%TEMP%\ls_trainer_gpu_detect.txt"
+set "GPU_VERIFY_OUT=%TEMP%\ls_trainer_gpu_verify.txt"
+del "%GPU_DETECT_OUT%" >nul 2>&1
+del "%GPU_VERIFY_OUT%" >nul 2>&1
+
+"%VENV_PYTHON%" -c "import json,re,shutil,subprocess; arc=''; nv=''; drv=''; maj=0; p=['powershell','-NoProfile','-Command','Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion | ConvertTo-Json -Compress']; raw=(subprocess.run(p,capture_output=True,text=True).stdout.strip() if shutil.which('powershell') else ''); items=json.loads(raw) if raw else []; items=[items] if isinstance(items,dict) else items; arc=next((str(i.get('Name','')).strip() for i in items if 'intel' in str(i.get('Name','')).lower() and ('arc' in str(i.get('Name','')).lower() or 'xpu' in str(i.get('Name','')).lower())), ''); nv_item=next((i for i in items if 'nvidia' in str(i.get('Name','')).lower()), None); nv=str(nv_item.get('Name','')).strip() if nv_item else ''; rdrv=re.sub(r'\D','',str(nv_item.get('DriverVersion',''))) if nv_item else ''; drv=(rdrv[-5:-2]+'.'+rdrv[-2:]) if len(rdrv)>=5 else ''; smi=(subprocess.run(['nvidia-smi','--query-gpu=name,driver_version','--format=csv,noheader'],capture_output=True,text=True) if (not arc and shutil.which('nvidia-smi')) else None); smi_line=smi.stdout.splitlines()[0] if (smi and smi.returncode==0 and smi.stdout.strip()) else ''; smi_parts=[x.strip() for x in smi_line.split(',')] if smi_line else []; nv=smi_parts[0] if smi_parts and smi_parts[0] else nv; drv=smi_parts[1] if len(smi_parts)>1 and smi_parts[1] else drv; maj=int(drv.split('.')[0]) if (drv and drv.split('.')[0].isdigit()) else 0; low=nv.lower(); bw=any(k in low for k in ('rtx 50','rtx50','blackwell','gb10','gb20','b100','b200')); print(f'xpu|https://download.pytorch.org/whl/xpu|Intel Arc XPU|{arc}' if arc else ((f'cu128|https://download.pytorch.org/whl/cu128|CUDA 12.8|{nv}' if (bw or maj>=560) else f'cu124|https://download.pytorch.org/whl/cu124|CUDA 12.4|{nv}') if nv else 'cpu|https://download.pytorch.org/whl/cpu|CPU-only|No discrete GPU'))" > "%GPU_DETECT_OUT%" 2>nul
 
 set "TARGET_WHEEL=cpu"
 set "TARGET_URL=https://download.pytorch.org/whl/cpu"
 set "CUDA_LABEL=CPU-only"
 set "GPU_DISPLAY=CPU"
 
-for /f "usebackq tokens=1,2,3,4 delims=|" %%A in (`"%VENV_PYTHON%" -c "import subprocess, re; name=''; drv=''; major=0;
-try:
-    out = subprocess.check_output(['nvidia-smi', '--query-gpu=name,driver_version', '--format=csv,noheader'], text=True, stderr=subprocess.DEVNULL).splitlines()[0]
-    parts = [p.strip() for p in out.split(',')]
-    name = parts[0] if parts else ''
-    drv = parts[1] if len(parts)>1 else ''
-except Exception:
-    try:
-        out = subprocess.check_output(['powershell', '-NoProfile', '-Command', \"Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' } | Select-Object -First 1 -Property Name,DriverVersion | ForEach-Object { '$($_.Name)|$($_.DriverVersion)' }\"], text=True, stderr=subprocess.DEVNULL).strip()
-        if '|' in out:
-            name, raw_d = out.split('|', 1)
-            digits = re.sub(r'\D', '', raw_d)
-            if len(digits) >= 5:
-                drv = digits[-5:-2] + '.' + digits[-2:]
-    except Exception:
-        pass
-if drv:
-    try: major = int(drv.split('.')[0])
-    except Exception: major = 0
-low = name.lower()
-is_bw = any(k in low for k in ['rtx 50', 'rtx50', 'blackwell', 'gb10', 'gb20', 'b100', 'b200'])
-if name:
-    if is_bw or major >= 560:
-        print(f'cu128|https://download.pytorch.org/whl/cu128|CUDA 12.8|{name}')
-    else:
-        print(f'cu124|https://download.pytorch.org/whl/cu124|CUDA 12.4|{name}')
-else:
-    print('cpu|https://download.pytorch.org/whl/cpu|CPU-only|No NVIDIA GPU')" 2^>nul`) do (
-    set "TARGET_WHEEL=%%A"
-    set "TARGET_URL=%%B"
-    set "CUDA_LABEL=%%C"
-    set "GPU_DISPLAY=%%D"
+if exist "%GPU_DETECT_OUT%" (
+    for /f "usebackq tokens=1,2,3,4 delims=|" %%A in ("%GPU_DETECT_OUT%") do (
+        set "TARGET_WHEEL=%%A"
+        set "TARGET_URL=%%B"
+        set "CUDA_LABEL=%%C"
+        set "GPU_DISPLAY=%%D"
+    )
+    del "%GPU_DETECT_OUT%" >nul 2>&1
 )
 
 echo [*] Detected Device: !GPU_DISPLAY! ^(!CUDA_LABEL! - !TARGET_WHEEL!^)
 
-if /i "!TARGET_WHEEL!"=="cpu" (
-    echo [*] No NVIDIA GPU detected. Verifying CPU-only PyTorch wheel...
-    echo cpu> "%VENV_DIR%\.ls_trainer_wheel"
-    goto :CUDA_STILL_CPU
+"%VENV_PYTHON%" -c "import sys; tw='!TARGET_WHEEL!'; ok=False; import torch; ver=getattr(torch,'__version__',''); xpu=bool(hasattr(torch,'xpu') and torch.xpu.is_available()); cuda=bool(torch.cuda.is_available()); t=torch.zeros(1,device='xpu')+1 if (tw=='xpu' and xpu) else (torch.zeros(1,device='cuda')+1 if (tw.startswith('cu') and cuda) else None); (torch.xpu.synchronize() if (tw=='xpu' and xpu) else (torch.cuda.synchronize() if (tw.startswith('cu') and cuda) else None)); ok=(xpu and '+xpu' in ver) if tw=='xpu' else ((cuda and ('+'+tw) in ver) if tw.startswith('cu') else (bool(ver) and '+cu' not in ver and '+xpu' not in ver)); print(ok)" > "%GPU_VERIFY_OUT%" 2>nul
+
+set "WHEEL_READY=False"
+if exist "%GPU_VERIFY_OUT%" (
+    for /f "usebackq delims=" %%G in ("%GPU_VERIFY_OUT%") do (
+        set "WHEEL_READY=%%G"
+    )
+    del "%GPU_VERIFY_OUT%" >nul 2>&1
 )
 
-REM Check if the exact target wheel is already installed and working on the GPU
-set "WHEEL_READY=False"
-for /f "usebackq delims=" %%G in (`"%VENV_PYTHON%" -c "import torch; ver=getattr(torch,'__version__',''); avail=torch.cuda.is_available(); kok=False
-if avail:
-    try:
-        _ = torch.zeros(1, device='cuda') + 1
-        torch.cuda.synchronize()
-        kok = True
-    except Exception:
-        kok = False
-req = '+!TARGET_WHEEL!'
-print(avail and kok and (req in ver))" 2^>nul`) do (
-    set "WHEEL_READY=%%G"
+if /i "!TARGET_WHEEL!"=="cpu" (
+    echo [*] Neither Intel Arc nor NVIDIA GPU detected. Verifying CPU-only PyTorch wheel...
+    if /i not "!WHEEL_READY!"=="True" (
+        echo [*] Installing CPU-only PyTorch from !TARGET_URL!...
+        "%VENV_PYTHON%" -m pip uninstall -y torch torchvision torchaudio
+        "%VENV_PYTHON%" -m pip install torch torchvision torchaudio --index-url !TARGET_URL!
+    )
+    echo cpu> "%VENV_DIR%\.ls_trainer_wheel"
+    goto :CUDA_STILL_CPU
 )
 
 if /i "!WHEEL_READY!"=="True" (
     echo [*] Matching PyTorch wheel ^(!TARGET_WHEEL!^) is already installed and verified.
     echo !TARGET_WHEEL!> "%VENV_DIR%\.ls_trainer_wheel"
-    goto :COMPLETED
+    "%VENV_PYTHON%" -c "import torch; xpu=bool(hasattr(torch,'xpu') and torch.xpu.is_available()); cuda=bool(torch.cuda.is_available()); print('Intel Arc XPU available:', xpu); print('NVIDIA CUDA available:  ', cuda); print('PyTorch version:        ', torch.__version__); print('Active training device: ', torch.xpu.get_device_name(0) if xpu else (torch.cuda.get_device_name(0) if cuda else 'CPU only'))"
+    exit /b 0
 )
 
 echo [*] Installing PyTorch for !GPU_DISPLAY! ^(!CUDA_LABEL!^) from !TARGET_URL!...
 "%VENV_PYTHON%" -m pip uninstall -y torch torchvision torchaudio
 "%VENV_PYTHON%" -m pip install torch torchvision torchaudio --index-url !TARGET_URL!
 if !ERRORLEVEL! NEQ 0 (
-    echo [!] Warning: !CUDA_LABEL! wheels failed to install. Reinstalling fallback PyTorch...
-    "%VENV_PYTHON%" -m pip install torch torchvision torchaudio
+    echo [!] Warning: !CUDA_LABEL! wheels failed to install. Reinstalling fallback CPU PyTorch...
+    "%VENV_PYTHON%" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 )
 
 echo !TARGET_WHEEL!> "%VENV_DIR%\.ls_trainer_wheel"
 
 echo.
-echo [*] Re-checking GPU / CUDA availability...
-"%VENV_PYTHON%" -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('PyTorch version:', torch.__version__); print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"
+echo [*] Re-checking GPU ^(Intel Arc XPU / NVIDIA CUDA^) availability...
+"%VENV_PYTHON%" -c "import torch; xpu=bool(hasattr(torch,'xpu') and torch.xpu.is_available()); cuda=bool(torch.cuda.is_available()); print('Intel Arc XPU available:', xpu); print('NVIDIA CUDA available:  ', cuda); print('PyTorch version:        ', torch.__version__); print('Active training device: ', torch.xpu.get_device_name(0) if xpu else (torch.cuda.get_device_name(0) if cuda else 'CPU only'))"
 
-set "CUDA_AVAILABLE=False"
-for /f "usebackq delims=" %%G in (`"%VENV_PYTHON%" -c "import torch; print(torch.cuda.is_available())" 2^>nul`) do (
-    set "CUDA_AVAILABLE=%%G"
+"%VENV_PYTHON%" -c "import torch; xpu=bool(hasattr(torch,'xpu') and torch.xpu.is_available()); cuda=bool(torch.cuda.is_available()); print(torch.xpu.get_device_name(0) if xpu else (torch.cuda.get_device_name(0) if cuda else 'CPU_ONLY'))" > "%GPU_VERIFY_OUT%" 2>nul
+set "ACTIVE_GPU_DEV=CPU_ONLY"
+if exist "%GPU_VERIFY_OUT%" (
+    for /f "usebackq delims=" %%D in ("%GPU_VERIFY_OUT%") do (
+        set "ACTIVE_GPU_DEV=%%D"
+    )
+    del "%GPU_VERIFY_OUT%" >nul 2>&1
 )
 
-if /i "!CUDA_AVAILABLE!"=="True" (
-    for /f "usebackq delims=" %%D in (`"%VENV_PYTHON%" -c "import torch; print(torch.cuda.get_device_name(0))" 2^>nul`) do (
-        echo [*] GPU Device: %%D
-    )
+if /i not "!ACTIVE_GPU_DEV!"=="CPU_ONLY" (
+    echo [*] GPU Device: !ACTIVE_GPU_DEV!
     echo [*] GPU acceleration is available for training.
-    goto :COMPLETED
+    exit /b 0
 )
 
 :CUDA_STILL_CPU
 echo.
 echo --------------------------------------------------------
-echo  NOTE: CUDA is still not available on this machine.
-echo  LS-Trainer will fall back to CPU for training.
-echo  Please ensure an NVIDIA driver is installed if you
-echo  wish to use GPU acceleration.
+echo  NOTE: GPU acceleration ^(Intel Arc XPU / NVIDIA CUDA^) is
+echo  not active on this machine. LS-Trainer will fall back
+echo  to CPU for training.
 echo --------------------------------------------------------
+exit /b 0
 
 :COMPLETED
 echo.
@@ -291,7 +293,7 @@ echo ========================================================
 echo  SUCCESS: Python environment successfully configured!
 echo.
 echo  Virtual Environment: "%VENV_DIR%"
-echo  Packages Installed:  ultralytics
+echo  Packages Installed:  ultralytics, rfdetr
 echo  Ready for LS-Trainer!
 echo ========================================================
 echo.

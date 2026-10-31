@@ -61,6 +61,7 @@ interface ExportResponse {
 }
 
 interface GpuInfo {
+	xpu_available?: boolean;
 	cuda_available: boolean;
 	cpu_fallback_confirmed: boolean;
 	device_name: string | null;
@@ -802,6 +803,8 @@ function shortenGpuName(name: string): string {
 	return name
 		.replace(/^NVIDIA GeForce\s+/i, "")
 		.replace(/^NVIDIA\s+/i, "")
+		.replace(/\(R\)/gi, "")
+		.replace(/\(TM\)/gi, "")
 		.trim();
 }
 
@@ -909,19 +912,23 @@ async function handleRepairCuda() {
 			};
 			const updated = await invoke<GpuInfo>("repair_cuda", { onLog });
 			gpuInfo = updated;
-			device = updated.cuda_available ? "0" : "cpu";
+			device = updated.xpu_available
+				? "xpu"
+				: updated.cuda_available
+					? "0"
+					: "cpu";
 			statusMessage = updated.status_summary;
 		} catch (err) {
 			const errMsg = err instanceof Error ? err.message : String(err);
 			logs = [...logs, `[LS-Trainer Error] ${errMsg}`];
-			statusMessage = "CUDA repair encountered an error";
+			statusMessage = "GPU repair encountered an error";
 		} finally {
 			isRepairingCuda = false;
 		}
 	} else {
 		logs = [
 			...logs,
-			"[LS-Trainer] Simulated CUDA repair in Browser Mode",
+			"[LS-Trainer] Simulated GPU repair in Browser Mode",
 			"[LS-Trainer] Verified PyTorch environment.",
 		];
 		statusMessage = "Ready";
@@ -932,10 +939,12 @@ async function handleRepairCuda() {
 onMount(async () => {
 	if (isTauri()) {
 		isCheckingGpu = true;
-		statusMessage = "Checking GPU and PyTorch CUDA environment…";
+		statusMessage = "Checking GPU and PyTorch environment…";
 		try {
 			gpuInfo = await invoke<GpuInfo>("get_gpu_info");
-			if (gpuInfo.cuda_available) {
+			if (gpuInfo.xpu_available) {
+				device = "xpu";
+			} else if (gpuInfo.cuda_available) {
 				device = "0";
 			} else {
 				device = "cpu";
@@ -1037,7 +1046,11 @@ const isTorchReady = $derived(
 		!isRepairingCuda &&
 		(gpuInfo === null
 			? !isTauri()
-			: Boolean(gpuInfo.cuda_available || gpuInfo.cpu_fallback_confirmed)),
+			: Boolean(
+					gpuInfo.xpu_available ||
+						gpuInfo.cuda_available ||
+						gpuInfo.cpu_fallback_confirmed,
+				)),
 );
 const isFormValid = $derived(
 	isDatasetSelected &&
@@ -2069,19 +2082,19 @@ async function handleExportToOnnx() {
 							onclick={handleRepairCuda}
 							disabled={isTraining || isRepairingCuda}
 							class="inline-flex items-center gap-1.5 rounded-md border border-zinc-700/80 bg-zinc-800/80 px-2.5 py-1 text-xs font-medium text-zinc-300 transition hover:border-amber-500/60 hover:bg-zinc-800 hover:text-amber-300 disabled:opacity-50"
-							title="Re-detect GPU and driver version and install the matching PyTorch CUDA wheel"
+							title="Re-detect GPU (Intel Arc XPU or NVIDIA CUDA) and install the matching PyTorch wheel"
 						>
 							{#if isRepairingCuda}
 								<svg class="h-3.5 w-3.5 animate-spin text-amber-400" aria-hidden="true" fill="none" viewBox="0 0 24 24">
 									<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
 									<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
 								</svg>
-								<span>Repairing CUDA…</span>
+								<span>{gpuInfo?.recommended_wheel === "xpu" ? "Repairing XPU…" : "Repairing GPU…"}</span>
 							{:else}
 								<svg class="h-3.5 w-3.5 text-amber-400" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
 									<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
 								</svg>
-								<span>Repair CUDA</span>
+								<span>{gpuInfo?.recommended_wheel === "xpu" ? "Repair XPU" : "Repair CUDA"}</span>
 							{/if}
 						</button>
 					</div>
@@ -2185,14 +2198,14 @@ async function handleExportToOnnx() {
 								<label for="device-select" class="block text-xs font-medium text-zinc-400 shrink-0">
 									Device
 								</label>
-								{#if gpuInfo?.cuda_available && gpuInfo.device_name}
+								{#if (gpuInfo?.xpu_available || gpuInfo?.cuda_available) && gpuInfo.device_name}
 									<span class="flex items-center gap-1.5 text-[11px] font-medium text-emerald-400 whitespace-nowrap truncate min-w-0" title={gpuInfo.device_name}>
 										<span class="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400"></span>
 										<span class="truncate">{shortenGpuName(gpuInfo.device_name)}</span>
 									</span>
-								{:else if gpuInfo && !gpuInfo.cuda_available}
+								{:else if gpuInfo && !gpuInfo.xpu_available && !gpuInfo.cuda_available}
 									<span class="text-[11px] text-zinc-500 whitespace-nowrap">
-										CPU only (No CUDA GPU)
+										CPU only (No XPU/CUDA GPU)
 									</span>
 								{/if}
 							</div>
@@ -2212,7 +2225,13 @@ async function handleExportToOnnx() {
 								disabled={isTraining}
 								class="w-full rounded-lg border border-zinc-700/80 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 transition focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
 							>
-								{#if gpuInfo?.cuda_available}
+								{#if gpuInfo?.xpu_available}
+									<option value="xpu">
+										{gpuInfo.device_name ? `Intel Arc XPU: ${shortenGpuName(gpuInfo.device_name)}` : "Intel Arc XPU (device=xpu)"}
+									</option>
+									<option value="cpu">CPU (device=cpu)</option>
+									<option value="custom">Custom device...</option>
+								{:else if gpuInfo?.cuda_available}
 									<option value="0">
 										{gpuInfo.device_name ? `GPU 0: ${ gpuInfo.device_name }` : "GPU (device=0)"}
 									</option>
@@ -2223,6 +2242,7 @@ async function handleExportToOnnx() {
 									<option value="custom">Custom device...</option>
 								{:else}
 									<option value="0">GPU (device=0)</option>
+									<option value="xpu">Intel Arc XPU (device=xpu)</option>
 									<option value="cpu">CPU (device=cpu)</option>
 									<option value="custom">Custom device...</option>
 								{/if}

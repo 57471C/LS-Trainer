@@ -20,8 +20,12 @@ Built for the Lean Studio / LS-Vision workflow. Point it at a Label Studio (or Y
 
 The Windows NSIS installer configures the Python training environment automatically:
 - **Automatic Setup Hook**: During installation, an NSIS hook automatically executes `setup-venv.bat` via `nsExec::ExecToLog` on the finish page, keeping all output visible in the installer log.
-- **Dedicated Virtual Environment**: `setup-venv.bat` creates a `.venv` directory directly adjacent to the installed `app.exe` (using `%~dp0`), upgrades `pip`, and installs `ultralytics`. If a compatible system Python is not found on PATH, it prompts to download and install Python 3.12.
-- **CUDA / GPU Check**: At the conclusion of setup, it runs `python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"` and prints a clear note indicating whether training can use GPU acceleration or will fall back to CPU.
+- **Dedicated Virtual Environment**: `setup-venv.bat` creates a `.venv` directory directly adjacent to the installed `app.exe` (using `%~dp0`), upgrades `pip`, and installs `ultralytics` and `rfdetr`. If a compatible system Python is not found on PATH, it prompts to download and install Python 3.12.
+- **GPU Detection Priority (Intel Arc XPU &rarr; NVIDIA CUDA &rarr; CPU)**: Before installing ML packages, `setup-venv.bat` (and the in-app GPU check/repair) probes `Win32_VideoController` and `nvidia-smi`:
+  1. **Intel Arc / XPU**: Installs the official Intel Arc XPU PyTorch build (`https://download.pytorch.org/whl/xpu`) and avoids pulling CUDA packages.
+  2. **NVIDIA GPU**: Installs the matching CUDA 12.8 (`cu128`, Blackwell / RTX 50-series) or CUDA 12.4 (`cu124`) PyTorch build.
+  3. **CPU Fallback**: Installs the lightweight CPU PyTorch wheel (`https://download.pytorch.org/whl/cpu`) when neither Intel Arc nor NVIDIA hardware is present.
+- **Hardware Verification**: At the conclusion of setup, it verifies `torch.xpu.is_available()` and `torch.cuda.is_available()` and prints the active training accelerator. During RF-DETR training, `torch.xpu.is_available()` is preferred first (`xpu`), followed by `torch.cuda.is_available()` (`cuda`), with `cpu` as the final fallback.
 - **Low-Friction**: No extra user steps are needed after clicking Finish—the application is ready to run immediately.
 
 ## Stack
