@@ -863,8 +863,13 @@ async fn repair_cuda(on_log: Channel<String>) -> Result<GpuInfo, String> {
         let venv_python = project_root.join(".venv").join("bin").join("python");
 
         if !venv_python.is_file() {
+            #[cfg(target_os = "windows")]
+            let setup_script_name = "setup-venv.bat";
+            #[cfg(not(target_os = "windows"))]
+            let setup_script_name = "setup-linux.sh";
+
             let msg = format!(
-                "Virtual environment Python not found at '{}'. Please run setup-venv.bat first.",
+                "Virtual environment Python not found at '{}'. Please run {setup_script_name} first.",
                 venv_python.display()
             );
             let _ = on_log.send(format!("[LS-Trainer Error] {msg}"));
