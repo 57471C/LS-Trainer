@@ -4,7 +4,9 @@ use crate::dataset::labels::{LabelStats, result_from_stats, scan_coco_json_text,
 use crate::hardware::{compute_recommended_workers, is_intel_arc_gpu, select_pytorch_wheel};
 use crate::models::TrainingRequest;
 use crate::rfdetr::{resolve_rfdetr_class_and_pretrain, snap_rfdetr_resolution};
-use crate::rtdetr::{find_rtdetr_checkpoint_in_dir, is_rtdetr_request, is_rtdetr_run_dir};
+use crate::rtdetr::{
+    find_rtdetr_checkpoint_in_dir, is_rtdetr_request, is_rtdetr_run_dir, resolve_rtdetr_model_meta,
+};
 use crate::training::resolve_train_task;
 
 #[test]
@@ -253,4 +255,28 @@ fn rtdetr_request_classification_and_checkpoint_detection() {
     assert_eq!(find_rtdetr_checkpoint_in_dir(&temp_dir), Some(best_pth));
 
     let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+
+#[test]
+fn rtdetr_model_meta_resolution() {
+    let (w18, l18) = resolve_rtdetr_model_meta("rtdetr-v2-r18");
+    assert_eq!(w18, "PekingU/rtdetr_v2_r18vd");
+    assert_eq!(l18, "RT-DETR v2-R18");
+
+    let (wl, ll) = resolve_rtdetr_model_meta("rtdetr-l.pt");
+    assert_eq!(wl, "PekingU/rtdetr_v2_r50vd");
+    assert_eq!(ll, "RT-DETR-L");
+
+    let (wl_alias, ll_alias) = resolve_rtdetr_model_meta("rtdetr-l");
+    assert_eq!(wl_alias, "PekingU/rtdetr_v2_r50vd");
+    assert_eq!(ll_alias, "RT-DETR-L");
+
+    let (wx, lx) = resolve_rtdetr_model_meta("rtdetr-x.pt");
+    assert_eq!(wx, "PekingU/rtdetr_v2_r101vd");
+    assert_eq!(lx, "RT-DETR-X");
+
+    let (wx_alias, lx_alias) = resolve_rtdetr_model_meta("rtdetr-x");
+    assert_eq!(wx_alias, "PekingU/rtdetr_v2_r101vd");
+    assert_eq!(lx_alias, "RT-DETR-X");
 }

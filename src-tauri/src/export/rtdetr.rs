@@ -7,6 +7,7 @@ use tauri::ipc::Channel;
 use crate::hardware::is_cuda_available;
 use crate::models::{ExportRequest, ExportResponse, default_export_imgsz};
 use crate::process::{get_venv_python, hide_console_window, stream_child_output, to_display_path};
+use crate::rtdetr::resolve_rtdetr_model_meta;
 
 pub(crate) async fn export_rtdetr_to_onnx(
     project_root: &Path,
@@ -48,12 +49,55 @@ pub(crate) async fn export_rtdetr_to_onnx(
         "cpu"
     };
 
+    let mut model_name = "RT-DETR v2-R18".to_string();
+    let mut base_weights = "PekingU/rtdetr_v2_r18vd".to_string();
+
+    let search_dirs = [
+        output_dir.clone(),
+        checkpoint_path.parent().unwrap_or(project_root).to_path_buf(),
+        checkpoint_path
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(project_root)
+            .to_path_buf(),
+    ];
+
+    for dir in &search_dirs {
+        let tc = dir.join("training_config.json");
+        if tc.is_file() {
+            if let Ok(text) = std::fs::read_to_string(&tc) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(name) = json.get("model_name").and_then(|v| v.as_str()) {
+                        model_name = name.to_string();
+                    }
+                    if let Some(bw) = json.get("base_weights").and_then(|v| v.as_str()) {
+                        base_weights = bw.to_string();
+                    } else if let Some(pw) = json.get("pretrain_weights").and_then(|v| v.as_str()) {
+                        if !pw.ends_with(".pth") && !pw.ends_with(".pt") {
+                            base_weights = pw.to_string();
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    if model_name == "RT-DETR v2-R18" && base_weights == "PekingU/rtdetr_v2_r18vd" {
+        let path_str = checkpoint_path.to_string_lossy();
+        let (meta_weights, meta_name) = resolve_rtdetr_model_meta(&path_str);
+        if meta_name != "RT-DETR v2-R18" {
+            model_name = meta_name.to_string();
+            base_weights = meta_weights.to_string();
+        }
+    }
+
     let ckpt_display = checkpoint_path.to_string_lossy().replace('\\', "/");
     let _ = on_log.send(format!(
         "[LS-Trainer] Found RT-DETR checkpoint: {ckpt_display}"
     ));
     let _ = on_log.send(format!(
-        "[LS-Trainer] Exporting RT-DETR v2-R18 to ONNX (shape=({export_res}, {export_res}), dynamic={}, simplify={})...",
+        "[LS-Trainer] Exporting {model_name} to ONNX (shape=({export_res}, {export_res}), dynamic={}, simplify={})...",
         request.dynamic, request.simplify
     ));
 
@@ -67,6 +111,8 @@ pub(crate) async fn export_rtdetr_to_onnx(
     let export_cfg = serde_json::json!({
         "checkpoint_path": checkpoint_path.to_string_lossy(),
         "output_dir": output_dir.to_string_lossy(),
+        "model_name": model_name,
+        "base_weights": base_weights,
         "resolution": export_res,
         "dynamic": request.dynamic,
         "simplify": request.simplify,

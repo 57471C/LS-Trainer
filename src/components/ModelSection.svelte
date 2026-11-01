@@ -1,6 +1,6 @@
 <script lang="ts">
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import { freshModelOptions, modelFamilies } from "../models";
+import { freshModelOptions, loadSavedFreshModel, modelFamilies } from "../models";
 import type { BaseModelId, ModelFamily, ModelMode, TrainTask } from "../types";
 import { normalizePath } from "../utils";
 
@@ -96,7 +96,15 @@ function selectModelFamily(family: ModelFamily) {
 			o.family === family &&
 			(showSegmentationModels || (o.task !== "segment" && !/-seg/i.test(o.id))),
 	);
-	if (!allowed.some((o) => o.id === freshModel)) {
+	const savedModel = loadSavedFreshModel(family);
+	if (savedModel && allowed.some((o) => o.id === savedModel)) {
+		freshModel = savedModel;
+		const found = freshModelOptions.find((o) => o.id === savedModel);
+		if (found) {
+			trainTask =
+				found.task === "segment" || /-seg/i.test(found.id) ? "segment" : "detect";
+		}
+	} else if (!allowed.some((o) => o.id === freshModel)) {
 		if (
 			trainTask === "segment" &&
 			showSegmentationModels &&
@@ -463,7 +471,7 @@ function clearExistingModel() {
 					<div>
 						<span class="font-semibold text-amber-300">{selectedFreshModelOption?.label ?? freshModel} coming soon.</span>
 						<span class="block text-amber-100/80">
-							This variant is cataloged for reference. For RT-DETR training, select <button type="button" onclick={() => handleFreshModelChange("rtdetr-v2-r18")} class="font-mono underline decoration-amber-400/70 hover:text-amber-200">RT-DETR v2-R18</button>.
+							This variant is cataloged for reference. For RT-DETR training, select <button type="button" onclick={() => handleFreshModelChange("rtdetr-v2-r18")} class="font-mono underline decoration-amber-400/70 hover:text-amber-200">RT-DETR v2-R18</button>, <button type="button" onclick={() => handleFreshModelChange("rtdetr-l.pt")} class="font-mono underline decoration-amber-400/70 hover:text-amber-200">RT-DETR-L</button>, or <button type="button" onclick={() => handleFreshModelChange("rtdetr-x.pt")} class="font-mono underline decoration-amber-400/70 hover:text-amber-200">RT-DETR-X</button>.
 						</span>
 					</div>
 				</div>

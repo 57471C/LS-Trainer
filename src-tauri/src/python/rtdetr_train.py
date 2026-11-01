@@ -374,7 +374,12 @@ def main():
     epochs = int(cfg.get("epochs", 50))
     batch_size = max(1, int(cfg.get("batch_size", 4)))
     resolution = int(cfg.get("resolution", 640))
+    model_name = cfg.get("model_name", "RT-DETR v2-R18")
     pretrain_weights = cfg.get("pretrain_weights", "PekingU/rtdetr_v2_r18vd")
+    base_weights = cfg.get(
+        "base_weights",
+        pretrain_weights if not os.path.isfile(pretrain_weights) else "PekingU/rtdetr_v2_r18vd",
+    )
     freeze_backbone = bool(cfg.get("freeze_backbone", False))
     amp = bool(cfg.get("amp", True))
     num_workers = detect_num_workers(cfg)
@@ -421,7 +426,7 @@ def main():
     num_classes = max(1, len(class_names))
 
     print(
-        f"[LS-Trainer] RT-DETR training started: model=RT-DETR v2-R18 ({pretrain_weights}) | device={device_req} ({device_name}) | resolution={resolution} | epochs={epochs} | batch={batch_size} | workers={num_workers} | classes={num_classes} | amp={amp}",
+        f"[LS-Trainer] RT-DETR training started: model={model_name} ({pretrain_weights}) | device={device_req} ({device_name}) | resolution={resolution} | epochs={epochs} | batch={batch_size} | workers={num_workers} | classes={num_classes} | amp={amp}",
         flush=True,
     )
     print(f"[LS-Trainer] Dataset: train={len(train_ds)} images | val={len(val_ds)} images | classes={class_names}", flush=True)
@@ -447,11 +452,11 @@ def main():
     )
 
     # Initialize model
-    print(f"[LS-Trainer] Loading base checkpoint '{pretrain_weights}' with {num_classes} classes...", flush=True)
+    print(f"[LS-Trainer] Loading base checkpoint '{base_weights}' with {num_classes} classes...", flush=True)
     if os.path.isfile(pretrain_weights):
         # Continue from custom checkpoint
         model = RTDetrV2ForObjectDetection.from_pretrained(
-            "PekingU/rtdetr_v2_r18vd",
+            base_weights,
             num_labels=num_classes,
             ignore_mismatched_sizes=True,
         )
@@ -567,8 +572,9 @@ def main():
     # Save final training_config.json
     final_config = {
         "model_family": "RT-DETR",
-        "model_name": "RT-DETR v2-R18",
+        "model_name": model_name,
         "pretrain_weights": pretrain_weights,
+        "base_weights": base_weights,
         "num_classes": num_classes,
         "class_names": class_names,
         "resolution": resolution,
@@ -581,7 +587,7 @@ def main():
         json.dump(final_config, f, indent=2)
 
     print(
-        f"[LS-Trainer] RT-DETR training completed successfully! Results saved to: {output_dir}",
+        f"[LS-Trainer] {model_name} training completed successfully! Results saved to: {output_dir}",
         flush=True,
     )
 

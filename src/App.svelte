@@ -12,6 +12,7 @@ import TrainingAction from "./components/TrainingAction.svelte";
 import {
 	freshModelOptions,
 	loadSavedFamily,
+	loadSavedFreshModel,
 	loadSavedShowSeg,
 	modelFamilies,
 	persistModelPreferences,
@@ -35,6 +36,7 @@ const initialFamily = loadSavedFamily();
 const initialShowSeg = loadSavedShowSeg();
 const initialFamilyMeta =
 	modelFamilies.find((f) => f.id === initialFamily) ?? modelFamilies[0];
+const initialSavedFreshModel = loadSavedFreshModel(initialFamily);
 
 // Form state
 let datasetPath = $state<string>("");
@@ -44,7 +46,9 @@ let selectedFamily = $state<ModelFamily>(initialFamily);
 let showSegmentationModels = $state<boolean>(initialShowSeg);
 let existingModelPath = $state<string>("");
 let existingModelFileName = $state<string>("");
-let freshModel = $state<BaseModelId>(initialFamilyMeta.defaultDetectModel);
+let freshModel = $state<BaseModelId>(
+	initialSavedFreshModel ?? initialFamilyMeta.defaultDetectModel,
+);
 let trainTask = $state<TrainTask>("detect");
 let freezeBackbone = $state<boolean>(false);
 const freezeLayersCount = 10;
@@ -192,7 +196,7 @@ function applyAugPreset(preset: "off" | "light" | "medium" | "bench") {
 }
 
 $effect(() => {
-	persistModelPreferences(selectedFamily, showSegmentationModels);
+	persistModelPreferences(selectedFamily, showSegmentationModels, freshModel);
 });
 
 const selectedFamilyInfo = $derived(
