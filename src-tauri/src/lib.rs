@@ -19,6 +19,7 @@ mod hardware;
 mod models;
 mod process;
 mod rfdetr;
+mod rtdetr;
 mod training;
 
 #[cfg(test)]

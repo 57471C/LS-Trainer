@@ -4,6 +4,7 @@ use crate::dataset::labels::{LabelStats, result_from_stats, scan_coco_json_text,
 use crate::hardware::{compute_recommended_workers, is_intel_arc_gpu, select_pytorch_wheel};
 use crate::models::TrainingRequest;
 use crate::rfdetr::{resolve_rfdetr_class_and_pretrain, snap_rfdetr_resolution};
+use crate::rtdetr::{find_rtdetr_checkpoint_in_dir, is_rtdetr_request, is_rtdetr_run_dir};
 use crate::training::resolve_train_task;
 
 #[test]
@@ -206,4 +207,50 @@ fn intel_arc_and_pytorch_wheel_selection() {
     let (cpu_wheel, cpu_url, _) = select_pytorch_wheel(None, None);
     assert_eq!(cpu_wheel, "cpu");
     assert_eq!(cpu_url, "https://download.pytorch.org/whl/cpu");
+}
+
+#[test]
+fn rtdetr_request_classification_and_checkpoint_detection() {
+    let mut req = TrainingRequest {
+        dataset_path: "datasets/coco".to_string(),
+        model_family: "RT-DETR".to_string(),
+        model_choice: "rtdetr-v2-r18".to_string(),
+        run_name: "test-rtdetr".to_string(),
+        epochs: 50,
+        batch: 4,
+        imgsz: 640,
+        workers: None,
+        device: "xpu".to_string(),
+        amp: true,
+        freeze_backbone: false,
+        freeze_layers: 0,
+        mosaic: 0.0,
+        mixup: 0.0,
+        copy_paste: 0.0,
+        degrees: 0.0,
+        flipud: 0.0,
+        translate: 0.0,
+        scale: 0.0,
+        close_mosaic: 0,
+        task: "detect".to_string(),
+    };
+    assert!(is_rtdetr_request(&req));
+
+    req.model_family = "YOLO".to_string();
+    assert!(is_rtdetr_request(&req)); // model_choice contains rtdetr
+
+    req.model_choice = "yolo11s.pt".to_string();
+    assert!(!is_rtdetr_request(&req));
+
+    let temp_dir = std::env::temp_dir().join(format!("ls_trainer_test_rtdetr_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let cfg_file = temp_dir.join("training_config.json");
+    let _ = std::fs::write(&cfg_file, r#"{"model_family": "RT-DETR", "model_name": "RT-DETR v2-R18"}"#);
+    let best_pth = temp_dir.join("best.pth");
+    let _ = std::fs::write(&best_pth, b"dummy checkpoint");
+
+    assert!(is_rtdetr_run_dir(&temp_dir));
+    assert_eq!(find_rtdetr_checkpoint_in_dir(&temp_dir), Some(best_pth));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
 }
