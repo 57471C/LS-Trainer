@@ -8,6 +8,7 @@ use crate::dataset::coco::prepare_rfdetr_coco_dataset;
 use crate::hardware::{detect_gpu_info, resolve_dataloader_workers};
 use crate::models::{TrainingRequest, TrainingResponse};
 use crate::process::{get_venv_python, hide_console_window, stream_child_output};
+use crate::rtdetr::resolve_rtdetr_model_meta;
 use crate::training::{extract_final_metrics_from_results_dir, log_final_metrics, save_run_config_metadata};
 
 pub(crate) async fn start_rtdetr_training(
@@ -26,10 +27,19 @@ pub(crate) async fn start_rtdetr_training(
     let _ = std::fs::create_dir_all(&models_dir);
 
     let custom_path = Path::new(request.model_choice.trim());
-    let resolved_pretrain = if custom_path.is_file() {
-        custom_path.to_string_lossy().to_string()
+    let (default_hf_weights, default_label) = resolve_rtdetr_model_meta(&request.model_choice);
+    let (resolved_pretrain, model_name, base_weights) = if custom_path.is_file() {
+        (
+            custom_path.to_string_lossy().to_string(),
+            default_label.to_string(),
+            default_hf_weights.to_string(),
+        )
     } else {
-        "PekingU/rtdetr_v2_r18vd".to_string()
+        (
+            default_hf_weights.to_string(),
+            default_label.to_string(),
+            default_hf_weights.to_string(),
+        )
     };
 
     let device_input = request.device.trim();
@@ -82,7 +92,8 @@ pub(crate) async fn start_rtdetr_training(
 
     let runner_cfg_path = abs_results_dir.join("ls_trainer_rtdetr_args.json");
     let runner_cfg = serde_json::json!({
-        "model_name": "RT-DETR v2-R18",
+        "model_name": model_name,
+        "base_weights": base_weights,
         "models_dir": models_dir.to_string_lossy(),
         "dataset_dir": coco_root.to_string_lossy(),
         "output_dir": abs_results_dir.to_string_lossy(),
@@ -112,8 +123,9 @@ pub(crate) async fn start_rtdetr_training(
 
     let _ = on_log.send("[LS-Trainer Status] Training in progress...".to_string());
     let _ = on_log.send(format!(
-        "[LS-Trainer] Active config: family=RT-DETR | task={} | model=RT-DETR v2-R18 ({}) | resolution={} | epochs={} | batch={} | workers={} | freeze_backbone={} | amp={} | device={}",
+        "[LS-Trainer] Active config: family=RT-DETR | task={} | model={} ({}) | resolution={} | epochs={} | batch={} | workers={} | freeze_backbone={} | amp={} | device={}",
         yolo_task,
+        model_name,
         resolved_pretrain,
         request.imgsz,
         request.epochs,
@@ -162,7 +174,7 @@ pub(crate) async fn start_rtdetr_training(
             if status.success() {
                 log_final_metrics(&on_log, map50, map50_95);
                 let _ = on_log.send(format!(
-                    "[LS-Trainer] RT-DETR training completed successfully! Results saved to: {results_dir} (run '{run_name}')"
+                    "[LS-Trainer] {model_name} training completed successfully! Results saved to: {results_dir} (run '{run_name}')"
                 ));
                 Ok(TrainingResponse {
                     success: true,

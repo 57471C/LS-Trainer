@@ -4,6 +4,19 @@ use std::path::{Path, PathBuf};
 
 use crate::models::TrainingRequest;
 
+/// Resolve the HuggingFace pretrained model weights and friendly display name
+/// based on the selected RT-DETR model ID or checkpoint path.
+pub(crate) fn resolve_rtdetr_model_meta(model_choice: &str) -> (&'static str, &'static str) {
+    let lower = model_choice.trim().to_ascii_lowercase();
+    if lower.contains("rtdetr-x") || lower.contains("rtdetr_x") || lower.contains("-x.") || lower.ends_with("-x") {
+        ("PekingU/rtdetr_v2_r101vd", "RT-DETR-X")
+    } else if lower.contains("rtdetr-l") || lower.contains("rtdetr_l") || lower.contains("-l.") || lower.ends_with("-l") {
+        ("PekingU/rtdetr_v2_r50vd", "RT-DETR-L")
+    } else {
+        ("PekingU/rtdetr_v2_r18vd", "RT-DETR v2-R18")
+    }
+}
+
 /// Check if a training request is targeting an RT-DETR model.
 pub(crate) fn is_rtdetr_request(request: &TrainingRequest) -> bool {
     if request.model_family.eq_ignore_ascii_case("RT-DETR")

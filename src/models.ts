@@ -7,6 +7,8 @@ import type {
 
 export const STORAGE_KEY_FAMILY = "ls_trainer.model_family";
 export const STORAGE_KEY_SHOW_SEG = "ls_trainer.show_segmentation_models";
+export const STORAGE_KEY_FRESH_MODEL = "ls_trainer.fresh_model";
+export const STORAGE_KEY_FRESH_MODEL_PREFIX = "ls_trainer.fresh_model.";
 
 export const modelFamilies: ModelFamilyInfo[] = [
 	{
@@ -37,7 +39,7 @@ export const modelFamilies: ModelFamilyInfo[] = [
 		supported: true,
 		defaultDetectModel: "rtdetr-v2-r18",
 		defaultSegModel: null,
-		description: "Real-Time Detection Transformer v2 (ResNet-18)",
+		description: "Real-Time Detection Transformer v2 (R18 / L / X)",
 	},
 	{
 		id: "YOLOX",
@@ -255,16 +257,34 @@ export const freshModelOptions: FreshModelOption[] = [
 	{
 		id: "rtdetr-v2-r18",
 		family: "RT-DETR",
-		group: "RT-DETRv2 Series",
+		group: "RT-DETR Series",
 		task: "detect",
 		label: "RT-DETR v2-R18",
 		desc: "ResNet-18vd lightweight real-time transformer",
 		supported: true,
 	},
 	{
-		id: "rtdetr-r18",
+		id: "rtdetr-l.pt",
 		family: "RT-DETR",
 		group: "RT-DETR Series",
+		task: "detect",
+		label: "RT-DETR-L",
+		desc: "ResNet-50vd Large (high accuracy)",
+		supported: true,
+	},
+	{
+		id: "rtdetr-x.pt",
+		family: "RT-DETR",
+		group: "RT-DETR Series",
+		task: "detect",
+		label: "RT-DETR-X",
+		desc: "ResNet-101vd XLarge (maximum capacity)",
+		supported: true,
+	},
+	{
+		id: "rtdetr-r18",
+		family: "RT-DETR",
+		group: "RT-DETR Series (Reference)",
 		task: "detect",
 		label: "RT-DETR-R18",
 		desc: "ResNet-18 (lightweight real-time DETR)",
@@ -273,7 +293,7 @@ export const freshModelOptions: FreshModelOption[] = [
 	{
 		id: "rtdetr-r34",
 		family: "RT-DETR",
-		group: "RT-DETR Series",
+		group: "RT-DETR Series (Reference)",
 		task: "detect",
 		label: "RT-DETR-R34",
 		desc: "ResNet-34 (balanced speed & accuracy)",
@@ -282,28 +302,10 @@ export const freshModelOptions: FreshModelOption[] = [
 	{
 		id: "rtdetr-r50",
 		family: "RT-DETR",
-		group: "RT-DETR Series",
+		group: "RT-DETR Series (Reference)",
 		task: "detect",
 		label: "RT-DETR-R50",
 		desc: "ResNet-50 (high accuracy transformer)",
-		supported: false,
-	},
-	{
-		id: "rtdetr-l.pt",
-		family: "RT-DETR",
-		group: "RT-DETR Series",
-		task: "detect",
-		label: "RT-DETR-L",
-		desc: "HGNetv2 Large (high accuracy)",
-		supported: false,
-	},
-	{
-		id: "rtdetr-x.pt",
-		family: "RT-DETR",
-		group: "RT-DETR Series",
-		task: "detect",
-		label: "RT-DETR-X",
-		desc: "HGNetv2 XLarge (maximum capacity)",
 		supported: false,
 	},
 	// YOLOX
@@ -384,11 +386,42 @@ export function loadSavedShowSeg(): boolean {
 	}
 }
 
-export function persistModelPreferences(family: ModelFamily, showSeg: boolean) {
+export function loadSavedFreshModel(family: ModelFamily): BaseModelId | null {
+	if (typeof window === "undefined") return null;
+	try {
+		const saved =
+			window.localStorage.getItem(STORAGE_KEY_FRESH_MODEL_PREFIX + family) ||
+			window.localStorage.getItem(STORAGE_KEY_FRESH_MODEL);
+		if (
+			saved &&
+			freshModelOptions.some(
+				(o) => o.id === saved && o.family === family,
+			)
+		) {
+			return saved as BaseModelId;
+		}
+	} catch {
+		// ignore localStorage read errors
+	}
+	return null;
+}
+
+export function persistModelPreferences(
+	family: ModelFamily,
+	showSeg: boolean,
+	freshModel?: BaseModelId,
+) {
 	if (typeof window === "undefined") return;
 	try {
 		window.localStorage.setItem(STORAGE_KEY_FAMILY, family);
 		window.localStorage.setItem(STORAGE_KEY_SHOW_SEG, String(showSeg));
+		if (freshModel) {
+			window.localStorage.setItem(
+				STORAGE_KEY_FRESH_MODEL_PREFIX + family,
+				freshModel,
+			);
+			window.localStorage.setItem(STORAGE_KEY_FRESH_MODEL, freshModel);
+		}
 	} catch {
 		// ignore localStorage write errors
 	}

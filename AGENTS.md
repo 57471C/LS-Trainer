@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Guidance for AI coding agents working on LS-Trainer. Version 0.1.4.
+Guidance for AI coding agents working on LS-Trainer. Version 0.1.5.
 
 ## Project context
 
@@ -38,7 +38,7 @@ Keep these in sync when the version changes:
 - `src-tauri/Cargo.toml`
 - `src-tauri/Cargo.lock` package `app` only
 - `src-tauri/tauri.conf.json`
-- the version badge in `src/App.svelte`
+- the version badge in `src/components/Header.svelte`
 
 Do not bump unrelated crate versions in `Cargo.lock`.
 

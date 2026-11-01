@@ -14,13 +14,13 @@ if hasattr(sys.stderr, "reconfigure"):
     except Exception:
         pass
 
-def embed_rtdetr_onnx_metadata(onnx_file, resolution, class_names, task="detect"):
+def embed_rtdetr_onnx_metadata(onnx_file, resolution, class_names, task="detect", model_name="RT-DETR v2-R18"):
     import onnx
     m = onnx.load(str(onnx_file))
     props = {p.key: p.value for p in m.metadata_props}
     props["ls_model_type"] = "rtdetr"
     props["ls_model_family"] = "RT-DETR"
-    props["ls_model_name"] = "RT-DETR v2-R18"
+    props["ls_model_name"] = str(model_name)
     props["task"] = str(task)
     props["imgsz"] = f"[{resolution}, {resolution}]"
 
@@ -36,7 +36,7 @@ def embed_rtdetr_onnx_metadata(onnx_file, resolution, class_names, task="detect"
         entry.value = str(v)
     onnx.save(m, str(onnx_file))
     print(
-        f'[LS-Trainer] Embedded ONNX metadata: ls_model_type="rtdetr" (ls_model_family="RT-DETR", model=RT-DETR v2-R18, task={task}, imgsz={resolution})',
+        f'[LS-Trainer] Embedded ONNX metadata: ls_model_type="rtdetr" (ls_model_family="RT-DETR", model={model_name}, task={task}, imgsz={resolution})',
         flush=True,
     )
 
@@ -55,10 +55,12 @@ def main():
     dynamic_batch = bool(cfg.get("dynamic", False))
     simplify = bool(cfg.get("simplify", True))
     task = cfg.get("task", "detect")
+    model_name = cfg.get("model_name", "RT-DETR v2-R18")
+    base_weights = cfg.get("base_weights", "PekingU/rtdetr_v2_r18vd")
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Resolve class names from training config if available
+    # Resolve class names and model weights from training config if available
     class_names = ["object"]
     search_dirs = [output_dir, os.path.dirname(checkpoint_path), os.path.dirname(os.path.dirname(checkpoint_path))]
     for d in search_dirs:
@@ -69,7 +71,13 @@ def main():
                     tc = json.load(tf)
                     if isinstance(tc.get("class_names"), list) and tc["class_names"]:
                         class_names = [str(c) for c in tc["class_names"]]
-                        break
+                    if tc.get("model_name"):
+                        model_name = str(tc["model_name"])
+                    if tc.get("base_weights"):
+                        base_weights = str(tc["base_weights"])
+                    elif tc.get("pretrain_weights") and not str(tc["pretrain_weights"]).endswith((".pt", ".pth")):
+                        base_weights = str(tc["pretrain_weights"])
+                    break
             except Exception:
                 pass
 
@@ -87,7 +95,7 @@ def main():
 
     num_classes = max(1, len(class_names))
     model = RTDetrV2ForObjectDetection.from_pretrained(
-        "PekingU/rtdetr_v2_r18vd",
+        base_weights,
         num_labels=num_classes,
         ignore_mismatched_sizes=True,
     )
@@ -118,7 +126,7 @@ def main():
         }
 
     print(
-        f"[LS-Trainer] Exporting RT-DETR v2-R18 to ONNX: shape=({resolution}, {resolution}), dynamic={dynamic_batch}, simplify={simplify}...",
+        f"[LS-Trainer] Exporting {model_name} to ONNX: shape=({resolution}, {resolution}), dynamic={dynamic_batch}, simplify={simplify}...",
         flush=True,
     )
 
@@ -146,7 +154,7 @@ def main():
             # Non-fatal if onnxsim is not installed or fails
             pass
 
-    embed_rtdetr_onnx_metadata(onnx_file, resolution, class_names, task=task)
+    embed_rtdetr_onnx_metadata(onnx_file, resolution, class_names, task=task, model_name=model_name)
 
     # Also place in weights/ subdirectory if present
     weights_dir = os.path.join(output_dir, "weights")
