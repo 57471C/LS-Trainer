@@ -38,7 +38,7 @@ const { isLogPanelOpen, isTraining, logCount, onToggleLogPanel }: HeaderProps =
 			</button>
 		{/if}
 		<span class="rounded border border-zinc-700/60 bg-zinc-800/80 px-2.5 py-0.5 font-mono text-xs text-zinc-400">
-			v0.1.4
+			v0.1.5
 		</span>
 	</div>
 </header>
