@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Guidance for AI coding agents working on LS-Trainer. Version 0.1.5.
+Guidance for AI coding agents working on LS-Trainer. Version 0.1.6.
 
 ## Project context
 

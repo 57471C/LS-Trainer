@@ -335,37 +335,3 @@ fn test_training_stop_lifecycle() {
         let _ = std::fs::remove_dir_all(&temp_run_dir);
     });
 }
-
-#[tokio::test]
-async fn test_training_stop_lifecycle() {
-    use std::path::PathBuf;
-    use crate::training::{
-        clear_active_training, is_stop_requested, register_active_training, register_child_pid,
-        stop_training,
-    };
-
-    let temp_run_dir = std::env::temp_dir().join("ls_trainer_test_run");
-    let _ = std::fs::create_dir_all(&temp_run_dir);
-
-    // Initial state: not stopped
-    clear_active_training();
-    assert!(!is_stop_requested());
-
-    // Register active training
-    register_active_training(temp_run_dir.clone());
-    assert!(!is_stop_requested());
-
-    // Stop training
-    let stopped = stop_training().await.expect("stop_training call failed");
-    assert!(stopped);
-    assert!(is_stop_requested());
-
-    // Verify .stop_requested file exists in run dir
-    assert!(temp_run_dir.join(".stop_requested").is_file());
-
-    // Clear active training
-    clear_active_training();
-
-    // Clean up
-    let _ = std::fs::remove_dir_all(&temp_run_dir);
-}

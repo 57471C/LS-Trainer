@@ -114,4 +114,4 @@ When auto-export is on, a successful run writes `best.onnx` next to `best.pt`. C
 
 ## Project status
 
-Version 0.1.5. Usable for local detection and instance-segmentation training, plus ONNX export.
+Version 0.1.6. Usable for local detection and instance-segmentation training, plus ONNX export.
