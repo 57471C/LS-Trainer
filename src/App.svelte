@@ -30,7 +30,13 @@ import type {
 	TrainingResponse,
 	TrainTask,
 } from "./types";
-import { normalizePath, shortenGpuName } from "./utils";
+import {
+	formatDurationHm,
+	formatEpochRate,
+	formatTimeRemaining,
+	normalizePath,
+	shortenGpuName,
+} from "./utils";
 
 const initialFamily = loadSavedFamily();
 const initialShowSeg = loadSavedShowSeg();
@@ -88,6 +94,7 @@ let activeTooltip = $state<string | null>(null);
 
 // Training & Log state
 let isTraining = $state<boolean>(false);
+let isStoppingTraining = $state<boolean>(false);
 let logs = $state<string[]>([]);
 let resultsDir = $state<string | null>(null);
 let statusMessage = $state<string>("Ready");
@@ -100,6 +107,9 @@ let isLogPanelOpen = $state<boolean>(false);
 let currentEpoch = $state<number>(0);
 let totalEpochs = $state<number>(0);
 let currentEpochStartTime = $state<number | null>(null);
+let trainingStartTime = $state<number | null>(null);
+let trainingEndTime = $state<number | null>(null);
+let currentTimestamp = $state<number>(Date.now());
 let recentEpochDurations = $state<number[]>([]);
 let firstEpochEstimatedSec = $state<number | null>(null);
 let finalMetrics = $state<FinalMetrics>({
@@ -199,6 +209,14 @@ $effect(() => {
 	persistModelPreferences(selectedFamily, showSegmentationModels, freshModel);
 });
 
+$effect(() => {
+	if (!isTraining) return;
+	const interval = setInterval(() => {
+		currentTimestamp = Date.now();
+	}, 1000);
+	return () => clearInterval(interval);
+});
+
 const selectedFamilyInfo = $derived(
 	modelFamilies.find((f) => f.id === selectedFamily) ?? modelFamilies[0],
 );
@@ -252,6 +270,23 @@ const rollingAvgEpochSec = $derived(
 				recentEpochDurations.length
 		: firstEpochEstimatedSec,
 );
+
+const elapsedSeconds = $derived.by(() => {
+	if (!trainingStartTime) return 0;
+	const end = trainingEndTime ?? currentTimestamp;
+	return Math.max(0, Math.floor((end - trainingStartTime) / 1000));
+});
+
+const elapsedLabel = $derived.by(() => {
+	if (!trainingStartTime) return "";
+	return `elapsed ${formatDurationHm(elapsedSeconds)}`;
+});
+
+const epochRateLabel = $derived.by(() => {
+	if (rollingAvgEpochSec === null || rollingAvgEpochSec <= 0) return "";
+	return formatEpochRate(rollingAvgEpochSec);
+});
+
 const epochEtaLabel = $derived.by(() => {
 	if (currentEpoch <= 0 || totalEpochs <= 0) return "";
 	if (!isTraining && remainingEpochs === 0) return "Complete";
@@ -259,17 +294,28 @@ const epochEtaLabel = $derived.by(() => {
 		return "estimating…";
 	}
 	const secLeft = remainingEpochs * rollingAvgEpochSec;
-	if (secLeft < 45) {
-		return `~${Math.max(1, Math.round(secLeft))} sec left`;
-	}
-	const mins = Math.max(1, Math.round(secLeft / 60));
-	return `~${mins} min left`;
+	return formatTimeRemaining(secLeft);
 });
-const epochCountdownText = $derived(
-	currentEpoch > 0 && totalEpochs > 0
-		? `Epoch ${currentEpoch} / ${totalEpochs}   (${remainingEpochs} remaining)   ${epochEtaLabel}`
-		: "",
-);
+
+const epochCountdownText = $derived.by(() => {
+	if (totalEpochs <= 0) return "";
+	if (currentEpoch <= 0 && !isTraining) return "";
+	const epDisplay = currentEpoch <= 0 ? 0 : currentEpoch;
+	const parts = [
+		`Epoch ${epDisplay} / ${totalEpochs}`,
+		currentEpoch <= 0 ? "(initializing...)" : `(${remainingEpochs} remaining)`,
+	];
+	if (elapsedLabel) {
+		parts.push(elapsedLabel);
+	}
+	if (epochRateLabel) {
+		parts.push(epochRateLabel);
+	}
+	if (epochEtaLabel) {
+		parts.push(epochEtaLabel);
+	}
+	return parts.join("   ");
+});
 const epochProgressPercent = $derived(
 	totalEpochs > 0
 		? Math.min(100, Math.round((currentEpoch / totalEpochs) * 100))
@@ -518,10 +564,36 @@ $effect(() => {
 	};
 });
 
+async function handleStopTraining() {
+	if (!isTraining || isStoppingTraining) return;
+	isStoppingTraining = true;
+	statusMessage = "Stopping training...";
+	logs = [...logs, "[LS-Trainer] Stop requested by user..."];
+
+	if (isTauri()) {
+		try {
+			await invoke("stop_training");
+		} catch (err) {
+			console.error("Failed to stop training:", err);
+			logs = [...logs, `[LS-Trainer Error] Stop training failed: ${err}`];
+		}
+	} else {
+		// Browser development preview simulation
+		setTimeout(() => {
+			isTraining = false;
+			isStoppingTraining = false;
+			statusMessage = "Stopped by user";
+			trainingEndTime = Date.now();
+			logs = [...logs, "[LS-Trainer] Training stopped by user."];
+		}, 300);
+	}
+}
+
 async function handleStartTraining() {
 	if (!isFormValid || isTraining) return;
 
 	isTraining = true;
+	isStoppingTraining = false;
 	isLogPanelOpen = true;
 	logs = [];
 	resultsDir = null;
@@ -530,6 +602,9 @@ async function handleStartTraining() {
 	currentEpoch = 0;
 	totalEpochs = Number(epochs);
 	currentEpochStartTime = null;
+	trainingStartTime = Date.now();
+	trainingEndTime = null;
+	currentTimestamp = Date.now();
 	recentEpochDurations = [];
 	firstEpochEstimatedSec = null;
 	finalMetrics = { map50: null, map50_95: null };
@@ -611,17 +686,27 @@ async function handleStartTraining() {
 				statusMessage = "Training complete — exporting ONNX…";
 				await handleExportToOnnx();
 			}
-			statusMessage = response.success
-				? onnxPath
-					? `Finished — ${normalizePath(onnxPath)}`
-					: `Finished — ${normalizePath(response.results_dir)}`
-				: "Process finished with status warnings";
+			if (isStoppingTraining || /stopped by user/i.test(response.message)) {
+				statusMessage = "Stopped by user";
+			} else {
+				statusMessage = response.success
+					? onnxPath
+						? `Finished — ${normalizePath(onnxPath)}`
+						: `Finished — ${normalizePath(response.results_dir)}`
+					: "Process finished with status warnings";
+			}
 		} catch (err) {
 			const errMsg = err instanceof Error ? err.message : String(err);
 			logs = [...logs, `[LS-Trainer Error] ${errMsg}`];
-			statusMessage = "Training encountered an error";
+			if (isStoppingTraining || /stopped by user/i.test(errMsg)) {
+				statusMessage = "Stopped by user";
+			} else {
+				statusMessage = "Training encountered an error";
+			}
 		} finally {
+			trainingEndTime = Date.now();
 			isTraining = false;
+			isStoppingTraining = false;
 		}
 	} else {
 		// Browser development preview simulation
@@ -659,6 +744,7 @@ async function handleStartTraining() {
 		statusMessage = onnxPath
 			? `Finished — ${normalizePath(onnxPath)}`
 			: `Finished — ${normalizePath(resultsDir)}`;
+		trainingEndTime = Date.now();
 		isTraining = false;
 	}
 }
@@ -847,6 +933,8 @@ async function handleExportToOnnx() {
 					onOpenLogPanel={() => {
 						isLogPanelOpen = true;
 					}}
+					{isStoppingTraining}
+					onStopTraining={handleStopTraining}
 				/>
 			</form>
 		</div>

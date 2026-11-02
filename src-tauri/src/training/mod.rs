@@ -5,14 +5,110 @@ pub(crate) mod rtdetr;
 pub(crate) mod yolo;
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::ipc::Channel;
 
 use crate::models::{TrainingRequest, TrainingResponse};
-use crate::process::{get_project_root, to_display_path};
+use crate::process::{get_project_root, hide_console_window, send_break_signal, to_display_path};
 use crate::rtdetr::is_rtdetr_request;
 use crate::training::rfdetr::start_rfdetr_training;
 use crate::training::rtdetr::start_rtdetr_training;
 use crate::training::yolo::start_yolo_training;
+
+pub struct ActiveTrainingState {
+    pub is_running: AtomicBool,
+    pub stop_requested: AtomicBool,
+    pub results_dir: Mutex<Option<PathBuf>>,
+    pub child_pid: Mutex<Option<u32>>,
+}
+
+pub static ACTIVE_TRAINING: ActiveTrainingState = ActiveTrainingState {
+    is_running: AtomicBool::new(false),
+    stop_requested: AtomicBool::new(false),
+    results_dir: Mutex::new(None),
+    child_pid: Mutex::new(None),
+};
+
+pub(crate) fn register_active_training(results_dir: PathBuf) {
+    ACTIVE_TRAINING.is_running.store(true, Ordering::SeqCst);
+    ACTIVE_TRAINING.stop_requested.store(false, Ordering::SeqCst);
+    if let Ok(mut lock) = ACTIVE_TRAINING.results_dir.lock() {
+        let stop_file = results_dir.join(".stop_requested");
+        let _ = std::fs::remove_file(stop_file);
+        *lock = Some(results_dir);
+    }
+}
+
+pub(crate) fn register_child_pid(pid: u32) {
+    if let Ok(mut lock) = ACTIVE_TRAINING.child_pid.lock() {
+        *lock = Some(pid);
+    }
+}
+
+pub(crate) fn unregister_child_pid() {
+    if let Ok(mut lock) = ACTIVE_TRAINING.child_pid.lock() {
+        *lock = None;
+    }
+}
+
+pub(crate) fn clear_active_training() {
+    ACTIVE_TRAINING.is_running.store(false, Ordering::SeqCst);
+    if let Ok(mut lock) = ACTIVE_TRAINING.child_pid.lock() {
+        *lock = None;
+    }
+    if let Ok(mut lock) = ACTIVE_TRAINING.results_dir.lock() {
+        *lock = None;
+    }
+}
+
+pub(crate) fn is_stop_requested() -> bool {
+    ACTIVE_TRAINING.stop_requested.load(Ordering::SeqCst)
+}
+
+#[tauri::command]
+pub async fn stop_training() -> Result<bool, String> {
+    if !ACTIVE_TRAINING.is_running.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+
+    ACTIVE_TRAINING.stop_requested.store(true, Ordering::SeqCst);
+
+    // 1. Write .stop_requested file to active run folder for file-based pollers
+    if let Ok(guard) = ACTIVE_TRAINING.results_dir.lock() {
+        if let Some(ref dir) = *guard {
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(dir.join(".stop_requested"), "stop");
+        }
+    }
+
+    // 2. Send break signal to active child process group
+    let pid_opt = ACTIVE_TRAINING.child_pid.lock().ok().and_then(|g| *g);
+    if let Some(pid) = pid_opt {
+        send_break_signal(pid);
+
+        // 3. Fallback watchdog: if training is still running after 6 seconds, terminate process
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(6));
+            if ACTIVE_TRAINING.is_running.load(Ordering::SeqCst) {
+                #[cfg(windows)]
+                {
+                    let mut cmd = Command::new("taskkill");
+                    cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
+                    hide_console_window(&mut cmd);
+                    let _ = cmd.spawn();
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = Command::new("kill").args(["-9", &pid.to_string()]).spawn();
+                }
+            }
+        });
+    }
+
+    Ok(true)
+}
 
 #[tauri::command]
 pub async fn start_training(
@@ -43,8 +139,10 @@ pub async fn start_training(
         return Err(msg);
     }
 
-    if is_rtdetr_request(&request) {
-        return start_rtdetr_training(
+    register_active_training(abs_results_dir.clone());
+
+    let response = if is_rtdetr_request(&request) {
+        start_rtdetr_training(
             project_root,
             run_name,
             yolo_task,
@@ -54,11 +152,9 @@ pub async fn start_training(
             request,
             on_log,
         )
-        .await;
-    }
-
-    if is_rfdetr_request(&request) {
-        return start_rfdetr_training(
+        .await
+    } else if is_rfdetr_request(&request) {
+        start_rfdetr_training(
             project_root,
             run_name,
             yolo_task,
@@ -68,20 +164,23 @@ pub async fn start_training(
             request,
             on_log,
         )
-        .await;
-    }
+        .await
+    } else {
+        start_yolo_training(
+            project_root,
+            run_name,
+            yolo_task,
+            abs_results_dir,
+            results_dir,
+            dataset_input,
+            request,
+            on_log,
+        )
+        .await
+    };
 
-    start_yolo_training(
-        project_root,
-        run_name,
-        yolo_task,
-        abs_results_dir,
-        results_dir,
-        dataset_input,
-        request,
-        on_log,
-    )
-    .await
+    clear_active_training();
+    response
 }
 
 pub(crate) fn resolve_train_task(request: &TrainingRequest) -> String {

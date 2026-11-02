@@ -52,7 +52,7 @@ pub(crate) fn ensure_rfdetr_installed(project_root: &Path, on_log: &Channel<Stri
     let mut check_cmd = Command::new(&python_exe);
     check_cmd.args([
         "-c",
-        "import rfdetr, pytorch_lightning, pycocotools, vernier, hotcoco, faster_coco_eval, onnx; from rfdetr.training import build_trainer",
+        "import rfdetr, pytorch_lightning, pycocotools, vernier, hotcoco, faster_coco_eval, onnx, torch_linear_assignment; from rfdetr.training import build_trainer",
     ]);
     hide_console_window(&mut check_cmd);
     if let Ok(status) = check_cmd.status() {
@@ -81,6 +81,7 @@ pub(crate) fn ensure_rfdetr_installed(project_root: &Path, on_log: &Channel<Stri
         "peft",
         "onnx",
         "onnxruntime",
+        "torch-linear-assignment",
     ]);
     install_cmd
         .env("PYTHONUNBUFFERED", "1")
@@ -90,6 +91,23 @@ pub(crate) fn ensure_rfdetr_installed(project_root: &Path, on_log: &Channel<Stri
     if let Ok(mut child) = install_cmd.spawn() {
         stream_child_output(&mut child, &on_log);
         let _ = child.wait();
+    }
+}
+
+/// Confirm that required RF-DETR runtime dependencies (specifically `torch_linear_assignment`)
+/// are imported / available before training starts, or return an error.
+pub(crate) fn verify_rfdetr_dependencies(project_root: &Path) -> Result<(), String> {
+    let python_exe = get_venv_python(project_root)
+        .ok_or_else(|| "Python virtual environment not found in .venv".to_string())?;
+
+    let mut check_cmd = Command::new(&python_exe);
+    check_cmd.args(["-c", "import torch_linear_assignment"]);
+    hide_console_window(&mut check_cmd);
+    match check_cmd.status() {
+        Ok(status) if status.success() => Ok(()),
+        _ => Err(
+            "Missing required dependency 'torch-linear-assignment' needed for RF-DETR Hungarian matching. Please install it with 'pip install torch-linear-assignment'.".to_string(),
+        ),
     }
 }
 

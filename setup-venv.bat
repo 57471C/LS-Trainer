@@ -29,7 +29,7 @@ echo [*] Target directory: "%APP_DIR%"
 echo [*] Checking for existing virtual environment...
 
 if exist "%VENV_DIR%\Scripts\python.exe" (
-    "%VENV_DIR%\Scripts\python.exe" -c "import importlib.util as u, sys; sys.exit(0 if all(u.find_spec(m) for m in ('ultralytics','rfdetr','vernier')) else 1)" >nul 2>&1
+    "%VENV_DIR%\Scripts\python.exe" -c "import importlib.util as u, sys; sys.exit(0 if all(u.find_spec(m) for m in ('ultralytics','rfdetr','vernier','torch_linear_assignment')) else 1)" >nul 2>&1
     if !ERRORLEVEL! EQU 0 (
         echo [*] Virtual environment, ultralytics, and rfdetr already installed and ready at:
         echo     "%VENV_DIR%"
@@ -175,7 +175,7 @@ if !ERRORLEVEL! NEQ 0 (
 
 echo.
 echo [*] Installing rfdetr and COCO/ONNX training dependencies...
-"%VENV_PYTHON%" -m pip install rfdetr pytorch_lightning "torchmetrics[detection]<1.9.0,>=1.8.2" vernier faster-coco-eval hotcoco pycocotools scipy peft onnx onnxruntime
+"%VENV_PYTHON%" -m pip install rfdetr pytorch_lightning "torchmetrics[detection]<1.9.0,>=1.8.2" vernier faster-coco-eval hotcoco pycocotools scipy peft onnx onnxruntime torch-linear-assignment
 if !ERRORLEVEL! NEQ 0 (
     echo [!] Warning: rfdetr installation returned non-zero exit code. Continuing...
 )
@@ -293,7 +293,7 @@ echo ========================================================
 echo  SUCCESS: Python environment successfully configured!
 echo.
 echo  Virtual Environment: "%VENV_DIR%"
-echo  Packages Installed:  ultralytics, rfdetr
+echo  Packages Installed:  ultralytics, rfdetr, torch-linear-assignment
 echo  Ready for LS-Trainer!
 echo ========================================================
 echo.

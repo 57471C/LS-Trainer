@@ -7,16 +7,39 @@ use tauri::ipc::Channel;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 
 /// Prevent a console window from flashing up for child processes on Windows. No-op elsewhere.
 pub(crate) fn hide_console_window(cmd: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
     #[cfg(not(windows))]
     let _ = cmd;
+}
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn GenerateConsoleCtrlEvent(dwCtrlEvent: u32, dwProcessGroupId: u32) -> i32;
+}
+
+/// Send a graceful break / interrupt signal to the target child process group.
+pub(crate) fn send_break_signal(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        // 1 = CTRL_BREAK_EVENT
+        unsafe { GenerateConsoleCtrlEvent(1, pid) != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        let res = std::process::Command::new("kill")
+            .args(["-2", &pid.to_string()])
+            .status();
+        res.map(|s| s.success()).unwrap_or(false)
+    }
 }
 
 /// Path to the project venv interpreter (`.venv\Scripts\python.exe` on Windows, `.venv/bin/python` elsewhere).

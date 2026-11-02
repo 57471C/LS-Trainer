@@ -9,7 +9,7 @@ use crate::dataset::yolo::{find_data_yaml, resolve_and_fix_data_yaml, unpack_arc
 use crate::hardware::{detect_gpu_info, resolve_dataloader_workers};
 use crate::models::{TrainingRequest, TrainingResponse};
 use crate::process::{hide_console_window, stream_child_output, venv_python_path, venv_yolo_path};
-use crate::training::{extract_final_metrics_from_results_dir, log_final_metrics, save_run_config_metadata};
+use crate::training::{extract_final_metrics_from_results_dir, is_stop_requested, log_final_metrics, register_child_pid, save_run_config_metadata, unregister_child_pid};
 
 pub(crate) fn resolve_or_download_model_weights(
     project_root: &Path,
@@ -376,11 +376,14 @@ pub(crate) async fn start_yolo_training(
 
     match cmd.spawn() {
         Ok(mut child) => {
+            register_child_pid(child.id());
             stream_child_output(&mut child, &on_log);
 
             let status = child
                 .wait()
                 .map_err(|e| format!("Failed while waiting for YOLO: {e}"))?;
+
+            unregister_child_pid();
 
             save_run_config_metadata(
                 &abs_results_dir,
@@ -393,6 +396,19 @@ pub(crate) async fn start_yolo_training(
             );
 
             let (map50, map50_95) = extract_final_metrics_from_results_dir(&abs_results_dir);
+
+            if is_stop_requested() {
+                let _ = on_log.send(format!(
+                    "[LS-Trainer] Training stopped by user. Checkpoints preserved at: {results_dir}"
+                ));
+                return Ok(TrainingResponse {
+                    success: false,
+                    results_dir,
+                    message: "Stopped by user".to_string(),
+                    map50,
+                    map50_95,
+                });
+            }
 
             if status.success() {
                 log_final_metrics(&on_log, map50, map50_95);

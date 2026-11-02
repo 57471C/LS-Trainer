@@ -49,6 +49,7 @@ pub fn run() {
             dialogs::pick_model_file,
             dataset::labels::inspect_dataset_labels,
             training::start_training,
+            training::stop_training,
             dialogs::open_folder,
             export::export_to_onnx,
             hardware::get_gpu_info,

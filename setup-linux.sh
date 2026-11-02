@@ -257,7 +257,7 @@ echo "[*] Installing Ultralytics YOLO..."
 
 echo
 echo "[*] Installing RF-DETR and COCO/ONNX training dependencies..."
-"${VENV_PYTHON}" -m pip install rfdetr pytorch_lightning "torchmetrics[detection]<1.9.0,>=1.8.2" vernier faster-coco-eval hotcoco pycocotools scipy peft onnx onnxruntime
+"${VENV_PYTHON}" -m pip install rfdetr pytorch_lightning "torchmetrics[detection]<1.9.0,>=1.8.2" vernier faster-coco-eval hotcoco pycocotools scipy peft onnx onnxruntime torch-linear-assignment
 
 # ------------------------------------------------------------------------------
 # 6. Verify Environment & Accelerators

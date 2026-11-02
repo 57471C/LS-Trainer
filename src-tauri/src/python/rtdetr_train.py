@@ -493,15 +493,33 @@ def main():
     weights_dir = os.path.join(output_dir, "weights")
     os.makedirs(weights_dir, exist_ok=True)
 
-    for epoch in range(1, epochs + 1):
-        epoch_start_time = time.time()
-        print(f"Epoch {epoch}/{epochs} - RT-DETR (v2-R18) training on {device_req}...", flush=True)
+    stop_file = os.path.join(output_dir, ".stop_requested")
+    if os.path.exists(stop_file):
+        try:
+            os.remove(stop_file)
+        except Exception:
+            pass
 
-        model.train()
-        total_loss = 0.0
-        num_batches = 0
+    user_stopped = False
+    try:
+        for epoch in range(1, epochs + 1):
+            if os.path.exists(stop_file):
+                print(f"[LS-Trainer] Stop requested by user before epoch {epoch}. Stopping gracefully...", flush=True)
+                user_stopped = True
+                break
 
-        for pixel_values, labels in train_loader:
+            epoch_start_time = time.time()
+            print(f"Epoch {epoch}/{epochs} - {model_name} training on {device_req}...", flush=True)
+
+            model.train()
+            total_loss = 0.0
+            num_batches = 0
+
+            for pixel_values, labels in train_loader:
+                if os.path.exists(stop_file):
+                    print(f"[LS-Trainer] Stop requested by user at epoch {epoch}. Stopping gracefully...", flush=True)
+                    user_stopped = True
+                    break
             pixel_values = pixel_values.to(torch_device)
             # Move targets to device
             device_labels = []
@@ -568,6 +586,14 @@ def main():
         print(f"[LS-Trainer Epoch] Epoch {epoch}/{epochs} finished in {dur:.1f}s - {metrics_str}", flush=True)
         print(f"Epoch {epoch}/{epochs} finished", flush=True)
         print(f"[LS-Trainer Metrics] Epoch {epoch}/{epochs} | {metrics_str}", flush=True)
+
+        if user_stopped or os.path.exists(stop_file):
+            print(f"[LS-Trainer] RT-DETR training stopped by user. Checkpoints preserved at: {output_dir}", flush=True)
+            user_stopped = True
+            break
+    except KeyboardInterrupt:
+        print("[LS-Trainer] Training interrupted by user.", flush=True)
+        user_stopped = True
 
     # Save final training_config.json
     final_config = {

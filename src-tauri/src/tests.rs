@@ -3,7 +3,9 @@
 use crate::dataset::labels::{LabelStats, result_from_stats, scan_coco_json_text, scan_label_text, scan_tar_archive};
 use crate::hardware::{compute_recommended_workers, is_intel_arc_gpu, select_pytorch_wheel};
 use crate::models::TrainingRequest;
-use crate::rfdetr::{resolve_rfdetr_class_and_pretrain, snap_rfdetr_resolution};
+use crate::rfdetr::{
+    resolve_rfdetr_class_and_pretrain, snap_rfdetr_resolution, verify_rfdetr_dependencies,
+};
 use crate::rtdetr::{
     find_rtdetr_checkpoint_in_dir, is_rtdetr_request, is_rtdetr_run_dir, resolve_rtdetr_model_meta,
 };
@@ -112,6 +114,24 @@ fn rfdetr_resolution_snapping_and_model_mapping() {
         resolve_rfdetr_class_and_pretrain("rf-detr-seg-small", "segment");
     assert_eq!(cls_seg, "RFDETRSegSmall");
     assert_eq!(snap_rfdetr_resolution(640, block_seg), 648);
+}
+
+#[test]
+fn rfdetr_dependency_verification() {
+    let project_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let result = verify_rfdetr_dependencies(&project_root);
+    assert!(
+        result.is_ok(),
+        "Expected torch_linear_assignment to be verified in venv: {:?}",
+        result
+    );
+
+    let bogus_root = std::env::temp_dir().join(format!("ls_trainer_bogus_{}", std::process::id()));
+    let bogus_result = verify_rfdetr_dependencies(&bogus_root);
+    assert!(bogus_result.is_err(), "Expected failure when .venv is missing");
 }
 
 #[test]
@@ -279,4 +299,73 @@ fn rtdetr_model_meta_resolution() {
     let (wx_alias, lx_alias) = resolve_rtdetr_model_meta("rtdetr-x");
     assert_eq!(wx_alias, "PekingU/rtdetr_v2_r101vd");
     assert_eq!(lx_alias, "RT-DETR-X");
+}
+
+#[test]
+fn test_training_stop_lifecycle() {
+    tauri::async_runtime::block_on(async {
+        use crate::training::{
+            clear_active_training, is_stop_requested, register_active_training,
+            stop_training,
+        };
+
+        let temp_run_dir = std::env::temp_dir().join("ls_trainer_test_run");
+        let _ = std::fs::create_dir_all(&temp_run_dir);
+
+        // Initial state: not stopped
+        clear_active_training();
+        assert!(!is_stop_requested());
+
+        // Register active training
+        register_active_training(temp_run_dir.clone());
+        assert!(!is_stop_requested());
+
+        // Stop training
+        let stopped = stop_training().await.expect("stop_training call failed");
+        assert!(stopped);
+        assert!(is_stop_requested());
+
+        // Verify .stop_requested file exists in run dir
+        assert!(temp_run_dir.join(".stop_requested").is_file());
+
+        // Clear active training
+        clear_active_training();
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&temp_run_dir);
+    });
+}
+
+#[tokio::test]
+async fn test_training_stop_lifecycle() {
+    use std::path::PathBuf;
+    use crate::training::{
+        clear_active_training, is_stop_requested, register_active_training, register_child_pid,
+        stop_training,
+    };
+
+    let temp_run_dir = std::env::temp_dir().join("ls_trainer_test_run");
+    let _ = std::fs::create_dir_all(&temp_run_dir);
+
+    // Initial state: not stopped
+    clear_active_training();
+    assert!(!is_stop_requested());
+
+    // Register active training
+    register_active_training(temp_run_dir.clone());
+    assert!(!is_stop_requested());
+
+    // Stop training
+    let stopped = stop_training().await.expect("stop_training call failed");
+    assert!(stopped);
+    assert!(is_stop_requested());
+
+    // Verify .stop_requested file exists in run dir
+    assert!(temp_run_dir.join(".stop_requested").is_file());
+
+    // Clear active training
+    clear_active_training();
+
+    // Clean up
+    let _ = std::fs::remove_dir_all(&temp_run_dir);
 }

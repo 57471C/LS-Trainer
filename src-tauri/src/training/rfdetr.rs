@@ -9,8 +9,11 @@ use crate::dataset::labels::inspect_label_tree;
 use crate::hardware::{detect_gpu_info, resolve_dataloader_workers};
 use crate::models::{TrainingRequest, TrainingResponse};
 use crate::process::{get_venv_python, hide_console_window, stream_child_output};
-use crate::rfdetr::{ensure_rfdetr_installed, resolve_rfdetr_class_and_pretrain, snap_rfdetr_resolution};
-use crate::training::{extract_final_metrics_from_results_dir, log_final_metrics, save_run_config_metadata};
+use crate::rfdetr::{
+    ensure_rfdetr_installed, resolve_rfdetr_class_and_pretrain, snap_rfdetr_resolution,
+    verify_rfdetr_dependencies,
+};
+use crate::training::{extract_final_metrics_from_results_dir, is_stop_requested, log_final_metrics, register_child_pid, save_run_config_metadata, unregister_child_pid};
 
 pub(crate) async fn start_rfdetr_training(
     project_root: PathBuf,
@@ -37,6 +40,10 @@ pub(crate) async fn start_rfdetr_training(
     }
 
     ensure_rfdetr_installed(&project_root, &on_log);
+    if let Err(err_msg) = verify_rfdetr_dependencies(&project_root) {
+        let _ = on_log.send(format!("[LS-Trainer Error] {err_msg}"));
+        return Err(err_msg);
+    }
 
     let (rfdetr_class, default_weights_name, block_size) =
         resolve_rfdetr_class_and_pretrain(&request.model_choice, &yolo_task);
@@ -166,11 +173,14 @@ pub(crate) async fn start_rfdetr_training(
 
     match cmd.spawn() {
         Ok(mut child) => {
+            register_child_pid(child.id());
             stream_child_output(&mut child, &on_log);
 
             let status = child
                 .wait()
                 .map_err(|e| format!("Failed while waiting for RF-DETR process: {e}"))?;
+
+            unregister_child_pid();
 
             save_run_config_metadata(
                 &abs_results_dir,
@@ -183,6 +193,19 @@ pub(crate) async fn start_rfdetr_training(
             );
 
             let (map50, map50_95) = extract_final_metrics_from_results_dir(&abs_results_dir);
+
+            if is_stop_requested() {
+                let _ = on_log.send(format!(
+                    "[LS-Trainer] Training stopped by user. Checkpoints preserved at: {results_dir}"
+                ));
+                return Ok(TrainingResponse {
+                    success: false,
+                    results_dir,
+                    message: "Stopped by user".to_string(),
+                    map50,
+                    map50_95,
+                });
+            }
 
             if status.success() {
                 log_final_metrics(&on_log, map50, map50_95);

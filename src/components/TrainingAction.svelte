@@ -21,6 +21,8 @@ interface TrainingActionProps {
 	finalMetrics: FinalMetrics;
 	hasLogs: boolean;
 	onOpenLogPanel: () => void;
+	isStoppingTraining?: boolean;
+	onStopTraining?: () => void;
 }
 
 let {
@@ -42,6 +44,8 @@ let {
 	finalMetrics,
 	hasLogs,
 	onOpenLogPanel,
+	isStoppingTraining = false,
+	onStopTraining,
 }: TrainingActionProps = $props();
 </script>
 
@@ -77,6 +81,28 @@ let {
 					<span class="font-mono text-xs font-medium text-amber-400/90">
 						{epochProgressPercent}%
 					</span>
+					{#if isTraining}
+						<button
+							type="button"
+							onclick={onStopTraining}
+							disabled={isStoppingTraining}
+							class="inline-flex items-center gap-1.5 rounded border border-rose-500/50 bg-rose-500/20 px-2.5 py-1 text-xs font-semibold text-rose-300 shadow-sm transition hover:bg-rose-500/30 hover:border-rose-500/70 hover:text-rose-200 disabled:cursor-not-allowed disabled:opacity-50 active:scale-[0.98]"
+							title="Stop training run gracefully"
+						>
+							{#if isStoppingTraining}
+								<svg class="h-3.5 w-3.5 animate-spin text-rose-300" viewBox="0 0 24 24" fill="none">
+									<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+									<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+								</svg>
+								<span>Stopping...</span>
+							{:else}
+								<svg class="h-3.5 w-3.5 text-rose-400" viewBox="0 0 20 20" fill="currentColor">
+									<rect x="5" y="5" width="10" height="10" rx="1.5" />
+								</svg>
+								<span>Stop training</span>
+							{/if}
+						</button>
+					{/if}
 				</div>
 			</div>
 			<div class="truncate font-mono text-[11px] text-zinc-300/90" title={activeRunConfigBanner}>
@@ -112,6 +138,12 @@ let {
 				<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
 			</svg>
 			<span class="font-medium text-zinc-950">Exporting ONNX...</span>
+		{:else if isStoppingTraining}
+			<svg class="h-4 w-4 animate-spin text-zinc-950" aria-hidden="true" fill="none" viewBox="0 0 24 24">
+				<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+				<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+			</svg>
+			<span class="font-medium text-zinc-950">Stopping training...</span>
 		{:else if isTraining}
 			<svg class="h-4 w-4 animate-spin text-zinc-950" aria-hidden="true" fill="none" viewBox="0 0 24 24">
 				<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
@@ -135,7 +167,7 @@ let {
 <!-- Status Line -->
 <div class="flex items-center justify-between border-t border-zinc-800/60 pt-4 text-xs text-zinc-400">
 	<div class="flex items-center gap-2">
-		<span class={`h-2 w-2 rounded-full ${isTraining || isRepairingCuda ? "bg-amber-400 animate-pulse shadow-[0_0_8px_rgba(245,158,11,0.8)]" : isTorchReady ? "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]" : "bg-amber-500/80 shadow-[0_0_6px_rgba(245,158,11,0.6)]"}`}></span>
+		<span class={`h-2 w-2 rounded-full ${isStoppingTraining ? "bg-rose-400 animate-pulse shadow-[0_0_8px_rgba(244,63,94,0.8)]" : isTraining || isRepairingCuda ? "bg-amber-400 animate-pulse shadow-[0_0_8px_rgba(245,158,11,0.8)]" : isTorchReady ? "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]" : "bg-amber-500/80 shadow-[0_0_6px_rgba(245,158,11,0.6)]"}`}></span>
 		<span>{statusMessage}</span>
 	</div>
 	{#if (hasLogs || isTraining || isRepairingCuda) && !isLogPanelOpen}

@@ -98,6 +98,16 @@ def main():
     os.makedirs(models_dir, exist_ok=True)
     os.chdir(models_dir)
 
+    try:
+        import torch_linear_assignment
+    except ImportError:
+        print(
+            "[LS-Trainer Error] Missing required dependency 'torch-linear-assignment' needed for RF-DETR Hungarian matching. "
+            "Please install it in your environment: pip install torch-linear-assignment",
+            flush=True,
+        )
+        sys.exit(1)
+
     import torch
     import rfdetr
     import rfdetr.detr as rf_detr_mod
@@ -201,7 +211,22 @@ def main():
                 flush=True,
             )
 
+        def _check_stop_requested(self, trainer):
+            stop_file = os.path.join(output_dir, ".stop_requested")
+            if os.path.exists(stop_file):
+                print("[LS-Trainer] Stop requested by user. Finishing current step...", flush=True)
+                trainer.should_stop = True
+                return True
+            return False
+
+        def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+            self._check_stop_requested(trainer)
+
+        def on_train_epoch_end(self, trainer, pl_module):
+            self._check_stop_requested(trainer)
+
         def on_train_epoch_start(self, trainer, pl_module):
+            self._check_stop_requested(trainer)
             ep = int(trainer.current_epoch) + 1
             total = int(trainer.max_epochs)
             print(f"Epoch {ep}/{total} - RF-DETR ({class_name}) training on {device}...", flush=True)
@@ -305,7 +330,13 @@ def main():
         train_kwargs["lr_encoder"] = 0.0
 
     print(f"Epoch 1/{epochs} - Starting RF-DETR training loop on device={device} (num_workers={num_workers})...", flush=True)
-    model.train(**train_kwargs)
+    try:
+        model.train(**train_kwargs)
+    except KeyboardInterrupt:
+        print("[LS-Trainer] Training interrupted by user.", flush=True)
+
+    if os.path.exists(os.path.join(output_dir, ".stop_requested")):
+        print(f"[LS-Trainer] RF-DETR training stopped by user. Checkpoints preserved at: {output_dir}", flush=True)
 
     metrics_file = os.path.join(output_dir, "ls_trainer_metrics.json")
     with open(metrics_file, "w", encoding="utf-8") as mf:
