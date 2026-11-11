@@ -47,6 +47,7 @@ Thumbs.db
 *.sw?
 
 # Secrets / local config
+ls_trainer_settings.json
 .env
 .env.*
 !.env.example

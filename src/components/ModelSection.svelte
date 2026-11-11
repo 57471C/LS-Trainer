@@ -26,9 +26,9 @@ interface ModelSectionProps {
 
 let {
 	modelMode = $bindable("fresh"),
-	selectedFamily = $bindable("YOLO"),
+	selectedFamily = $bindable("RF-DETR"),
 	showSegmentationModels = $bindable(false),
-	freshModel = $bindable("yolo11m.pt"),
+	freshModel = $bindable("rf-detr-medium"),
 	trainTask = $bindable("detect"),
 	existingModelPath = $bindable(""),
 	existingModelFileName = $bindable(""),
@@ -87,7 +87,10 @@ const visibleModelGroups = $derived.by(() => {
 	return groups;
 });
 
-function selectModelFamily(family: ModelFamily) {
+let licenceDialog: HTMLDialogElement | undefined = $state();
+let yoloPromptTimer: ReturnType<typeof setTimeout> | undefined;
+
+function applyModelFamily(family: ModelFamily) {
 	if (isTraining) return;
 	selectedFamily = family;
 	const meta = modelFamilies.find((f) => f.id === family) ?? modelFamilies[0];
@@ -116,6 +119,35 @@ function selectModelFamily(family: ModelFamily) {
 			trainTask = "detect";
 		}
 	}
+}
+
+function selectModelFamily(family: ModelFamily) {
+	if (isTraining) return;
+	if (family === "YOLO" && selectedFamily !== "YOLO") {
+		if (yoloPromptTimer !== undefined || licenceDialog?.open) return;
+		// Open after this click so the same event cannot dismiss or accept the dialog.
+		yoloPromptTimer = setTimeout(() => {
+			yoloPromptTimer = undefined;
+			if (selectedFamily === "YOLO" || !licenceDialog || licenceDialog.open) return;
+			licenceDialog.showModal();
+		}, 0);
+		return;
+	}
+	if (yoloPromptTimer !== undefined) {
+		clearTimeout(yoloPromptTimer);
+		yoloPromptTimer = undefined;
+	}
+	if (licenceDialog?.open) licenceDialog.close();
+	applyModelFamily(family);
+}
+
+function confirmYoloSelection() {
+	applyModelFamily("YOLO");
+	licenceDialog?.close();
+}
+
+function cancelYoloSelection() {
+	if (licenceDialog?.open) licenceDialog.close();
 }
 
 function toggleShowSegmentationModels(nextValue: boolean) {
@@ -614,4 +646,42 @@ function clearExistingModel() {
 		{/if}
 	</div>
 </section>
+
+<dialog
+	bind:this={licenceDialog}
+	aria-labelledby="yolo-licence-title"
+	class="w-[min(32rem,calc(100%-2rem))] rounded-xl border border-zinc-700/80 bg-zinc-900 p-5 text-zinc-100 shadow-2xl backdrop:bg-black/60"
+	onclick={(e) => {
+		if (e.target === e.currentTarget) cancelYoloSelection();
+	}}
+	oncancel={(e) => {
+		e.preventDefault();
+		// Close after the cancel event. Closing inside it is ignored once preventDefault runs.
+		queueMicrotask(() => cancelYoloSelection());
+	}}
+>
+	<h2 id="yolo-licence-title" class="text-sm font-semibold tracking-wide text-zinc-100 uppercase">
+		Ultralytics YOLO licence
+	</h2>
+	<p class="mt-3 text-sm leading-relaxed text-zinc-300">
+		Ultralytics YOLO models are licensed under AGPL-3.0. Commercial use typically requires a
+		separate licence, or open-sourcing this application.
+	</p>
+	<div class="mt-5 flex justify-end gap-2">
+		<button
+			type="button"
+			onclick={cancelYoloSelection}
+			class="rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-400 hover:bg-zinc-800"
+		>
+			Cancel
+		</button>
+		<button
+			type="button"
+			onclick={confirmYoloSelection}
+			class="rounded-md bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-500"
+		>
+			Click to continue
+		</button>
+	</div>
+</dialog>
 

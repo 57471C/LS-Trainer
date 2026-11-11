@@ -13,12 +13,31 @@
 	let draft = $state("");
 	let saving = $state(false);
 	let error = $state<string | null>(null);
+	let panel: HTMLDivElement | undefined = $state();
+	let acceptBackdropClose = $state(false);
+	// Plain flag so a later dataDirectory update cannot wipe an in-progress edit.
+	let seeded = false;
 
 	$effect(() => {
 		if (open) {
-			draft = dataDirectory;
-			error = null;
+			if (!seeded) {
+				draft = dataDirectory;
+				error = null;
+				seeded = true;
+				panel?.focus();
+			}
+		} else {
+			seeded = false;
+			acceptBackdropClose = false;
 		}
+	});
+
+	$effect(() => {
+		if (!open) return;
+		const timer = setTimeout(() => {
+			acceptBackdropClose = true;
+		}, 0);
+		return () => clearTimeout(timer);
 	});
 
 	async function pickFolder() {
@@ -56,21 +75,33 @@
 	}
 </script>
 
+<svelte:window
+	onkeydown={(e) => {
+		if (!open || e.key !== "Escape") return;
+		e.preventDefault();
+		onClose();
+	}}
+/>
+
 {#if open}
 	<div
 		class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
-		onclick={onClose}
-		onkeydown={(e) => e.key === "Escape" && onClose()}
-		role="dialog"
-		aria-modal="true"
+		role="presentation"
+		onclick={(e) => {
+			if (!acceptBackdropClose || e.target !== e.currentTarget) return;
+			onClose();
+		}}
 	>
 		<div
+			bind:this={panel}
 			class="w-full max-w-lg rounded-xl border border-zinc-700/80 bg-zinc-900 p-5 shadow-2xl"
-			onclick|stopPropagation
-			onkeydown|stopPropagation
+			role="dialog"
+			aria-modal="true"
+			aria-labelledby="settings-title"
+			tabindex="-1"
 		>
 			<div class="mb-4 flex items-center justify-between">
-				<h2 class="text-sm font-semibold tracking-wide text-zinc-100 uppercase">Settings</h2>
+				<h2 id="settings-title" class="text-sm font-semibold tracking-wide text-zinc-100 uppercase">Settings</h2>
 				<button
 					type="button"
 					onclick={onClose}
@@ -80,16 +111,17 @@
 				</button>
 			</div>
 
-			<label class="mb-1 block text-xs font-medium text-zinc-400">
+			<label for="data-directory-input" class="mb-1 block text-xs font-medium text-zinc-400">
 				Data directory (runs & extraction)
 			</label>
 			<p class="mb-2 text-[11px] leading-relaxed text-zinc-500">
 				Leave empty to use the project folder. When set, training outputs go to
-				<code class="text-zinc-400"><data>/runs/<task>/<run></code>.
+				<code class="text-zinc-400">{'<data>/runs/<task>/<run>'}</code>.
 			</p>
 
 			<div class="mb-3 flex gap-2">
 				<input
+					id="data-directory-input"
 					type="text"
 					bind:value={draft}
 					placeholder="/mnt/datasets"
@@ -126,7 +158,7 @@
 				</button>
 				<button
 					type="button"
-				onclick={save}
+					onclick={save}
 					disabled={saving}
 					class="rounded-md bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-500 disabled:opacity-50"
 				>

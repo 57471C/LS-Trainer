@@ -40,7 +40,10 @@ const { isLogPanelOpen, isTraining, logCount, onToggleLogPanel, onOpenSettings }
 		{/if}
 		<button
 			type="button"
-			onclick={onOpenSettings}
+			onclick={(event) => {
+				event.stopPropagation();
+				onOpenSettings();
+			}}
 			title="Settings"
 			class="flex h-7 w-7 items-center justify-center rounded-md border border-zinc-700/60 bg-zinc-800/80 text-zinc-400 transition hover:bg-zinc-700 hover:text-zinc-100"
 		>

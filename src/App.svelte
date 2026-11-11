@@ -104,7 +104,20 @@ let onnxPath = $state<string | null>(null);
 let onnxError = $state<string | null>(null);
 let isLogPanelOpen = $state<boolean>(false);
 let settingsOpen = $state<boolean>(false);
+let settingsLoaded = $state<boolean>(false);
 let dataDirectory = $state<string>("");
+let openSettingsWhenReady = false;
+
+function openSettings() {
+	if (!settingsLoaded) {
+		openSettingsWhenReady = true;
+		return;
+	}
+	// The gear click must finish before the backdrop exists, or it closes the modal.
+	setTimeout(() => {
+		settingsOpen = true;
+	}, 0);
+}
 
 // Progress & Metrics
 let currentEpoch = $state<number>(0);
@@ -500,6 +513,12 @@ onMount(async () => {
 			dataDirectory = s.data_directory ?? "";
 		} catch (e) {
 			console.warn("Failed to load settings:", e);
+		} finally {
+			settingsLoaded = true;
+			if (openSettingsWhenReady) {
+				openSettingsWhenReady = false;
+				openSettings();
+			}
 		}
 		isCheckingGpu = true;
 		statusMessage = "Checking GPU and PyTorch environment…";
@@ -523,6 +542,11 @@ onMount(async () => {
 			isCheckingGpu = false;
 		}
 	} else {
+		settingsLoaded = true;
+		if (openSettingsWhenReady) {
+			openSettingsWhenReady = false;
+			openSettings();
+		}
 		isCheckingGpu = false;
 	}
 });
@@ -824,9 +848,7 @@ async function handleExportToOnnx() {
 		onToggleLogPanel={() => {
 			isLogPanelOpen = !isLogPanelOpen;
 		}}
-		onOpenSettings={() => {
-			settingsOpen = true;
-		}}
+		onOpenSettings={openSettings}
 	/>
 
 	<!-- Main Workspace Split -->

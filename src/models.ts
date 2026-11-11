@@ -12,16 +12,6 @@ export const STORAGE_KEY_FRESH_MODEL_PREFIX = "ls_trainer.fresh_model.";
 
 export const modelFamilies: ModelFamilyInfo[] = [
 	{
-		id: "YOLO",
-		label: "YOLO",
-		vendor: "Ultralytics",
-		badge: "Active",
-		supported: true,
-		defaultDetectModel: "yolo11m.pt",
-		defaultSegModel: "yolo11s-seg.pt",
-		description: "Ultralytics YOLO11 & YOLO26 detection and segmentation",
-	},
-	{
 		id: "RF-DETR",
 		label: "RF-DETR",
 		vendor: "Roboflow",
@@ -50,6 +40,16 @@ export const modelFamilies: ModelFamilyInfo[] = [
 		defaultDetectModel: "yolox-s",
 		defaultSegModel: null,
 		description: "Anchor-free decoupled-head detector (Apache 2.0)",
+	},
+	{
+		id: "YOLO",
+		label: "YOLO",
+		vendor: "Ultralytics",
+		badge: "Active",
+		supported: true,
+		defaultDetectModel: "yolo11m.pt",
+		defaultSegModel: "yolo11s-seg.pt",
+		description: "Ultralytics YOLO11 & YOLO26 detection and segmentation",
 	},
 ];
 
@@ -360,7 +360,7 @@ export const freshModelOptions: FreshModelOption[] = [
 ];
 
 export function loadSavedFamily(): ModelFamily {
-	if (typeof window === "undefined") return "YOLO";
+	if (typeof window === "undefined") return "RF-DETR";
 	try {
 		const raw = window.localStorage.getItem(STORAGE_KEY_FAMILY);
 		if (
@@ -374,7 +374,7 @@ export function loadSavedFamily(): ModelFamily {
 	} catch {
 		// ignore localStorage read errors
 	}
-	return "YOLO";
+	return "RF-DETR";
 }
 
 export function loadSavedShowSeg(): boolean {

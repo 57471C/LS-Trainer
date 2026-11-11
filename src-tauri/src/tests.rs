@@ -335,3 +335,46 @@ fn test_training_stop_lifecycle() {
         let _ = std::fs::remove_dir_all(&temp_run_dir);
     });
 }
+
+#[test]
+fn data_directory_survives_reload_and_sets_runs_base() {
+    use crate::settings::{
+        apply_data_directory, read_settings_file, resolve_runs_base, write_settings_file, AppSettings,
+    };
+
+    let temp = std::env::temp_dir().join(format!(
+        "ls_trainer_settings_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&temp);
+    std::fs::create_dir_all(&temp).unwrap();
+    let settings_file = temp.join("ls_trainer_settings.json");
+    let data_dir = temp.join("datasets");
+    let project_root = temp.join("project");
+
+    let mut settings = AppSettings::default();
+    apply_data_directory(&mut settings, data_dir.to_str().unwrap()).unwrap();
+    write_settings_file(&settings_file, &settings).unwrap();
+
+    // Restart: drop the in-memory value and read the file again.
+    let loaded = read_settings_file(&settings_file);
+    assert_eq!(loaded.data_directory, settings.data_directory);
+    assert_eq!(
+        resolve_runs_base(&loaded, &project_root),
+        std::path::PathBuf::from(&loaded.data_directory)
+    );
+    assert!(data_dir.is_dir());
+
+    let mut cleared = loaded.clone();
+    apply_data_directory(&mut cleared, "  ").unwrap();
+    assert!(cleared.data_directory.is_empty());
+    assert_eq!(resolve_runs_base(&cleared, &project_root), project_root);
+
+    let mut relative = AppSettings::default();
+    let err = apply_data_directory(&mut relative, "relative/runs").unwrap_err();
+    assert!(err.to_lowercase().contains("absolute"));
+    assert!(relative.data_directory.is_empty());
+    assert_eq!(resolve_runs_base(&relative, &project_root), project_root);
+
+    let _ = std::fs::remove_dir_all(&temp);
+}
