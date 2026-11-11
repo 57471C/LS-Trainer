@@ -9,6 +9,7 @@
 //! - `training`  – `start_training` (YOLO and RF-DETR backends)
 //! - `export`    – `export_to_onnx` (YOLO and RF-DETR backends)
 //! - `dialogs`   – file pickers and open-folder
+//! - `settings`  – persistent data directory for runs / extraction
 //!
 //! Embedded Python runners live in `src/python/` and are compiled in with `include_str!`.
 
@@ -20,6 +21,7 @@ mod models;
 mod process;
 mod rfdetr;
 mod rtdetr;
+mod settings;
 mod training;
 
 #[cfg(test)]
@@ -53,7 +55,9 @@ pub fn run() {
             dialogs::open_folder,
             export::export_to_onnx,
             hardware::get_gpu_info,
-            hardware::repair_cuda
+            hardware::repair_cuda,
+            settings::get_settings,
+            settings::set_data_directory
         ])
         .run(tauri::generate_context!())
         .expect("error while building tauri application");
