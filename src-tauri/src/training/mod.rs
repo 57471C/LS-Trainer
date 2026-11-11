@@ -13,6 +13,7 @@ use tauri::ipc::Channel;
 use crate::models::{TrainingRequest, TrainingResponse};
 use crate::process::{get_project_root, hide_console_window, send_break_signal, to_display_path};
 use crate::rtdetr::is_rtdetr_request;
+use crate::settings::runs_base_dir;
 use crate::training::rfdetr::start_rfdetr_training;
 use crate::training::rtdetr::start_rtdetr_training;
 use crate::training::yolo::start_yolo_training;
@@ -124,12 +125,19 @@ pub async fn start_training(
 
     let project_root = get_project_root();
     let yolo_task = resolve_train_task(&request);
-    let project_runs_dir = project_root.join("runs").join(&yolo_task);
+
+    // Prefer configured data directory for runs; fall back to project root.
+    let base = runs_base_dir();
+    let project_runs_dir = base.join("runs").join(&yolo_task);
     let abs_results_dir = project_runs_dir.join(&run_name);
     let results_dir = to_display_path(&abs_results_dir);
 
     let _ = on_log.send(format!(
         "[LS-Trainer] Initializing training run '{run_name}'..."
+    ));
+    let _ = on_log.send(format!(
+        "[LS-Trainer] Results directory: {}",
+        results_dir
     ));
 
     let dataset_input = PathBuf::from(&request.dataset_path);
