@@ -9,6 +9,7 @@ import ModelSection from "./components/ModelSection.svelte";
 import OutputSection from "./components/OutputSection.svelte";
 import ParametersSection from "./components/ParametersSection.svelte";
 import TrainingAction from "./components/TrainingAction.svelte";
+import SettingsModal from "./components/SettingsModal.svelte";
 import {
 	freshModelOptions,
 	loadSavedFamily,
@@ -102,6 +103,8 @@ let isExportingOnnx = $state<boolean>(false);
 let onnxPath = $state<string | null>(null);
 let onnxError = $state<string | null>(null);
 let isLogPanelOpen = $state<boolean>(false);
+let settingsOpen = $state<boolean>(false);
+let dataDirectory = $state<string>("");
 
 // Progress & Metrics
 let currentEpoch = $state<number>(0);
@@ -492,6 +495,12 @@ async function handleRepairCuda() {
 
 onMount(async () => {
 	if (isTauri()) {
+		try {
+			const s = await invoke<{ data_directory: string }>("get_settings");
+			dataDirectory = s.data_directory ?? "";
+		} catch (e) {
+			console.warn("Failed to load settings:", e);
+		}
 		isCheckingGpu = true;
 		statusMessage = "Checking GPU and PyTorch environment…";
 		try {
@@ -815,6 +824,9 @@ async function handleExportToOnnx() {
 		onToggleLogPanel={() => {
 			isLogPanelOpen = !isLogPanelOpen;
 		}}
+		onOpenSettings={() => {
+			settingsOpen = true;
+		}}
 	/>
 
 	<!-- Main Workspace Split -->
@@ -959,4 +971,12 @@ async function handleExportToOnnx() {
 			onExportOnnx={handleExportToOnnx}
 		/>
 	</div>
+
+	<SettingsModal
+		open={settingsOpen}
+		onClose={() => { settingsOpen = false; }}
+		{dataDirectory}
+		onSaved={(path) => { dataDirectory = path; }}
+	/>
 </div>
+
