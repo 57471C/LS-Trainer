@@ -288,7 +288,8 @@ if xpu_avail:
             dev_names.append(torch.xpu.get_device_name(i))
         except Exception:
             dev_names.append(f"XPU:{i}")
-    active_device = f"Intel Arc XPU ({cnt} device(s): { \", \".join(dev_names) })"
+    names = ", ".join(dev_names)
+    active_device = f"Intel Arc XPU ({cnt} device(s): {names})"
     # Kernel test
     try:
         t = torch.zeros(2, 2, device="xpu") + 1
@@ -299,7 +300,8 @@ if xpu_avail:
 elif cuda_avail:
     cnt = torch.cuda.device_count()
     dev_names = [torch.cuda.get_device_name(i) for i in range(cnt)]
-    active_device = f"NVIDIA CUDA ({cnt} device(s): { \", \".join(dev_names) })"
+    names = ", ".join(dev_names)
+    active_device = f"NVIDIA CUDA ({cnt} device(s): {names})"
     # Kernel test
     try:
         t = torch.zeros(2, 2, device="cuda") + 1
