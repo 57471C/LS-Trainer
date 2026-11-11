@@ -394,9 +394,7 @@ export function loadSavedFreshModel(family: ModelFamily): BaseModelId | null {
 			window.localStorage.getItem(STORAGE_KEY_FRESH_MODEL);
 		if (
 			saved &&
-			freshModelOptions.some(
-				(o) => o.id === saved && o.family === family,
-			)
+			freshModelOptions.some((o) => o.id === saved && o.family === family)
 		) {
 			return saved as BaseModelId;
 		}

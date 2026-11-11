@@ -1,6 +1,10 @@
 <script lang="ts">
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import { freshModelOptions, loadSavedFreshModel, modelFamilies } from "../models";
+import {
+	freshModelOptions,
+	loadSavedFreshModel,
+	modelFamilies,
+} from "../models";
 import type { BaseModelId, ModelFamily, ModelMode, TrainTask } from "../types";
 import { normalizePath } from "../utils";
 
@@ -105,7 +109,9 @@ function applyModelFamily(family: ModelFamily) {
 		const found = freshModelOptions.find((o) => o.id === savedModel);
 		if (found) {
 			trainTask =
-				found.task === "segment" || /-seg/i.test(found.id) ? "segment" : "detect";
+				found.task === "segment" || /-seg/i.test(found.id)
+					? "segment"
+					: "detect";
 		}
 	} else if (!allowed.some((o) => o.id === freshModel)) {
 		if (
@@ -128,7 +134,8 @@ function selectModelFamily(family: ModelFamily) {
 		// Open after this click so the same event cannot dismiss or accept the dialog.
 		yoloPromptTimer = setTimeout(() => {
 			yoloPromptTimer = undefined;
-			if (selectedFamily === "YOLO" || !licenceDialog || licenceDialog.open) return;
+			if (selectedFamily === "YOLO" || !licenceDialog || licenceDialog.open)
+				return;
 			licenceDialog.showModal();
 		}, 0);
 		return;

@@ -8,8 +8,8 @@ import LogPanel from "./components/LogPanel.svelte";
 import ModelSection from "./components/ModelSection.svelte";
 import OutputSection from "./components/OutputSection.svelte";
 import ParametersSection from "./components/ParametersSection.svelte";
-import TrainingAction from "./components/TrainingAction.svelte";
 import SettingsModal from "./components/SettingsModal.svelte";
+import TrainingAction from "./components/TrainingAction.svelte";
 import {
 	freshModelOptions,
 	loadSavedFamily,

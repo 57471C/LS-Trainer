@@ -1,78 +1,81 @@
 <script lang="ts">
-	import { invoke, isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 
-	interface Props {
-		open: boolean;
-		onClose: () => void;
-		dataDirectory: string;
-		onSaved: (path: string) => void;
-	}
+interface Props {
+	open: boolean;
+	onClose: () => void;
+	dataDirectory: string;
+	onSaved: (path: string) => void;
+}
 
-	const { open, onClose, dataDirectory, onSaved }: Props = $props();
+const { open, onClose, dataDirectory, onSaved }: Props = $props();
 
-	let draft = $state("");
-	let saving = $state(false);
-	let error = $state<string | null>(null);
-	let panel: HTMLDivElement | undefined = $state();
-	let acceptBackdropClose = $state(false);
-	// Plain flag so a later dataDirectory update cannot wipe an in-progress edit.
-	let seeded = false;
+let draft = $state("");
+let saving = $state(false);
+let error = $state<string | null>(null);
+let panel: HTMLDivElement | undefined = $state();
+let acceptBackdropClose = $state(false);
+// Plain flag so a later dataDirectory update cannot wipe an in-progress edit.
+let seeded = false;
 
-	$effect(() => {
-		if (open) {
-			if (!seeded) {
-				draft = dataDirectory;
-				error = null;
-				seeded = true;
-				panel?.focus();
-			}
-		} else {
-			seeded = false;
-			acceptBackdropClose = false;
+$effect(() => {
+	if (open) {
+		if (!seeded) {
+			draft = dataDirectory;
+			error = null;
+			seeded = true;
+			panel?.focus();
 		}
-	});
-
-	$effect(() => {
-		if (!open) return;
-		const timer = setTimeout(() => {
-			acceptBackdropClose = true;
-		}, 0);
-		return () => clearTimeout(timer);
-	});
-
-	async function pickFolder() {
-		if (!isTauri()) return;
-		try {
-			const picked = await invoke<string | null>("pick_dataset_folder");
-			if (picked) draft = picked;
-		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
-		}
+	} else {
+		seeded = false;
+		acceptBackdropClose = false;
 	}
+});
 
-	function useDefaultMount() {
-		draft = "/mnt/datasets";
+$effect(() => {
+	if (!open) return;
+	const timer = setTimeout(() => {
+		acceptBackdropClose = true;
+	}, 0);
+	return () => clearTimeout(timer);
+});
+
+async function pickFolder() {
+	if (!isTauri()) return;
+	try {
+		const picked = await invoke<string | null>("pick_dataset_folder");
+		if (picked) draft = picked;
+	} catch (e) {
+		error = e instanceof Error ? e.message : String(e);
 	}
+}
 
-	async function save() {
-		saving = true;
-		error = null;
-		try {
-			if (isTauri()) {
-				const result = await invoke<{ data_directory: string }>("set_data_directory", {
+function useDefaultMount() {
+	draft = "/mnt/datasets";
+}
+
+async function save() {
+	saving = true;
+	error = null;
+	try {
+		if (isTauri()) {
+			const result = await invoke<{ data_directory: string }>(
+				"set_data_directory",
+				{
 					path: draft.trim(),
-				});
-				onSaved(result.data_directory);
-			} else {
-				onSaved(draft.trim());
-			}
-			onClose();
-		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
-		} finally {
-			saving = false;
+				},
+			);
+			onSaved(result.data_directory);
+		} else {
+			onSaved(draft.trim());
 		}
+		onClose();
+	} catch (e) {
+		error = e instanceof Error ? e.message : String(e);
+	} finally {
+		saving = false;
 	}
+}
 </script>
 
 <svelte:window

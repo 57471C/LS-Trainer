@@ -7,8 +7,13 @@ interface HeaderProps {
 	onOpenSettings: () => void;
 }
 
-const { isLogPanelOpen, isTraining, logCount, onToggleLogPanel, onOpenSettings }: HeaderProps =
-	$props();
+const {
+	isLogPanelOpen,
+	isTraining,
+	logCount,
+	onToggleLogPanel,
+	onOpenSettings,
+}: HeaderProps = $props();
 </script>
 
 <header class="z-10 flex h-14 shrink-0 items-center justify-between border-b border-zinc-800/80 bg-zinc-900/90 px-6 backdrop-blur-md">
