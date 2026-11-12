@@ -351,6 +351,13 @@ fn ensure_directory_creates_nested_run_and_rejects_file_parent() {
     let data = root.join("datasets");
     std::fs::create_dir_all(&data).unwrap();
     require_existing_directory(&data).unwrap();
+    crate::settings::ensure_data_directory_writable(&data).unwrap();
+    assert!(
+        !data
+            .join(format!("ls_trainer_write_test_{}", std::process::id()))
+            .exists(),
+        "write probe should be removed"
+    );
 
     let missing = root.join("mnt-datasets");
     let missing_err = require_existing_directory(&missing).unwrap_err();

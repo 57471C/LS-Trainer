@@ -13,7 +13,9 @@ use tauri::ipc::Channel;
 use crate::models::{TrainingRequest, TrainingResponse};
 use crate::process::{get_project_root, hide_console_window, send_break_signal, to_display_path};
 use crate::rtdetr::is_rtdetr_request;
-use crate::settings::runs_base_dir;
+use crate::settings::{
+    describe_write_access, ensure_data_directory_writable, nearest_existing_dir, runs_base_dir,
+};
 use crate::training::rfdetr::start_rfdetr_training;
 use crate::training::rtdetr::start_rtdetr_training;
 use crate::training::yolo::start_yolo_training;
@@ -145,6 +147,10 @@ pub async fn start_training(
         let _ = on_log.send(format!("[LS-Trainer] Error: {err}"));
         return Err(err);
     }
+    if let Err(err) = ensure_data_directory_writable(&base) {
+        let _ = on_log.send(format!("[LS-Trainer] Error: {err}"));
+        return Err(err);
+    }
 
     // Parent must exist before a backend writes its runner script into the run folder.
     // Creating the run folder itself is left to the backend: Ultralytics treats an
@@ -256,10 +262,13 @@ pub(crate) fn ensure_directory(path: &Path) -> Result<(), String> {
         match std::fs::create_dir_all(path) {
             Ok(()) if path.is_dir() => return Ok(()),
             Ok(()) => {
-                last_error = Some(directory_error(path, "path is not a directory"));
+                last_error = Some(format!(
+                    "Could not create results directory '{}': path is not a directory.",
+                    path.display()
+                ));
             }
             Err(err) => {
-                last_error = Some(directory_error(path, &err.to_string()));
+                last_error = Some(directory_error(path, &err));
                 if err.kind() != std::io::ErrorKind::NotFound {
                     break;
                 }
@@ -269,7 +278,8 @@ pub(crate) fn ensure_directory(path: &Path) -> Result<(), String> {
             std::thread::sleep(std::time::Duration::from_millis(30));
         }
     }
-    Err(last_error.unwrap_or_else(|| directory_error(path, "create failed")))
+    Err(last_error
+        .unwrap_or_else(|| format!("Could not create results directory '{}'.", path.display())))
 }
 
 /// Write `contents` to `path`, creating the parent directory first.
@@ -303,11 +313,18 @@ pub(crate) fn write_text_file(path: &Path, contents: &str) -> Result<(), String>
     Err(format!("'{}': {last_error}", path.display()))
 }
 
-fn directory_error(path: &Path, detail: &str) -> String {
+fn directory_error(path: &Path, err: &std::io::Error) -> String {
     let mut message = format!(
-        "Could not create results directory '{}': {detail}.",
+        "Could not create results directory '{}': {err}.",
         path.display()
     );
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        if let Some(existing) = nearest_existing_dir(path) {
+            message.push_str(&describe_write_access(&existing));
+        }
+        message.push_str(" Training needs to create folders inside the data directory.");
+        return message;
+    }
     if let Some(missing) = first_missing_component(path) {
         if missing != path {
             message.push_str(&format!(" Missing '{}'.", missing.display()));
