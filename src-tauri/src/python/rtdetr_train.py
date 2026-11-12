@@ -520,77 +520,77 @@ def main():
                     print(f"[LS-Trainer] Stop requested by user at epoch {epoch}. Stopping gracefully...", flush=True)
                     user_stopped = True
                     break
-            pixel_values = pixel_values.to(torch_device)
-            # Move targets to device
-            device_labels = []
-            for lab in labels:
-                device_labels.append({
-                    "class_labels": lab["class_labels"].to(torch_device),
-                    "boxes": lab["boxes"].to(torch_device),
-                })
+                pixel_values = pixel_values.to(torch_device)
+                # Move targets to device
+                device_labels = []
+                for lab in labels:
+                    device_labels.append({
+                        "class_labels": lab["class_labels"].to(torch_device),
+                        "boxes": lab["boxes"].to(torch_device),
+                    })
 
-            optimizer.zero_grad()
-            with torch.autocast(device_type=dev_type, enabled=amp and dev_type != "cpu"):
-                outputs = model(pixel_values=pixel_values, labels=device_labels)
-                loss = outputs.loss
-            print(f"[LS-Trainer] Step forward complete, loss={float(loss.detach().item()):.4f}", flush=True)
+                optimizer.zero_grad()
+                with torch.autocast(device_type=dev_type, enabled=amp and dev_type != "cpu"):
+                    outputs = model(pixel_values=pixel_values, labels=device_labels)
+                    loss = outputs.loss
+                print(f"[LS-Trainer] Step forward complete, loss={float(loss.detach().item()):.4f}", flush=True)
 
-            loss.backward()
-            print("[LS-Trainer] Step backward complete", flush=True)
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.1)
-            optimizer.step()
-            print("[LS-Trainer] Optimizer step complete", flush=True)
+                loss.backward()
+                print("[LS-Trainer] Step backward complete", flush=True)
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.1)
+                optimizer.step()
+                print("[LS-Trainer] Optimizer step complete", flush=True)
 
-            total_loss += float(loss.detach().item())
-            num_batches += 1
+                total_loss += float(loss.detach().item())
+                num_batches += 1
 
-        lr_scheduler.step()
-        avg_loss = total_loss / max(1, num_batches)
-        dur = time.time() - epoch_start_time
+            lr_scheduler.step()
+            avg_loss = total_loss / max(1, num_batches)
+            dur = time.time() - epoch_start_time
 
-        # Validation
-        print("[LS-Trainer] Running COCO validation evaluation...", flush=True)
-        map50, map50_95 = evaluate_coco(model, val_loader, valid_ann, device_req, amp=amp)
-        print(f"[LS-Trainer] Evaluation complete: map50={map50:.4f}, map50-95={map50_95:.4f}", flush=True)
+            # Validation
+            print("[LS-Trainer] Running COCO validation evaluation...", flush=True)
+            map50, map50_95 = evaluate_coco(model, val_loader, valid_ann, device_req, amp=amp)
+            print(f"[LS-Trainer] Evaluation complete: map50={map50:.4f}, map50-95={map50_95:.4f}", flush=True)
 
-        is_best = map50 >= best_map50
-        if is_best:
-            best_map50 = map50
-            best_map50_95 = map50_95
+            is_best = map50 >= best_map50
+            if is_best:
+                best_map50 = map50
+                best_map50_95 = map50_95
 
-        # Checkpoint saving
-        state_dict_cpu = {k: v.cpu() for k, v in model.state_dict().items()}
-        ckpt_payload = {
-            "epoch": epoch,
-            "state_dict": state_dict_cpu,
-            "class_names": class_names,
-            "map50": map50,
-            "map50_95": map50_95,
-        }
+            # Checkpoint saving
+            state_dict_cpu = {k: v.cpu() for k, v in model.state_dict().items()}
+            ckpt_payload = {
+                "epoch": epoch,
+                "state_dict": state_dict_cpu,
+                "class_names": class_names,
+                "map50": map50,
+                "map50_95": map50_95,
+            }
 
-        last_path = os.path.join(weights_dir, "last.pth")
-        torch.save(ckpt_payload, last_path)
-        # Also save directly in output_dir for easy location
-        torch.save(ckpt_payload, os.path.join(output_dir, "last.pth"))
+            last_path = os.path.join(weights_dir, "last.pth")
+            torch.save(ckpt_payload, last_path)
+            # Also save directly in output_dir for easy location
+            torch.save(ckpt_payload, os.path.join(output_dir, "last.pth"))
 
-        if is_best:
-            best_path = os.path.join(weights_dir, "best.pth")
-            torch.save(ckpt_payload, best_path)
-            torch.save(ckpt_payload, os.path.join(output_dir, "best.pth"))
+            if is_best:
+                best_path = os.path.join(weights_dir, "best.pth")
+                torch.save(ckpt_payload, best_path)
+                torch.save(ckpt_payload, os.path.join(output_dir, "best.pth"))
 
-        # Save run metrics and training config
-        with open(os.path.join(output_dir, "ls_trainer_metrics.json"), "w", encoding="utf-8") as mf:
-            json.dump({"map50": best_map50, "map50_95": best_map50_95}, mf, indent=2)
+            # Save run metrics and training config
+            with open(os.path.join(output_dir, "ls_trainer_metrics.json"), "w", encoding="utf-8") as mf:
+                json.dump({"map50": best_map50, "map50_95": best_map50_95}, mf, indent=2)
 
-        metrics_str = f"loss: {avg_loss:.4f} | mAP50={map50:.4f} | mAP50-95={map50_95:.4f}"
-        print(f"[LS-Trainer Epoch] Epoch {epoch}/{epochs} finished in {dur:.1f}s - {metrics_str}", flush=True)
-        print(f"Epoch {epoch}/{epochs} finished", flush=True)
-        print(f"[LS-Trainer Metrics] Epoch {epoch}/{epochs} | {metrics_str}", flush=True)
+            metrics_str = f"loss: {avg_loss:.4f} | mAP50={map50:.4f} | mAP50-95={map50_95:.4f}"
+            print(f"[LS-Trainer Epoch] Epoch {epoch}/{epochs} finished in {dur:.1f}s - {metrics_str}", flush=True)
+            print(f"Epoch {epoch}/{epochs} finished", flush=True)
+            print(f"[LS-Trainer Metrics] Epoch {epoch}/{epochs} | {metrics_str}", flush=True)
 
-        if user_stopped or os.path.exists(stop_file):
-            print(f"[LS-Trainer] RT-DETR training stopped by user. Checkpoints preserved at: {output_dir}", flush=True)
-            user_stopped = True
-            break
+            if user_stopped or os.path.exists(stop_file):
+                print(f"[LS-Trainer] RT-DETR training stopped by user. Checkpoints preserved at: {output_dir}", flush=True)
+                user_stopped = True
+                break
     except KeyboardInterrupt:
         print("[LS-Trainer] Training interrupted by user.", flush=True)
         user_stopped = True
