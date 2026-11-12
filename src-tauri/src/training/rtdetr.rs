@@ -8,7 +8,9 @@ use crate::dataset::coco::prepare_rfdetr_coco_dataset;
 use crate::hardware::{detect_gpu_info, resolve_dataloader_workers};
 use crate::models::{TrainingRequest, TrainingResponse};
 use crate::process::{get_venv_python, hide_console_window, stream_child_output};
-use crate::rtdetr::resolve_rtdetr_model_meta;
+use crate::rtdetr::{
+    resolve_rtdetr_model_meta, rtdetr_architecture_from_run, rtdetr_run_dir_for_checkpoint,
+};
 use crate::training::{
     ensure_directory, extract_final_metrics_from_results_dir, is_stop_requested, log_final_metrics,
     register_child_pid, save_run_config_metadata, unregister_child_pid, write_text_file,
@@ -24,6 +26,9 @@ pub(crate) async fn start_rtdetr_training(
     request: TrainingRequest,
     on_log: Channel<String>,
 ) -> Result<TrainingResponse, String> {
+    let mut request = request;
+    request.model_family = "RT-DETR".to_string();
+
     let coco_root = prepare_rfdetr_coco_dataset(&dataset_input, &on_log)?;
 
     let models_dir = project_root.join("models");
@@ -32,11 +37,14 @@ pub(crate) async fn start_rtdetr_training(
     let custom_path = Path::new(request.model_choice.trim());
     let (default_hf_weights, default_label) = resolve_rtdetr_model_meta(&request.model_choice);
     let (resolved_pretrain, model_name, base_weights) = if custom_path.is_file() {
-        (
-            custom_path.to_string_lossy().to_string(),
-            default_label.to_string(),
-            default_hf_weights.to_string(),
-        )
+        let (base, label) = rtdetr_run_dir_for_checkpoint(custom_path)
+            .and_then(|run_dir| rtdetr_architecture_from_run(&run_dir))
+            .unwrap_or_else(|| (default_hf_weights.to_string(), default_label.to_string()));
+        let _ = on_log.send(format!(
+            "[LS-Trainer] Continuing RT-DETR from checkpoint '{}' with base {base}.",
+            custom_path.display()
+        ));
+        (custom_path.to_string_lossy().to_string(), label, base)
     } else {
         (
             default_hf_weights.to_string(),

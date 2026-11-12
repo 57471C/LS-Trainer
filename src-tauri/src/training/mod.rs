@@ -431,6 +431,9 @@ pub(crate) fn save_run_config_metadata(
 }
 
 pub(crate) fn is_rfdetr_request(request: &TrainingRequest) -> bool {
+    if is_rtdetr_request(request) {
+        return false;
+    }
     if request.model_family.eq_ignore_ascii_case("RF-DETR")
         || request.model_family.eq_ignore_ascii_case("RFDETR")
     {

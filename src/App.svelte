@@ -653,7 +653,7 @@ async function handleStartTraining() {
 		modelMode === "continue"
 			? /rt-?detr/i.test(effectiveModel)
 				? "RT-DETR"
-				: /\.pth$/i.test(effectiveModel) || /^rf-?detr/i.test(effectiveModel)
+				: /rf-?detr/i.test(effectiveModel)
 					? "RF-DETR"
 					: selectedFamily
 			: selectedFamily;

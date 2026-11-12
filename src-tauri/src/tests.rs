@@ -10,8 +10,9 @@ use crate::rfdetr::{
 };
 use crate::rtdetr::{
     find_rtdetr_checkpoint_in_dir, is_rtdetr_request, is_rtdetr_run_dir, resolve_rtdetr_model_meta,
+    rtdetr_architecture_from_run,
 };
-use crate::training::resolve_train_task;
+use crate::training::{is_rfdetr_request, resolve_train_task};
 
 #[test]
 fn polygon_line_has_more_than_five_values() {
@@ -280,7 +281,36 @@ fn rtdetr_request_classification_and_checkpoint_detection() {
     let _ = std::fs::write(&best_pth, b"dummy checkpoint");
 
     assert!(is_rtdetr_run_dir(&temp_dir));
-    assert_eq!(find_rtdetr_checkpoint_in_dir(&temp_dir), Some(best_pth));
+    assert_eq!(
+        find_rtdetr_checkpoint_in_dir(&temp_dir),
+        Some(best_pth.clone())
+    );
+
+    let _ = std::fs::write(
+        &cfg_file,
+        r#"{"model_family":"RT-DETR","model_name":"RT-DETR-L","base_weights":"PekingU/rtdetr_v2_r50vd"}"#,
+    );
+    req.model_family = "RF-DETR".to_string();
+    req.model_choice = best_pth.to_string_lossy().to_string();
+    assert!(
+        is_rtdetr_request(&req),
+        "an RT-DETR best.pth must not be trained as RF-DETR"
+    );
+    assert!(!is_rfdetr_request(&req));
+    assert_eq!(
+        rtdetr_architecture_from_run(&temp_dir),
+        Some((
+            "PekingU/rtdetr_v2_r50vd".to_string(),
+            "RT-DETR-L".to_string()
+        ))
+    );
+
+    let weights_dir = temp_dir.join("weights");
+    std::fs::create_dir_all(&weights_dir).unwrap();
+    let nested = weights_dir.join("best.pth");
+    std::fs::write(&nested, b"dummy checkpoint").unwrap();
+    req.model_choice = nested.to_string_lossy().to_string();
+    assert!(is_rtdetr_request(&req));
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
