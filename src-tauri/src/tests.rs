@@ -1,6 +1,8 @@
 //! Unit tests for label scanning, task resolution, RF-DETR mapping, workers, and wheel selection.
 
-use crate::dataset::labels::{LabelStats, result_from_stats, scan_coco_json_text, scan_label_text, scan_tar_archive};
+use crate::dataset::labels::{
+    LabelStats, result_from_stats, scan_coco_json_text, scan_label_text, scan_tar_archive,
+};
 use crate::hardware::{compute_recommended_workers, is_intel_arc_gpu, select_pytorch_wheel};
 use crate::models::TrainingRequest;
 use crate::rfdetr::{
@@ -36,7 +38,10 @@ fn bbox_line_warns_for_segmentation() {
 #[test]
 fn mixed_labels_warn() {
     let mut stats = LabelStats::default();
-    scan_label_text("0 0.5 0.5 0.2 0.2\n1 0.1 0.1 0.2 0.1 0.2 0.2 0.1 0.2\n", &mut stats);
+    scan_label_text(
+        "0 0.5 0.5 0.2 0.2\n1 0.1 0.1 0.2 0.1 0.2 0.2 0.1 0.2\n",
+        &mut stats,
+    );
     let result = result_from_stats(&stats);
     assert!(result.polygons_found && result.bboxes_found);
     assert!(result.warning.is_some());
@@ -102,16 +107,14 @@ fn coco_json_scan_detects_bboxes_and_polygons() {
 
 #[test]
 fn rfdetr_resolution_snapping_and_model_mapping() {
-    let (cls_n, weights_n, block_n) =
-        resolve_rfdetr_class_and_pretrain("rf-detr-nano", "detect");
+    let (cls_n, weights_n, block_n) = resolve_rfdetr_class_and_pretrain("rf-detr-nano", "detect");
     assert_eq!(cls_n, "RFDETRNano");
     assert_eq!(weights_n, "rf-detr-nano.pth");
     assert_eq!(snap_rfdetr_resolution(640, block_n), 640);
     assert_eq!(snap_rfdetr_resolution(960, block_n), 960);
     assert_eq!(snap_rfdetr_resolution(1280, block_n), 1280);
 
-    let (cls_seg, _, block_seg) =
-        resolve_rfdetr_class_and_pretrain("rf-detr-seg-small", "segment");
+    let (cls_seg, _, block_seg) = resolve_rfdetr_class_and_pretrain("rf-detr-seg-small", "segment");
     assert_eq!(cls_seg, "RFDETRSegSmall");
     assert_eq!(snap_rfdetr_resolution(640, block_seg), 648);
 }
@@ -131,7 +134,10 @@ fn rfdetr_dependency_verification() {
 
     let bogus_root = std::env::temp_dir().join(format!("ls_trainer_bogus_{}", std::process::id()));
     let bogus_result = verify_rfdetr_dependencies(&bogus_root);
-    assert!(bogus_result.is_err(), "Expected failure when .venv is missing");
+    assert!(
+        bogus_result.is_err(),
+        "Expected failure when .venv is missing"
+    );
 }
 
 #[test]
@@ -218,12 +224,10 @@ fn intel_arc_and_pytorch_wheel_selection() {
     assert_eq!(arc_url, "https://download.pytorch.org/whl/xpu");
     assert_eq!(arc_label, "Intel Arc XPU");
 
-    let (nv_50_wheel, _, _) =
-        select_pytorch_wheel(Some("NVIDIA GeForce RTX 5080"), Some(572));
+    let (nv_50_wheel, _, _) = select_pytorch_wheel(Some("NVIDIA GeForce RTX 5080"), Some(572));
     assert_eq!(nv_50_wheel, "cu128");
 
-    let (nv_old_wheel, _, _) =
-        select_pytorch_wheel(Some("NVIDIA GeForce RTX 3060"), Some(535));
+    let (nv_old_wheel, _, _) = select_pytorch_wheel(Some("NVIDIA GeForce RTX 3060"), Some(535));
     assert_eq!(nv_old_wheel, "cu124");
 
     let (cpu_wheel, cpu_url, _) = select_pytorch_wheel(None, None);
@@ -264,10 +268,14 @@ fn rtdetr_request_classification_and_checkpoint_detection() {
     req.model_choice = "yolo11s.pt".to_string();
     assert!(!is_rtdetr_request(&req));
 
-    let temp_dir = std::env::temp_dir().join(format!("ls_trainer_test_rtdetr_{}", std::process::id()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("ls_trainer_test_rtdetr_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&temp_dir);
     let cfg_file = temp_dir.join("training_config.json");
-    let _ = std::fs::write(&cfg_file, r#"{"model_family": "RT-DETR", "model_name": "RT-DETR v2-R18"}"#);
+    let _ = std::fs::write(
+        &cfg_file,
+        r#"{"model_family": "RT-DETR", "model_name": "RT-DETR v2-R18"}"#,
+    );
     let best_pth = temp_dir.join("best.pth");
     let _ = std::fs::write(&best_pth, b"dummy checkpoint");
 
@@ -276,7 +284,6 @@ fn rtdetr_request_classification_and_checkpoint_detection() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
-
 
 #[test]
 fn rtdetr_model_meta_resolution() {
@@ -305,8 +312,7 @@ fn rtdetr_model_meta_resolution() {
 fn test_training_stop_lifecycle() {
     tauri::async_runtime::block_on(async {
         use crate::training::{
-            clear_active_training, is_stop_requested, register_active_training,
-            stop_training,
+            clear_active_training, is_stop_requested, register_active_training, stop_training,
         };
 
         let temp_run_dir = std::env::temp_dir().join("ls_trainer_test_run");
@@ -337,15 +343,52 @@ fn test_training_stop_lifecycle() {
 }
 
 #[test]
+fn ensure_directory_creates_nested_run_and_rejects_file_parent() {
+    use crate::training::{ensure_directory, require_existing_directory, write_text_file};
+
+    let root = std::env::temp_dir().join(format!("ls_trainer_ensure_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let data = root.join("datasets");
+    std::fs::create_dir_all(&data).unwrap();
+    require_existing_directory(&data).unwrap();
+
+    let missing = root.join("mnt-datasets");
+    let missing_err = require_existing_directory(&missing).unwrap_err();
+    assert!(
+        missing_err.contains("mnt-datasets"),
+        "error should name the missing data directory, got {missing_err}"
+    );
+    assert!(
+        !missing.exists(),
+        "a missing data directory must not be created"
+    );
+
+    let run = data.join("runs").join("detect").join("job");
+    ensure_directory(&run).unwrap();
+    let script = run.join("ls_trainer_rtdetr_run.py");
+    write_text_file(&script, "print('ok')\n").unwrap();
+    assert!(script.is_file());
+
+    let blocker = root.join("not-a-directory");
+    std::fs::write(&blocker, "file").unwrap();
+    let blocked = blocker.join("runs").join("detect").join("job");
+    let err = ensure_directory(&blocked).unwrap_err();
+    assert!(
+        err.contains("not-a-directory"),
+        "error should name the results path, got {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn data_directory_survives_reload_and_sets_runs_base() {
     use crate::settings::{
-        apply_data_directory, read_settings_file, resolve_runs_base, write_settings_file, AppSettings,
+        AppSettings, apply_data_directory, read_settings_file, resolve_runs_base,
+        write_settings_file,
     };
 
-    let temp = std::env::temp_dir().join(format!(
-        "ls_trainer_settings_{}",
-        std::process::id()
-    ));
+    let temp = std::env::temp_dir().join(format!("ls_trainer_settings_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp);
     std::fs::create_dir_all(&temp).unwrap();
     let settings_file = temp.join("ls_trainer_settings.json");

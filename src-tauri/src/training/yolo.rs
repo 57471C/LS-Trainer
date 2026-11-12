@@ -9,7 +9,10 @@ use crate::dataset::yolo::{find_data_yaml, resolve_and_fix_data_yaml, unpack_arc
 use crate::hardware::{detect_gpu_info, resolve_dataloader_workers};
 use crate::models::{TrainingRequest, TrainingResponse};
 use crate::process::{hide_console_window, stream_child_output, venv_python_path, venv_yolo_path};
-use crate::training::{extract_final_metrics_from_results_dir, is_stop_requested, log_final_metrics, register_child_pid, save_run_config_metadata, unregister_child_pid};
+use crate::training::{
+    extract_final_metrics_from_results_dir, is_stop_requested, log_final_metrics,
+    register_child_pid, save_run_config_metadata, unregister_child_pid,
+};
 
 pub(crate) fn resolve_or_download_model_weights(
     project_root: &Path,
@@ -47,12 +50,7 @@ pub(crate) fn resolve_or_download_model_weights(
     ];
 
     for candidate in &candidate_paths {
-        if candidate.is_file()
-            && candidate
-                .metadata()
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
-        {
+        if candidate.is_file() && candidate.metadata().map(|m| m.len() > 0).unwrap_or(false) {
             let _ = on_log.send(format!(
                 "[LS-Trainer] Using cached model weights: {}",
                 candidate.display()
@@ -119,7 +117,10 @@ pub(crate) async fn start_yolo_training(
     request: TrainingRequest,
     on_log: Channel<String>,
 ) -> Result<TrainingResponse, String> {
-    let project_runs_dir = project_root.join("runs").join(&yolo_task);
+    let project_runs_dir = abs_results_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| project_root.join("runs").join(&yolo_task));
 
     // Determine data.yaml path: unpack if archive, or find inside directory
     let raw_data_yaml_path = if dataset_input.is_file() {
@@ -214,9 +215,7 @@ pub(crate) async fn start_yolo_training(
         None
     };
 
-    let _ = on_log.send(format!(
-        "[LS-Trainer] Ultralytics task=\"{yolo_task}\""
-    ));
+    let _ = on_log.send(format!("[LS-Trainer] Ultralytics task=\"{yolo_task}\""));
     let _ = on_log.send(format!(
         "[LS-Trainer] Active config: task={} | model={} | workers={} | freeze={} | mosaic={} | close_mosaic={} | mixup={} | copy_paste={} | degrees={} | flipud={} | translate={} | scale={} | amp={}",
         yolo_task,
@@ -251,7 +250,10 @@ pub(crate) async fn start_yolo_training(
         || device_input.eq_ignore_ascii_case("cuda")
         || device_input == "0"
     {
-        if gpu_probe.xpu_available && !device_input.eq_ignore_ascii_case("cuda") && device_input != "0" {
+        if gpu_probe.xpu_available
+            && !device_input.eq_ignore_ascii_case("cuda")
+            && device_input != "0"
+        {
             let dev_label = gpu_probe.device_name.as_deref().unwrap_or("Intel Arc XPU");
             let _ = on_log.send(format!(
                 "[LS-Trainer] Intel Arc XPU available (torch.xpu.is_available()=True), selecting device=xpu ({dev_label})"
@@ -326,10 +328,7 @@ pub(crate) async fn start_yolo_training(
         let mut c = Command::new(&expected_venv_yolo);
         c.args(&train_args);
 
-        let cmd_str = format!(
-            "\"{}\" {joined_train_args}",
-            expected_venv_yolo.display()
-        );
+        let cmd_str = format!("\"{}\" {joined_train_args}", expected_venv_yolo.display());
 
         (c, cmd_str)
     } else {
@@ -455,10 +454,9 @@ pub(crate) async fn start_yolo_training(
                     .to_string(),
             );
             let _ = on_log.send(format!("[LS-Trainer] Command was: {exact_command}"));
-            let _ = on_log.send(format!(
-                "[LS-Trainer] Target results folder: {results_dir}"
-            ));
-            let _ = on_log.send("[LS-Trainer] Wiring and parameter verification complete.".to_string());
+            let _ = on_log.send(format!("[LS-Trainer] Target results folder: {results_dir}"));
+            let _ =
+                on_log.send("[LS-Trainer] Wiring and parameter verification complete.".to_string());
 
             Ok(TrainingResponse {
                 success: true,

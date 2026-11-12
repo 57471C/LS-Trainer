@@ -13,7 +13,10 @@ use crate::rfdetr::{
     ensure_rfdetr_installed, resolve_rfdetr_class_and_pretrain, snap_rfdetr_resolution,
     verify_rfdetr_dependencies,
 };
-use crate::training::{extract_final_metrics_from_results_dir, is_stop_requested, log_final_metrics, register_child_pid, save_run_config_metadata, unregister_child_pid};
+use crate::training::{
+    ensure_directory, extract_final_metrics_from_results_dir, is_stop_requested, log_final_metrics,
+    register_child_pid, save_run_config_metadata, unregister_child_pid, write_text_file,
+};
 
 pub(crate) async fn start_rfdetr_training(
     project_root: PathBuf,
@@ -78,10 +81,7 @@ pub(crate) async fn start_rfdetr_training(
         || device_input == "0"
     {
         if gpu_probe.xpu_available && !device_input.eq_ignore_ascii_case("cuda") {
-            let dev_label = gpu_probe
-                .device_name
-                .as_deref()
-                .unwrap_or("Intel Arc XPU");
+            let dev_label = gpu_probe.device_name.as_deref().unwrap_or("Intel Arc XPU");
             let _ = on_log.send(format!(
                 "[LS-Trainer] Intel Arc XPU available (torch.xpu.is_available()=True), selecting device=xpu ({dev_label})"
             ));
@@ -105,12 +105,12 @@ pub(crate) async fn start_rfdetr_training(
 
     let effective_workers = resolve_dataloader_workers(&project_root, request.workers, &on_log);
 
-    let _ = std::fs::create_dir_all(&abs_results_dir);
+    ensure_directory(&abs_results_dir)?;
     let runner_script_path = abs_results_dir.join("ls_trainer_rfdetr_run.py");
 
     let runner_script = include_str!("../python/rfdetr_train.py");
 
-    std::fs::write(&runner_script_path, runner_script)
+    write_text_file(&runner_script_path, runner_script)
         .map_err(|e| format!("Failed to write RF-DETR runner script: {e}"))?;
 
     let runner_cfg_path = abs_results_dir.join("ls_trainer_rfdetr_args.json");
@@ -128,9 +128,9 @@ pub(crate) async fn start_rfdetr_training(
         "freeze_backbone": request.freeze_backbone,
         "task": yolo_task,
     });
-    std::fs::write(
+    write_text_file(
         &runner_cfg_path,
-        serde_json::to_string_pretty(&runner_cfg).unwrap_or_default(),
+        &serde_json::to_string_pretty(&runner_cfg).unwrap_or_default(),
     )
     .map_err(|e| format!("Failed to write RF-DETR config JSON: {e}"))?;
 

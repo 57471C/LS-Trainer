@@ -34,7 +34,9 @@ pub static ACTIVE_TRAINING: ActiveTrainingState = ActiveTrainingState {
 
 pub(crate) fn register_active_training(results_dir: PathBuf) {
     ACTIVE_TRAINING.is_running.store(true, Ordering::SeqCst);
-    ACTIVE_TRAINING.stop_requested.store(false, Ordering::SeqCst);
+    ACTIVE_TRAINING
+        .stop_requested
+        .store(false, Ordering::SeqCst);
     if let Ok(mut lock) = ACTIVE_TRAINING.results_dir.lock() {
         let stop_file = results_dir.join(".stop_requested");
         let _ = std::fs::remove_file(stop_file);
@@ -135,10 +137,24 @@ pub async fn start_training(
     let _ = on_log.send(format!(
         "[LS-Trainer] Initializing training run '{run_name}'..."
     ));
-    let _ = on_log.send(format!(
-        "[LS-Trainer] Results directory: {}",
-        results_dir
-    ));
+    let _ = on_log.send(format!("[LS-Trainer] Results directory: {}", results_dir));
+
+    // Do not create the data directory here. A missing `/mnt/datasets` is usually an
+    // unmounted disk, and creating it would hide that mount.
+    if let Err(err) = require_existing_directory(&base) {
+        let _ = on_log.send(format!("[LS-Trainer] Error: {err}"));
+        return Err(err);
+    }
+
+    // Parent must exist before a backend writes its runner script into the run folder.
+    // Creating the run folder itself is left to the backend: Ultralytics treats an
+    // existing name as taken and increments it.
+    if let Some(parent) = abs_results_dir.parent() {
+        if let Err(err) = ensure_directory(parent) {
+            let _ = on_log.send(format!("[LS-Trainer] Error: {err}"));
+            return Err(err);
+        }
+    }
 
     let dataset_input = PathBuf::from(&request.dataset_path);
     if !dataset_input.exists() {
@@ -189,6 +205,142 @@ pub async fn start_training(
 
     clear_active_training();
     response
+}
+
+/// The configured data directory must already exist. Creating a missing mount
+/// such as `/mnt/datasets` would hide the unmounted disk.
+pub(crate) fn require_existing_directory(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("Data directory path is empty".to_string());
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if path.is_dir() {
+                return Ok(());
+            }
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "Data directory '{}' is a broken symlink. Mount the target, or choose another folder in Settings.",
+                    path.display()
+                ));
+            }
+            Err(format!(
+                "Data directory '{}' exists but is not a directory.",
+                path.display()
+            ))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "Data directory '{}' does not exist or is not mounted. Mount it, or choose another folder in Settings, before training.",
+            path.display()
+        )),
+        Err(err) => Err(format!(
+            "Data directory '{}' is not accessible: {err}",
+            path.display()
+        )),
+    }
+}
+
+/// Create `path` and its parents. The error names the directory so a missing
+/// mount such as `/mnt/datasets` is not reported later as a missing script file.
+pub(crate) fn ensure_directory(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("Could not create results directory: path is empty".to_string());
+    }
+    if path.is_dir() {
+        return Ok(());
+    }
+
+    let mut last_error: Option<String> = None;
+    for attempt in 0..3 {
+        match std::fs::create_dir_all(path) {
+            Ok(()) if path.is_dir() => return Ok(()),
+            Ok(()) => {
+                last_error = Some(directory_error(path, "path is not a directory"));
+            }
+            Err(err) => {
+                last_error = Some(directory_error(path, &err.to_string()));
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    break;
+                }
+            }
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+    }
+    Err(last_error.unwrap_or_else(|| directory_error(path, "create failed")))
+}
+
+/// Write `contents` to `path`, creating the parent directory first.
+/// A short retry covers a network mount that returns ENOENT just after mkdir.
+pub(crate) fn write_text_file(path: &Path, contents: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            ensure_directory(parent)?;
+        }
+    }
+
+    let mut last_error = String::new();
+    for attempt in 0..3 {
+        match std::fs::write(path, contents) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_error = err.to_string();
+                let retry = err.kind() == std::io::ErrorKind::NotFound && attempt < 2;
+                if !retry {
+                    return Err(format!("'{}': {last_error}", path.display()));
+                }
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        let _ = ensure_directory(parent);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+        }
+    }
+    Err(format!("'{}': {last_error}", path.display()))
+}
+
+fn directory_error(path: &Path, detail: &str) -> String {
+    let mut message = format!(
+        "Could not create results directory '{}': {detail}.",
+        path.display()
+    );
+    if let Some(missing) = first_missing_component(path) {
+        if missing != path {
+            message.push_str(&format!(" Missing '{}'.", missing.display()));
+        }
+    }
+    message.push_str(" Check that this data directory exists, is mounted, and is writable.");
+    message
+}
+
+/// Highest ancestor of `path` that is not present, so a missing `/mnt/datasets`
+/// is named instead of the run folder underneath it.
+fn first_missing_component(path: &Path) -> Option<PathBuf> {
+    let mut current = path;
+    let mut missing: Option<PathBuf> = None;
+    loop {
+        match std::fs::symlink_metadata(current) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() && !current.is_dir() {
+                    return Some(current.to_path_buf());
+                }
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                missing = Some(current.to_path_buf());
+                match current.parent() {
+                    Some(parent) if parent != current => current = parent,
+                    _ => break,
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    missing
 }
 
 pub(crate) fn resolve_train_task(request: &TrainingRequest) -> String {
@@ -271,7 +423,9 @@ pub(crate) fn is_rfdetr_request(request: &TrainingRequest) -> bool {
     choice.starts_with("rf-detr") || choice.starts_with("rfdetr") || choice.ends_with(".pth")
 }
 
-pub(crate) fn extract_final_metrics_from_results_dir(abs_results_dir: &Path) -> (Option<f64>, Option<f64>) {
+pub(crate) fn extract_final_metrics_from_results_dir(
+    abs_results_dir: &Path,
+) -> (Option<f64>, Option<f64>) {
     let metrics_json_path = abs_results_dir.join("ls_trainer_metrics.json");
     if metrics_json_path.is_file() {
         if let Ok(text) = std::fs::read_to_string(&metrics_json_path) {
@@ -342,7 +496,11 @@ pub(crate) fn extract_final_metrics_from_results_dir(abs_results_dir: &Path) -> 
 }
 
 /// Log the best mAP50 / mAP50-95 for a finished run when both are known.
-pub(crate) fn log_final_metrics(on_log: &Channel<String>, map50: Option<f64>, map50_95: Option<f64>) {
+pub(crate) fn log_final_metrics(
+    on_log: &Channel<String>,
+    map50: Option<f64>,
+    map50_95: Option<f64>,
+) {
     if let (Some(m50), Some(m95)) = (map50, map50_95) {
         let _ = on_log.send(format!(
             "[LS-Trainer] Final Metrics — mAP50: {:.1}% ({:.4}) | mAP50-95: {:.1}% ({:.4})",

@@ -9,7 +9,10 @@ use crate::hardware::{detect_gpu_info, resolve_dataloader_workers};
 use crate::models::{TrainingRequest, TrainingResponse};
 use crate::process::{get_venv_python, hide_console_window, stream_child_output};
 use crate::rtdetr::resolve_rtdetr_model_meta;
-use crate::training::{extract_final_metrics_from_results_dir, is_stop_requested, log_final_metrics, register_child_pid, save_run_config_metadata, unregister_child_pid};
+use crate::training::{
+    ensure_directory, extract_final_metrics_from_results_dir, is_stop_requested, log_final_metrics,
+    register_child_pid, save_run_config_metadata, unregister_child_pid, write_text_file,
+};
 
 pub(crate) async fn start_rtdetr_training(
     project_root: PathBuf,
@@ -56,10 +59,7 @@ pub(crate) async fn start_rtdetr_training(
         || device_input == "0"
     {
         if gpu_probe.xpu_available && !device_input.eq_ignore_ascii_case("cuda") {
-            let dev_label = gpu_probe
-                .device_name
-                .as_deref()
-                .unwrap_or("Intel Arc XPU");
+            let dev_label = gpu_probe.device_name.as_deref().unwrap_or("Intel Arc XPU");
             let _ = on_log.send(format!(
                 "[LS-Trainer] Intel Arc XPU available (torch.xpu.is_available()=True), selecting device=xpu ({dev_label})"
             ));
@@ -83,11 +83,11 @@ pub(crate) async fn start_rtdetr_training(
 
     let effective_workers = resolve_dataloader_workers(&project_root, request.workers, &on_log);
 
-    let _ = std::fs::create_dir_all(&abs_results_dir);
+    ensure_directory(&abs_results_dir)?;
     let runner_script_path = abs_results_dir.join("ls_trainer_rtdetr_run.py");
     let runner_script = include_str!("../python/rtdetr_train.py");
 
-    std::fs::write(&runner_script_path, runner_script)
+    write_text_file(&runner_script_path, runner_script)
         .map_err(|e| format!("Failed to write RT-DETR runner script: {e}"))?;
 
     let runner_cfg_path = abs_results_dir.join("ls_trainer_rtdetr_args.json");
@@ -107,9 +107,9 @@ pub(crate) async fn start_rtdetr_training(
         "amp": request.amp,
         "task": yolo_task,
     });
-    std::fs::write(
+    write_text_file(
         &runner_cfg_path,
-        serde_json::to_string_pretty(&runner_cfg).unwrap_or_default(),
+        &serde_json::to_string_pretty(&runner_cfg).unwrap_or_default(),
     )
     .map_err(|e| format!("Failed to write RT-DETR config JSON: {e}"))?;
 
@@ -216,4 +216,3 @@ pub(crate) async fn start_rtdetr_training(
         Err(err) => Err(format!("Failed to launch RT-DETR process: {err}")),
     }
 }
-
