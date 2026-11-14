@@ -455,6 +455,236 @@ def _parse_arg_value(args, prefix):
     return None
 
 
+def _is_rank_zero():
+    try:
+        return int(os.environ.get("RANK", "0")) == 0
+    except Exception:
+        return True
+
+
+# Module-level runtime state so Ultralytics callbacks remain top-level functions
+# with no closure over threading.Lock/Event (which breaks cloudpickle in DDP).
+_RUNTIME = {}
+
+
+def _ensure_runtime_for_trainer(trainer):
+    if "state" not in _RUNTIME:
+        epochs = int(getattr(trainer, "epochs", _RUNTIME.get("configured_epochs", 1)))
+        _RUNTIME["state"] = {
+            "step": 0,
+            "last_step_time": time.time(),
+            "ema_step_dt": None,
+            "last_train_loss": 0.0,
+            "last_lr": 0.0,
+            "last_sps": 0.0,
+        }
+        _RUNTIME["configured_epochs"] = epochs
+        _RUNTIME["progress_tracker"] = ProgressTracker(epochs)
+    return _RUNTIME["state"], _RUNTIME["progress_tracker"]
+
+
+def _resolve_stop_file(trainer):
+    save_dir = getattr(trainer, "save_dir", None)
+    if save_dir:
+        return os.path.join(str(save_dir), ".stop_requested")
+    return _RUNTIME.get("default_stop_file")
+
+
+def _extract_yolo_train_loss(trainer, state):
+    tloss = getattr(trainer, "tloss", None)
+    if tloss is not None:
+        try:
+            if hasattr(tloss, "sum"):
+                return _safe_float(tloss.sum())
+            return _safe_float(tloss)
+        except Exception:
+            pass
+    loss = getattr(trainer, "loss", None)
+    if loss is not None:
+        return _safe_float(loss)
+    return state["last_train_loss"]
+
+
+def _extract_yolo_lr(trainer, state):
+    opt = getattr(trainer, "optimizer", None)
+    if opt is not None and getattr(opt, "param_groups", None):
+        try:
+            return _safe_float(opt.param_groups[0].get("lr", 0.0))
+        except Exception:
+            pass
+    return state["last_lr"]
+
+
+def on_train_epoch_start(trainer):
+    if not _is_rank_zero():
+        return
+    state, progress_tracker = _ensure_runtime_for_trainer(trainer)
+    ctrl_state = _RUNTIME.get("ctrl_state")
+    configured_epochs = _RUNTIME.get("configured_epochs", 1)
+    state["step"] = 0
+    state["last_step_time"] = time.time()
+    epoch = int(getattr(trainer, "epoch", 0)) + 1
+    total_epochs = int(getattr(trainer, "epochs", configured_epochs))
+    progress_tracker.start_epoch(epoch, total_epochs)
+    stop_file = _resolve_stop_file(trainer)
+    if ctrl_state is not None:
+        ctrl_state.wait_if_paused(stop_file)
+        if ctrl_state.is_stop_requested(stop_file):
+            trainer.stop = True
+            raise KeyboardInterrupt("Stop requested by user")
+    elif stop_file and os.path.exists(stop_file):
+        trainer.stop = True
+        raise KeyboardInterrupt("Stop requested by user")
+
+
+def on_train_batch_end(trainer):
+    if not _is_rank_zero():
+        return
+    state, _ = _ensure_runtime_for_trainer(trainer)
+    ctrl_state = _RUNTIME.get("ctrl_state")
+    configured_batch = _RUNTIME.get("configured_batch", 4)
+
+    now = time.time()
+    dt = max(1e-6, now - state["last_step_time"])
+    state["last_step_time"] = now
+    if state["ema_step_dt"] is None:
+        state["ema_step_dt"] = dt
+    else:
+        state["ema_step_dt"] = 0.85 * state["ema_step_dt"] + 0.15 * dt
+
+    state["step"] += 1
+    step = state["step"]
+    train_loader = getattr(trainer, "train_loader", None)
+    try:
+        total_steps = len(train_loader) if train_loader is not None else step
+    except Exception:
+        total_steps = step
+    total_steps = max(step, int(total_steps))
+
+    epoch = int(getattr(trainer, "epoch", 0)) + 1
+    total_epochs = int(getattr(trainer, "epochs", 1))
+    batch_sz = int(getattr(trainer, "batch_size", configured_batch) or configured_batch)
+    sps = batch_sz / dt
+    state["last_sps"] = sps
+
+    done_global = (epoch - 1) * total_steps + step
+    total_global = max(done_global, total_epochs * total_steps)
+    rem_steps = max(0, total_global - done_global)
+    eta_secs = rem_steps * (state["ema_step_dt"] or dt)
+
+    train_loss = _extract_yolo_train_loss(trainer, state)
+    lr = _extract_yolo_lr(trainer, state)
+    state["last_train_loss"] = train_loss
+    state["last_lr"] = lr
+
+    emit_metrics(
+        epoch=epoch,
+        total_epochs=total_epochs,
+        step=step,
+        total_steps=total_steps,
+        train_loss=train_loss,
+        val_loss=None,
+        map50=None,
+        map50_95=None,
+        lr=lr,
+        samples_per_sec=sps,
+        eta_secs=eta_secs,
+    )
+
+    stop_file = _resolve_stop_file(trainer)
+    if ctrl_state is not None:
+        if ctrl_state.consume_checkpoint_request():
+            try:
+                if hasattr(trainer, "save_model"):
+                    trainer.save_model()
+                print("[LS-Trainer] Immediate checkpoint saved.", flush=True)
+            except Exception as exc:
+                print(f"[LS-Trainer Warning] Immediate checkpoint save failed: {exc}", flush=True)
+        ctrl_state.wait_if_paused(stop_file)
+        if ctrl_state.is_stop_requested(stop_file):
+            trainer.stop = True
+            try:
+                if hasattr(trainer, "save_model"):
+                    trainer.save_model()
+            except Exception:
+                pass
+            raise KeyboardInterrupt("Stop requested by user")
+    elif stop_file and os.path.exists(stop_file):
+        trainer.stop = True
+        try:
+            if hasattr(trainer, "save_model"):
+                trainer.save_model()
+        except Exception:
+            pass
+        raise KeyboardInterrupt("Stop requested by user")
+
+
+def on_fit_epoch_end(trainer):
+    if not _is_rank_zero():
+        return
+    state, progress_tracker = _ensure_runtime_for_trainer(trainer)
+    cli_spinner = _RUNTIME.get("cli_spinner")
+
+    epoch = int(getattr(trainer, "epoch", 0)) + 1
+    total_epochs = int(getattr(trainer, "epochs", 1))
+    train_loader = getattr(trainer, "train_loader", None)
+    try:
+        total_steps = len(train_loader) if train_loader is not None else state["step"]
+    except Exception:
+        total_steps = state["step"]
+    total_steps = max(1, int(total_steps))
+
+    metrics = getattr(trainer, "metrics", None) or {}
+    m50 = None
+    for k in ("metrics/mAP50(B)", "metrics/mAP50(M)"):
+        v = _safe_opt_float(metrics.get(k))
+        if v is not None and (m50 is None or v > m50):
+            m50 = v
+
+    m50_95 = None
+    for k in ("metrics/mAP50-95(B)", "metrics/mAP50-95(M)"):
+        v = _safe_opt_float(metrics.get(k))
+        if v is not None and (m50_95 is None or v > m50_95):
+            m50_95 = v
+
+    val_losses = [
+        _safe_opt_float(v)
+        for k, v in metrics.items()
+        if str(k).startswith("val/") and str(k).endswith("loss")
+    ]
+    val_losses = [v for v in val_losses if v is not None]
+    val_loss = sum(val_losses) if val_losses else None
+
+    rem_epochs = max(0, total_epochs - epoch)
+    avg_dt = state["ema_step_dt"] or 0.0
+    eta_secs = rem_epochs * total_steps * avg_dt
+
+    emit_metrics(
+        epoch=epoch,
+        total_epochs=total_epochs,
+        step=total_steps,
+        total_steps=total_steps,
+        train_loss=state["last_train_loss"],
+        val_loss=val_loss,
+        map50=m50,
+        map50_95=m50_95,
+        lr=state["last_lr"],
+        samples_per_sec=state["last_sps"],
+        eta_secs=eta_secs,
+    )
+    progress_tracker.finish_epoch()
+    timing = progress_tracker.timing_summary(epoch)
+    m50_str = f"{m50:.4f}" if m50 is not None else "0.0000"
+    m95_str = f"{m50_95:.4f}" if m50_95 is not None else "0.0000"
+    msg = (
+        f"[LS-Trainer Metrics] Epoch {epoch}/{total_epochs} | mAP50={m50_str} | mAP50-95={m95_str} | {timing}"
+    )
+    if cli_spinner is not None:
+        cli_spinner.print_line(msg)
+    else:
+        print(msg, flush=True)
+
+
 def main():
     cli_args = sys.argv[1:]
     ctrl_state = TrainingControlState()
@@ -463,6 +693,12 @@ def main():
     project_dir = _parse_arg_value(cli_args, "project=")
     run_name = _parse_arg_value(cli_args, "name=")
     batch_arg = _parse_arg_value(cli_args, "batch=")
+    device_arg = _parse_arg_value(cli_args, "device=") or ""
+    if "," in device_arg:
+        dev_parts = [p.strip() for p in device_arg.split(",") if p.strip()]
+        if len(dev_parts) > 1:
+            print(f"[LS-Trainer] Multi-GPU: {device_arg} ({len(dev_parts)} devices)", flush=True)
+
     try:
         configured_batch = max(1, int(batch_arg)) if batch_arg else 4
     except Exception:
@@ -490,169 +726,16 @@ def main():
     progress_tracker = ProgressTracker(configured_epochs)
     cli_spinner = CliSpinner(progress_tracker)
 
-    def _resolve_stop_file(trainer):
-        save_dir = getattr(trainer, "save_dir", None)
-        if save_dir:
-            return os.path.join(str(save_dir), ".stop_requested")
-        return default_stop_file
-
-    def _extract_yolo_train_loss(trainer):
-        tloss = getattr(trainer, "tloss", None)
-        if tloss is not None:
-            try:
-                if hasattr(tloss, "sum"):
-                    return _safe_float(tloss.sum())
-                return _safe_float(tloss)
-            except Exception:
-                pass
-        loss = getattr(trainer, "loss", None)
-        if loss is not None:
-            return _safe_float(loss)
-        return state["last_train_loss"]
-
-    def _extract_yolo_lr(trainer):
-        opt = getattr(trainer, "optimizer", None)
-        if opt is not None and getattr(opt, "param_groups", None):
-            try:
-                return _safe_float(opt.param_groups[0].get("lr", 0.0))
-            except Exception:
-                pass
-        return state["last_lr"]
-
-    def on_train_epoch_start(trainer):
-        state["step"] = 0
-        state["last_step_time"] = time.time()
-        epoch = int(getattr(trainer, "epoch", 0)) + 1
-        total_epochs = int(getattr(trainer, "epochs", configured_epochs))
-        progress_tracker.start_epoch(epoch, total_epochs)
-        stop_file = _resolve_stop_file(trainer)
-        ctrl_state.wait_if_paused(stop_file)
-        if ctrl_state.is_stop_requested(stop_file):
-            trainer.stop = True
-            raise KeyboardInterrupt("Stop requested by user")
-
-    def on_train_batch_end(trainer):
-        now = time.time()
-        dt = max(1e-6, now - state["last_step_time"])
-        state["last_step_time"] = now
-        if state["ema_step_dt"] is None:
-            state["ema_step_dt"] = dt
-        else:
-            state["ema_step_dt"] = 0.85 * state["ema_step_dt"] + 0.15 * dt
-
-        state["step"] += 1
-        step = state["step"]
-        train_loader = getattr(trainer, "train_loader", None)
-        try:
-            total_steps = len(train_loader) if train_loader is not None else step
-        except Exception:
-            total_steps = step
-        total_steps = max(step, int(total_steps))
-
-        epoch = int(getattr(trainer, "epoch", 0)) + 1
-        total_epochs = int(getattr(trainer, "epochs", 1))
-        batch_sz = int(getattr(trainer, "batch_size", configured_batch) or configured_batch)
-        sps = batch_sz / dt
-        state["last_sps"] = sps
-
-        done_global = (epoch - 1) * total_steps + step
-        total_global = max(done_global, total_epochs * total_steps)
-        rem_steps = max(0, total_global - done_global)
-        eta_secs = rem_steps * (state["ema_step_dt"] or dt)
-
-        train_loss = _extract_yolo_train_loss(trainer)
-        lr = _extract_yolo_lr(trainer)
-        state["last_train_loss"] = train_loss
-        state["last_lr"] = lr
-
-        emit_metrics(
-            epoch=epoch,
-            total_epochs=total_epochs,
-            step=step,
-            total_steps=total_steps,
-            train_loss=train_loss,
-            val_loss=None,
-            map50=None,
-            map50_95=None,
-            lr=lr,
-            samples_per_sec=sps,
-            eta_secs=eta_secs,
-        )
-
-        if ctrl_state.consume_checkpoint_request():
-            try:
-                if hasattr(trainer, "save_model"):
-                    trainer.save_model()
-                print("[LS-Trainer] Immediate checkpoint saved.", flush=True)
-            except Exception as exc:
-                print(f"[LS-Trainer Warning] Immediate checkpoint save failed: {exc}", flush=True)
-
-        stop_file = _resolve_stop_file(trainer)
-        ctrl_state.wait_if_paused(stop_file)
-        if ctrl_state.is_stop_requested(stop_file):
-            trainer.stop = True
-            try:
-                if hasattr(trainer, "save_model"):
-                    trainer.save_model()
-            except Exception:
-                pass
-            raise KeyboardInterrupt("Stop requested by user")
-
-    def on_fit_epoch_end(trainer):
-        epoch = int(getattr(trainer, "epoch", 0)) + 1
-        total_epochs = int(getattr(trainer, "epochs", 1))
-        train_loader = getattr(trainer, "train_loader", None)
-        try:
-            total_steps = len(train_loader) if train_loader is not None else state["step"]
-        except Exception:
-            total_steps = state["step"]
-        total_steps = max(1, int(total_steps))
-
-        metrics = getattr(trainer, "metrics", None) or {}
-        m50 = None
-        for k in ("metrics/mAP50(B)", "metrics/mAP50(M)"):
-            v = _safe_opt_float(metrics.get(k))
-            if v is not None and (m50 is None or v > m50):
-                m50 = v
-
-        m50_95 = None
-        for k in ("metrics/mAP50-95(B)", "metrics/mAP50-95(M)"):
-            v = _safe_opt_float(metrics.get(k))
-            if v is not None and (m50_95 is None or v > m50_95):
-                m50_95 = v
-
-        val_losses = [
-            _safe_opt_float(v)
-            for k, v in metrics.items()
-            if str(k).startswith("val/") and str(k).endswith("loss")
-        ]
-        val_losses = [v for v in val_losses if v is not None]
-        val_loss = sum(val_losses) if val_losses else None
-
-        rem_epochs = max(0, total_epochs - epoch)
-        avg_dt = state["ema_step_dt"] or 0.0
-        eta_secs = rem_epochs * total_steps * avg_dt
-
-        emit_metrics(
-            epoch=epoch,
-            total_epochs=total_epochs,
-            step=total_steps,
-            total_steps=total_steps,
-            train_loss=state["last_train_loss"],
-            val_loss=val_loss,
-            map50=m50,
-            map50_95=m50_95,
-            lr=state["last_lr"],
-            samples_per_sec=state["last_sps"],
-            eta_secs=eta_secs,
-        )
-        progress_tracker.finish_epoch()
-        timing = progress_tracker.timing_summary(epoch)
-        m50_str = f"{m50:.4f}" if m50 is not None else "0.0000"
-        m95_str = f"{m50_95:.4f}" if m50_95 is not None else "0.0000"
-        cli_spinner.print_line(
-            f"[LS-Trainer Metrics] Epoch {epoch}/{total_epochs} | mAP50={m50_str} | mAP50-95={m95_str} | {timing}"
-        )
+    _RUNTIME.clear()
+    _RUNTIME.update({
+        "ctrl_state": ctrl_state,
+        "progress_tracker": progress_tracker,
+        "cli_spinner": cli_spinner,
+        "state": state,
+        "configured_epochs": configured_epochs,
+        "configured_batch": configured_batch,
+        "default_stop_file": default_stop_file,
+    })
 
     try:
         from ultralytics.utils import callbacks as ul_callbacks

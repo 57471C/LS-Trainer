@@ -468,6 +468,29 @@ def detect_num_workers(cfg):
     return min(8, max(1, base_cores - 1))
 
 
+def parse_xpu_device_indices(requested, available_count):
+    """Parse 'xpu', 'xpu:0', or 'xpu:0,1' into a validated list of XPU device indices."""
+    raw = str(requested or "").strip().lower()
+    if available_count <= 0:
+        return []
+    if raw in ("", "auto", "gpu", "0", "xpu"):
+        return [0]
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    indices = []
+    for part in parts:
+        token = part[4:] if part.startswith("xpu:") else part
+        if token.isdigit():
+            idx = int(token)
+            if 0 <= idx < available_count and idx not in indices:
+                indices.append(idx)
+            elif idx >= available_count:
+                print(
+                    f"[LS-Trainer Warning] Requested XPU index {idx} not available (device_count={available_count}); skipping.",
+                    flush=True,
+                )
+    return indices or [0]
+
+
 def select_training_device(requested):
     import torch
     req = str(requested or "auto").strip().lower()
@@ -479,7 +502,7 @@ def select_training_device(requested):
             "[LS-Trainer] RF-DETR device selection: CPU requested -> device=cpu (accelerator=cpu, devices=1)",
             flush=True,
         )
-        return "cpu"
+        return "cpu", []
 
     if req in ("", "auto", "gpu", "0", "xpu", "xpu:0", "cuda", "cuda:0"):
         if xpu_avail and req not in ("cuda", "cuda:0"):
@@ -495,7 +518,7 @@ def select_training_device(requested):
                 f"[LS-Trainer] RF-DETR device selection: torch.xpu.is_available()=True -> using Intel Arc XPU device=xpu ({dev_name}{count_info})",
                 flush=True,
             )
-            return "xpu"
+            return "xpu:0", [0]
         if cuda_avail:
             dev_name = "CUDA GPU"
             try:
@@ -506,28 +529,37 @@ def select_training_device(requested):
                 f"[LS-Trainer] RF-DETR device selection: torch.cuda.is_available()=True -> using NVIDIA CUDA device=cuda ({dev_name})",
                 flush=True,
             )
-            return "cuda"
+            return "cuda", []
         print(
             "[LS-Trainer] RF-DETR device selection: neither Intel Arc XPU nor CUDA is available -> falling back to device=cpu",
             flush=True,
         )
-        return "cpu"
+        return "cpu", []
 
-    if req.startswith("xpu"):
-        dev_name = "Intel Arc XPU"
-        try:
-            idx = int(req.split(":")[1]) if ":" in req else 0
-            dev_name = torch.xpu.get_device_name(idx)
-        except Exception:
-            pass
+    if req.startswith("xpu") or ("," in req and xpu_avail and not cuda_avail):
+        if not xpu_avail:
+            print(
+                "[LS-Trainer Warning] XPU requested but torch.xpu is not available -> falling back to device=cpu",
+                flush=True,
+            )
+            return "cpu", []
+        dev_count = int(torch.xpu.device_count())
+        indices = parse_xpu_device_indices(req, dev_count)
+        names = []
+        for idx in indices:
+            try:
+                names.append(torch.xpu.get_device_name(idx))
+            except Exception:
+                names.append(f"Intel Arc XPU:{idx}")
+        norm_req = "xpu:" + ",".join(str(i) for i in indices)
         print(
-            f"[LS-Trainer] RF-DETR device selection: using specified Intel Arc device={requested} ({dev_name})",
+            f"[LS-Trainer] RF-DETR device selection: using Intel Arc device={norm_req} ({', '.join(names)})",
             flush=True,
         )
-        return str(requested)
+        return norm_req, indices
 
     print(f"[LS-Trainer] RF-DETR device selection: using custom device={requested}", flush=True)
-    return str(requested)
+    return str(requested), []
 
 
 def main():
@@ -559,7 +591,7 @@ def main():
     import rfdetr.training.trainer as rf_trainer_mod
     from pytorch_lightning import Callback
     from pytorch_lightning.accelerators import Accelerator
-    from pytorch_lightning.strategies import SingleDeviceStrategy
+    from pytorch_lightning.strategies import DDPStrategy, SingleDeviceStrategy
 
     try:
         import rfdetr.utilities.console as rf_console
@@ -578,7 +610,10 @@ def main():
     epochs = int(cfg["epochs"])
     batch_size = max(1, int(cfg["batch_size"]))
     resolution = int(cfg["resolution"])
-    device = select_training_device(cfg.get("device", "auto"))
+    device, xpu_indices = select_training_device(cfg.get("device", "auto"))
+    if len(xpu_indices) > 1:
+        print(f"[LS-Trainer] Multi-GPU: {device} ({len(xpu_indices)} devices)", flush=True)
+    single_device = f"xpu:{xpu_indices[0]}" if xpu_indices else device
     pretrain_weights = cfg["pretrain_weights"]
     freeze_backbone = bool(cfg.get("freeze_backbone", False))
     num_workers = detect_num_workers(cfg)
@@ -602,11 +637,19 @@ def main():
 
         @staticmethod
         def parse_devices(devices):
-            return [torch.device("xpu", 0)]
+            if isinstance(devices, (list, tuple)):
+                return [d if isinstance(d, torch.device) else torch.device("xpu", int(d)) for d in devices]
+            if isinstance(devices, int) and devices > 0:
+                return [torch.device("xpu", i) for i in range(devices)]
+            return [torch.device("xpu", xpu_indices[0] if xpu_indices else 0)]
 
         @staticmethod
         def get_parallel_devices(devices):
-            return [torch.device("xpu", 0)]
+            if isinstance(devices, (list, tuple)):
+                return [d if isinstance(d, torch.device) else torch.device("xpu", int(d)) for d in devices]
+            if isinstance(devices, int) and devices > 0:
+                return [torch.device("xpu", i) for i in range(devices)]
+            return [torch.device("xpu", xpu_indices[0] if xpu_indices else 0)]
 
         @staticmethod
         def auto_device_count():
@@ -625,7 +668,7 @@ def main():
         @staticmethod
         def patched_resolve_device_kwargs(dev, *args, **kwargs):
             if dev is not None and str(dev).strip().lower().startswith("xpu"):
-                return "auto", 1
+                return "auto", (xpu_indices if len(xpu_indices) > 1 else 1)
             return orig_resolve_device_kwargs(dev, *args, **kwargs)
         rf_detr_mod.RFDETR._resolve_trainer_device_kwargs = patched_resolve_device_kwargs
 
@@ -671,6 +714,9 @@ def main():
             return False
 
         def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+            if not getattr(trainer, "is_global_zero", True):
+                self._check_stop_requested(trainer)
+                return
             now = time.time()
             dt = max(1e-6, now - step_state["last_time"])
             step_state["last_time"] = now
@@ -750,6 +796,8 @@ def main():
         def on_train_epoch_start(self, trainer, pl_module):
             step_state["last_time"] = time.time()
             self._check_stop_requested(trainer)
+            if not getattr(trainer, "is_global_zero", True):
+                return
             ep = int(trainer.current_epoch) + 1
             total = int(trainer.max_epochs)
             progress_tracker.start_epoch(ep, total)
@@ -759,7 +807,7 @@ def main():
             )
 
         def on_validation_epoch_end(self, trainer, pl_module):
-            if getattr(trainer, "sanity_checking", False):
+            if getattr(trainer, "sanity_checking", False) or not getattr(trainer, "is_global_zero", True):
                 return
             ep = int(trainer.current_epoch) + 1
             total = int(trainer.max_epochs)
@@ -817,19 +865,23 @@ def main():
     orig_build_trainer = rf_training.build_trainer
 
     def hooked_build_trainer(*args, **kw):
-        if str(device).lower().startswith("xpu"):
-            dev_idx = 0
-            if ":" in str(device):
-                try:
-                    dev_idx = int(str(device).split(":")[1])
-                except Exception:
-                    dev_idx = 0
-            kw["accelerator"] = "auto"
-            kw["devices"] = 1
-            kw["strategy"] = SingleDeviceStrategy(
-                device=torch.device("xpu", dev_idx),
-                accelerator=XPUAccelerator(),
-            )
+        if xpu_indices:
+            if len(xpu_indices) > 1:
+                backend = (
+                    "xccl"
+                    if (hasattr(torch.distributed, "is_xccl_available") and torch.distributed.is_xccl_available())
+                    else "gloo"
+                )
+                kw["accelerator"] = XPUAccelerator()
+                kw["devices"] = xpu_indices
+                kw["strategy"] = DDPStrategy(process_group_backend=backend)
+            else:
+                kw["accelerator"] = "auto"
+                kw["devices"] = 1
+                kw["strategy"] = SingleDeviceStrategy(
+                    device=torch.device("xpu", xpu_indices[0]),
+                    accelerator=XPUAccelerator(),
+                )
         elif str(device).lower().startswith("cuda"):
             dev_idx = 0
             if ":" in str(device):
@@ -863,7 +915,7 @@ def main():
         f"[LS-Trainer] Initializing {class_name} (resolution={resolution}, pretrain_weights={pretrain_weights}, device={device}, eval_backend={eval_backend}, num_workers={num_workers})...",
         flush=True,
     )
-    model = model_cls(resolution=resolution, pretrain_weights=pretrain_weights, device=device)
+    model = model_cls(resolution=resolution, pretrain_weights=pretrain_weights, device=single_device)
 
     train_kwargs = {
         "dataset_dir": dataset_dir,
@@ -871,7 +923,7 @@ def main():
         "epochs": epochs,
         "batch_size": batch_size,
         "resolution": resolution,
-        "device": device,
+        "device": single_device,
         "num_workers": num_workers,
         "run_test": False,
         "progress_bar": False,
