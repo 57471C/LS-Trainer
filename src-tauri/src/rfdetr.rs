@@ -52,10 +52,13 @@ pub(crate) fn ensure_rfdetr_installed(project_root: &Path, sink: &Arc<dyn Traini
     };
 
     let mut check_cmd = Command::new(&python_exe);
-    check_cmd.args([
-        "-c",
-        "import rfdetr, pytorch_lightning, pycocotools, vernier, hotcoco, faster_coco_eval, onnx, torch_linear_assignment; from rfdetr.training import build_trainer",
-    ]);
+    check_cmd
+        .args([
+            "-c",
+            "import rfdetr, pytorch_lightning, pycocotools, vernier, hotcoco, faster_coco_eval, onnx, torch_linear_assignment; from rfdetr.training import build_trainer",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     hide_console_window(&mut check_cmd);
     if let Ok(status) = check_cmd.status() {
         if status.success() {
@@ -103,7 +106,10 @@ pub(crate) fn verify_rfdetr_dependencies(project_root: &Path) -> Result<(), Stri
         .ok_or_else(|| "Python virtual environment not found in .venv".to_string())?;
 
     let mut check_cmd = Command::new(&python_exe);
-    check_cmd.args(["-c", "import torch_linear_assignment"]);
+    check_cmd
+        .args(["-c", "import torch_linear_assignment"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     hide_console_window(&mut check_cmd);
     match check_cmd.status() {
         Ok(status) if status.success() => Ok(()),

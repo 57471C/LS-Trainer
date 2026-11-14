@@ -174,6 +174,7 @@ pub(crate) async fn start_rfdetr_training(
     .env("PYTHONUNBUFFERED", "1")
     .env("PYTHONUTF8", "1")
     .env("PYTHONIOENCODING", "utf-8")
+    .env("TORCH_DISABLE_FLOP_COUNTER", "1")
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
@@ -182,7 +183,7 @@ pub(crate) async fn start_rfdetr_training(
     hide_console_window_tokio(&mut cmd);
 
     sink.on_log(format!(
-        "[LS-Trainer] Spawning child process: exe='{}' cwd='{}' env(PYTHONUNBUFFERED=1, PYTHONUTF8=1, PYTHONIOENCODING=utf-8)",
+        "[LS-Trainer] Spawning child process: exe='{}' cwd='{}' env(PYTHONUNBUFFERED=1, PYTHONUTF8=1, PYTHONIOENCODING=utf-8, TORCH_DISABLE_FLOP_COUNTER=1)",
         python_exe.display(),
         project_root.display()
     ));

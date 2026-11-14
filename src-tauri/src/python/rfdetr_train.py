@@ -12,21 +12,23 @@ import warnings
 
 os.environ.setdefault("TORCH_DISABLE_FLOP_COUNTER", "1")
 
-_NOISY_WARNING_PATTERNS = (
-    (r".*torch\.jit\.script.*deprecated.*", FutureWarning),
-    (r".*(triton not found|flop counting).*", Warning),
-    (r".*AccumulateGrad.*stream.*", UserWarning),
-    (r".*default training augmentation backend.*", UserWarning),
-    (r".*LeafSpec.*", Warning),
-    (r".*sync_dist.*", Warning),
-)
+# Before torch, rfdetr, and lightning. The triton line is logging.warning on
+# torch.utils.flop_counter (glog-style stderr), so a root-logger filter never
+# sees it. warnings filters cover the warning module; the handler hook covers
+# records emitted on child loggers.
+warnings.filterwarnings("ignore", message=".*triton not found.*")
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*torch.jit.script.*")
+warnings.filterwarnings("ignore", category=UserWarning, message=".*AccumulateGrad.*")
+warnings.filterwarnings("ignore", category=UserWarning, message=".*augmentation backend.*")
+warnings.filterwarnings("ignore", message=".*LeafSpec.*")
+warnings.filterwarnings("ignore", message=".*sync_dist.*")
 
 _NOISY_LOG_SUBSTRINGS = (
     "triton not found",
     "flop counting will not work",
     "torch.jit.script",
     "accumulategrad",
-    "default training augmentation backend",
+    "augmentation backend",
     "leafspec",
     "sync_dist",
 )
@@ -38,15 +40,44 @@ class _NoisyLogFilter(logging.Filter):
             msg = record.getMessage().lower()
         except Exception:
             msg = str(getattr(record, "msg", "")).lower()
-        return not any(sub in msg for sub in _NOISY_LOG_SUBSTRINGS)
+        path = str(getattr(record, "pathname", "") or "").lower()
+        blob = msg + "\n" + path
+        return not any(sub in blob for sub in _NOISY_LOG_SUBSTRINGS)
+
+
+_NOISY_LOG_FILTER = _NoisyLogFilter()
+_ORIG_HANDLER_HANDLE = logging.Handler.handle
+
+
+def _filtered_handler_handle(self, record):
+    if not _NOISY_LOG_FILTER.filter(record):
+        return False
+    return _ORIG_HANDLER_HANDLE(self, record)
 
 
 def _install_warning_and_log_filters():
-    for pattern, cat in _NOISY_WARNING_PATTERNS:
-        warnings.filterwarnings("ignore", message=pattern, category=cat)
+    warnings.filterwarnings("ignore", message=".*triton not found.*")
+    warnings.filterwarnings("ignore", category=FutureWarning, message=".*torch.jit.script.*")
+    warnings.filterwarnings("ignore", category=UserWarning, message=".*AccumulateGrad.*")
+    warnings.filterwarnings("ignore", category=UserWarning, message=".*augmentation backend.*")
+    warnings.filterwarnings("ignore", message=".*LeafSpec.*")
+    warnings.filterwarnings("ignore", message=".*sync_dist.*")
+    if logging.Handler.handle is not _filtered_handler_handle:
+        logging.Handler.handle = _filtered_handler_handle
+    for name in (
+        "torch",
+        "torch.utils",
+        "torch.utils.flop_counter",
+        "pytorch_lightning",
+        "lightning_fabric",
+        "rfdetr",
+    ):
+        logger = logging.getLogger(name)
+        if not any(isinstance(f, _NoisyLogFilter) for f in logger.filters):
+            logger.addFilter(_NOISY_LOG_FILTER)
     root_logger = logging.getLogger()
     if not any(isinstance(f, _NoisyLogFilter) for f in root_logger.filters):
-        root_logger.addFilter(_NoisyLogFilter())
+        root_logger.addFilter(_NOISY_LOG_FILTER)
 
 
 _install_warning_and_log_filters()
