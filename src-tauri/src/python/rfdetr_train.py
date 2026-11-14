@@ -7,6 +7,18 @@ import sys
 import threading
 import time
 import traceback
+import warnings
+
+os.environ.setdefault("TORCH_DISABLE_FLOP_COUNTER", "1")
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torch\.jit\.script.*deprecated.*",
+    category=FutureWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*triton not found.*",
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     try:

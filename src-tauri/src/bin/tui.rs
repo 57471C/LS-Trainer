@@ -1649,6 +1649,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut terminal = ratatui::init();
+    let mut clipboard: Option<Clipboard> = None;
     let tick_rate = Duration::from_millis(80);
 
     loop {
@@ -1742,7 +1743,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     KeyCode::F(12) => {
-                        copy_logs_with_feedback(&state);
+                        copy_logs_with_feedback(&state, &mut clipboard);
                     }
                     _ => {}
                 }
@@ -1754,7 +1755,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn copy_logs_with_feedback(state: &Arc<Mutex<AppState>>) {
+fn copy_logs_with_feedback(state: &Arc<Mutex<AppState>>, clipboard: &mut Option<Clipboard>) {
     let (logs_text, line_count) = {
         let Ok(guard) = state.lock() else {
             return;
@@ -1771,7 +1772,7 @@ fn copy_logs_with_feedback(state: &Arc<Mutex<AppState>>) {
         return;
     }
 
-    match copy_text_to_clipboard(&logs_text) {
+    match copy_text_to_clipboard(clipboard, &logs_text) {
         Ok(()) => {
             if let Ok(mut guard) = state.lock() {
                 guard.status_line = format!("Copied {line_count} log lines to clipboard (F12)");
@@ -1789,7 +1790,12 @@ fn copy_logs_with_feedback(state: &Arc<Mutex<AppState>>) {
     }
 }
 
-fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
-    let mut cb = Clipboard::new().map_err(|e| e.to_string())?;
+fn copy_text_to_clipboard(clipboard: &mut Option<Clipboard>, text: &str) -> Result<(), String> {
+    if clipboard.is_none() {
+        *clipboard = Some(Clipboard::new().map_err(|e| e.to_string())?);
+    }
+    let cb = clipboard
+        .as_mut()
+        .ok_or_else(|| "clipboard unavailable".to_string())?;
     cb.set_text(text.to_owned()).map_err(|e| e.to_string())
 }
