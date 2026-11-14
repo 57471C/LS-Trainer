@@ -89,6 +89,13 @@ async function copyLogsToClipboard() {
 	}
 }
 
+function handleWindowKeydown(e: KeyboardEvent) {
+	if (e.key === "F12" && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+		e.preventDefault();
+		void copyLogsToClipboard();
+	}
+}
+
 async function handleOpenFolder(folderPath: string) {
 	if (!folderPath) return;
 	if (isTauri()) {
@@ -128,6 +135,8 @@ async function handleCopyOnnxPath() {
 	}
 }
 </script>
+
+<svelte:window onkeydown={handleWindowKeydown} />
 
 {#if isLogPanelOpen}
 	<!-- Resizer Divider Handle -->
@@ -183,7 +192,7 @@ async function handleCopyOnnxPath() {
 						onclick={copyLogsToClipboard}
 						disabled={logs.length === 0}
 						class="rounded bg-zinc-800/80 p-1 text-zinc-400 transition hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-40"
-						title={hasCopiedLogs ? "Copied!" : "Copy logs to clipboard"}
+						title={hasCopiedLogs ? "Copied!" : "Copy logs to clipboard (F12)"}
 						aria-label="Copy logs to clipboard"
 					>
 						{#if hasCopiedLogs}

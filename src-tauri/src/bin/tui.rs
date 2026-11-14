@@ -2,6 +2,8 @@
 
 use std::collections::VecDeque;
 use std::env;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1252,6 +1254,14 @@ fn render_bottom_log_and_footer(frame: &mut Frame, area: Rect, state: &AppState)
         ),
         Span::styled(" Scroll Logs  ", Style::default().fg(Color::White)),
         Span::styled(
+            " [F12] ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Copy Log  ", Style::default().fg(Color::White)),
+        Span::styled(
             " [q] ",
             Style::default()
                 .fg(Color::White)
@@ -1732,6 +1742,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                    KeyCode::F(12) => {
+                        copy_logs_with_feedback(&state);
+                    }
                     _ => {}
                 }
             }
@@ -1740,4 +1753,96 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ratatui::restore();
     Ok(())
+}
+
+fn copy_logs_with_feedback(state: &Arc<Mutex<AppState>>) {
+    let (logs_text, line_count) = {
+        let Ok(guard) = state.lock() else {
+            return;
+        };
+        let count = guard.logs.len();
+        let text = guard.logs.iter().cloned().collect::<Vec<_>>().join("\n");
+        (text, count)
+    };
+
+    if line_count == 0 {
+        if let Ok(mut guard) = state.lock() {
+            guard.status_line = "No logs to copy.".to_string();
+        }
+        return;
+    }
+
+    match copy_text_to_clipboard(&logs_text) {
+        Ok(()) => {
+            if let Ok(mut guard) = state.lock() {
+                guard.status_line = format!("Copied {line_count} log lines to clipboard (F12)");
+                guard.push_log(format!(
+                    "[LS-Trainer] Copied {line_count} log lines to clipboard."
+                ));
+            }
+        }
+        Err(err) => {
+            if let Ok(mut guard) = state.lock() {
+                guard.status_line = format!("Clipboard copy failed: {err}");
+                guard.push_log(format!("[LS-Trainer Warning] Clipboard copy failed: {err}"));
+            }
+        }
+    }
+}
+
+fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        return pipe_to_clipboard_command("clip", &[], text);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return pipe_to_clipboard_command("pbcopy", &[], text);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        for (cmd, args) in [
+            ("wl-copy", &[][..]),
+            ("xclip", &["-selection", "clipboard"][..]),
+            ("xsel", &["--clipboard", "--input"][..]),
+        ] {
+            if pipe_to_clipboard_command(cmd, args, text).is_ok() {
+                return Ok(());
+            }
+        }
+        return Err("no clipboard utility found (tried wl-copy, xclip, xsel)".to_string());
+    }
+}
+
+fn pipe_to_clipboard_command(program: &str, args: &[&str], text: &str) -> Result<(), String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to launch {program}: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| format!("failed to write to {program}: {e}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("failed waiting for {program}: {e}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            Err(format!("{program} exited with status {}", output.status))
+        } else {
+            Err(format!("{program} failed: {stderr}"))
+        }
+    }
 }
