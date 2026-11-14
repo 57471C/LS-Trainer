@@ -17,7 +17,17 @@ warnings.filterwarnings(
 )
 warnings.filterwarnings(
     "ignore",
-    message=r".*triton not found.*",
+    message=r".*(triton not found|flop counting).*",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*AccumulateGrad.*stream.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*default training augmentation backend.*",
+    category=UserWarning,
 )
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -911,9 +921,12 @@ def main():
                 )
                 kw["accelerator"] = XPUAccelerator()
                 kw["devices"] = xpu_indices
-                kw["strategy"] = XPUDDPStrategy(process_group_backend=backend)
+                kw["strategy"] = XPUDDPStrategy(
+                    process_group_backend=backend,
+                    find_unused_parameters=True,
+                )
                 print(
-                    f"[LS-Trainer] RF-DETR Multi-GPU strategy: accelerator=XPUAccelerator, strategy=XPUDDPStrategy, backend={backend}, devices={xpu_indices}",
+                    f"[LS-Trainer] RF-DETR Multi-GPU strategy: accelerator=XPUAccelerator, strategy=XPUDDPStrategy, backend={backend}, devices={xpu_indices}, find_unused_parameters=True",
                     flush=True,
                 )
             else:
