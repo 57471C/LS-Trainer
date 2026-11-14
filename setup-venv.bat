@@ -189,7 +189,9 @@ REM 5. Auto-detect GPU & driver and install matching PyTorch wheel.
 REM
 REM Detection priority:
 REM   1. Intel Arc / XPU GPU (Win32_VideoController matching "Intel" + "Arc", or torch.xpu)
-REM      -> Installs Intel Arc XPU build from https://download.pytorch.org/whl/xpu (no CUDA packages)
+REM      -> Installs the pinned Windows Arc XPU stack from requirements-win-xpu.txt
+REM         (deliberate temporary pin for Windows Arc stability; newer +xpu wheels
+REM          regress with Ultralytics) and avoids pulling CUDA packages.
 REM   2. NVIDIA GPU (nvidia-smi or Win32_VideoController matching "NVIDIA")
 REM      -> Installs CUDA 12.8 (Blackwell / driver >= 560) or CUDA 12.4 build
 REM   3. CPU Fallback (neither Intel Arc nor NVIDIA detected)
@@ -221,7 +223,8 @@ if exist "%GPU_DETECT_OUT%" (
 
 echo [*] Detected Device: !GPU_DISPLAY! ^(!CUDA_LABEL! - !TARGET_WHEEL!^)
 
-"%VENV_PYTHON%" -c "import sys; tw='!TARGET_WHEEL!'; ok=False; import torch; ver=getattr(torch,'__version__',''); xpu=bool(hasattr(torch,'xpu') and torch.xpu.is_available()); cuda=bool(torch.cuda.is_available()); t=torch.zeros(1,device='xpu')+1 if (tw=='xpu' and xpu) else (torch.zeros(1,device='cuda')+1 if (tw.startswith('cu') and cuda) else None); (torch.xpu.synchronize() if (tw=='xpu' and xpu) else (torch.cuda.synchronize() if (tw.startswith('cu') and cuda) else None)); ok=(xpu and '+xpu' in ver) if tw=='xpu' else ((cuda and ('+'+tw) in ver) if tw.startswith('cu') else (bool(ver) and '+cu' not in ver and '+xpu' not in ver)); print(ok)" > "%GPU_VERIFY_OUT%" 2>nul
+set "LS_WIN_XPU_REQ=%APP_DIR%requirements-win-xpu.txt"
+"%VENV_PYTHON%" -c "import os,sys; tw='!TARGET_WHEEL!'; req=os.environ.get('LS_WIN_XPU_REQ',''); pinned=next((l.strip().split('==',1)[1] for l in open(req,encoding='utf-8') if l.strip().startswith('torch==')),'') if (tw=='xpu' and req and os.path.isfile(req)) else ''; ok=False; import torch; ver=getattr(torch,'__version__',''); xpu=bool(hasattr(torch,'xpu') and torch.xpu.is_available()); cuda=bool(torch.cuda.is_available()); t=torch.zeros(1,device='xpu')+1 if (tw=='xpu' and xpu) else (torch.zeros(1,device='cuda')+1 if (tw.startswith('cu') and cuda) else None); (torch.xpu.synchronize() if (tw=='xpu' and xpu) else (torch.cuda.synchronize() if (tw.startswith('cu') and cuda) else None)); ok=(xpu and (ver==pinned if pinned else '+xpu' in ver)) if tw=='xpu' else ((cuda and ('+'+tw) in ver) if tw.startswith('cu') else (bool(ver) and '+cu' not in ver and '+xpu' not in ver)); print(ok)" > "%GPU_VERIFY_OUT%" 2>nul
 
 set "WHEEL_READY=False"
 if exist "%GPU_VERIFY_OUT%" (
@@ -251,7 +254,13 @@ if /i "!WHEEL_READY!"=="True" (
 
 echo [*] Installing PyTorch for !GPU_DISPLAY! ^(!CUDA_LABEL!^) from !TARGET_URL!...
 "%VENV_PYTHON%" -m pip uninstall -y torch torchvision torchaudio
-"%VENV_PYTHON%" -m pip install torch torchvision torchaudio --index-url !TARGET_URL!
+if /i "!TARGET_WHEEL!"=="xpu" (
+    REM Deliberate temporary pin for Windows Intel Arc stability (see requirements-win-xpu.txt).
+    echo [*] Using pinned Windows Intel Arc XPU requirements: "%APP_DIR%requirements-win-xpu.txt"
+    "%VENV_PYTHON%" -m pip install -r "%APP_DIR%requirements-win-xpu.txt"
+) else (
+    "%VENV_PYTHON%" -m pip install torch torchvision torchaudio --index-url !TARGET_URL!
+)
 if !ERRORLEVEL! NEQ 0 (
     echo [!] Warning: !CUDA_LABEL! wheels failed to install. Reinstalling fallback CPU PyTorch...
     "%VENV_PYTHON%" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu

@@ -234,6 +234,25 @@ fn intel_arc_and_pytorch_wheel_selection() {
     let (cpu_wheel, cpu_url, _) = select_pytorch_wheel(None, None);
     assert_eq!(cpu_wheel, "cpu");
     assert_eq!(cpu_url, "https://download.pytorch.org/whl/cpu");
+
+    let (win_xpu_url, win_xpu_pkgs) =
+        crate::hardware::parse_win_xpu_requirements(include_str!("../../requirements-win-xpu.txt"));
+    assert_eq!(
+        win_xpu_url.as_deref(),
+        Some("https://download.pytorch.org/whl/xpu")
+    );
+    assert_eq!(
+        win_xpu_pkgs,
+        vec![
+            "torch==2.9.1+xpu".to_string(),
+            "torchvision==0.24.1+xpu".to_string(),
+            "torchaudio==2.9.1+xpu".to_string(),
+        ]
+    );
+    assert_eq!(
+        crate::hardware::pinned_win_xpu_torch_version().as_deref(),
+        Some("2.9.1+xpu")
+    );
 }
 
 #[test]

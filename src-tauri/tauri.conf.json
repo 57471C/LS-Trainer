@@ -34,7 +34,8 @@
 			"icons/icon.ico"
 		],
 		"resources": {
-			"../setup-venv.bat": "setup-venv.bat"
+			"../setup-venv.bat": "setup-venv.bat",
+			"../requirements-win-xpu.txt": "requirements-win-xpu.txt"
 		},
 		"windows": {
 			"nsis": {
