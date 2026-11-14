@@ -508,6 +508,29 @@ def detect_num_workers(cfg):
     return min(8, max(1, base_cores - 1))
 
 
+def parse_xpu_device_indices(requested, available_count):
+    """Parse 'xpu', 'xpu:0', or 'xpu:0,1' into a validated list of XPU device indices."""
+    raw = str(requested or "").strip().lower()
+    if available_count <= 0:
+        return []
+    if raw in ("", "auto", "gpu", "0", "xpu"):
+        return [0]
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    indices = []
+    for part in parts:
+        token = part[4:] if part.startswith("xpu:") else part
+        if token.isdigit():
+            idx = int(token)
+            if 0 <= idx < available_count and idx not in indices:
+                indices.append(idx)
+            elif idx >= available_count:
+                print(
+                    f"[LS-Trainer Warning] Requested XPU index {idx} not available (device_count={available_count}); skipping.",
+                    flush=True,
+                )
+    return indices or [0]
+
+
 def select_training_device(requested):
     import torch
     req = str(requested or "auto").strip().lower()
@@ -519,7 +542,7 @@ def select_training_device(requested):
             "[LS-Trainer] RT-DETR device selection: CPU requested -> device=cpu",
             flush=True,
         )
-        return "cpu", "CPU"
+        return "cpu", "CPU", []
 
     if req in ("", "auto", "gpu", "0", "xpu", "xpu:0", "cuda", "cuda:0"):
         if xpu_avail and req not in ("cuda", "cuda:0"):
@@ -535,7 +558,7 @@ def select_training_device(requested):
                 f"[LS-Trainer] RT-DETR device selection: torch.xpu.is_available()=True -> using Intel Arc XPU device=xpu ({dev_name}{count_info})",
                 flush=True,
             )
-            return "xpu", dev_name
+            return "xpu:0", dev_name, [0]
         if cuda_avail:
             dev_name = "CUDA GPU"
             try:
@@ -546,25 +569,35 @@ def select_training_device(requested):
                 f"[LS-Trainer] RT-DETR device selection: torch.cuda.is_available()=True -> using NVIDIA CUDA device=cuda ({dev_name})",
                 flush=True,
             )
-            return "cuda", dev_name
+            return "cuda", dev_name, []
         print(
             "[LS-Trainer] RT-DETR device selection: neither Intel Arc XPU nor CUDA is available -> falling back to device=cpu",
             flush=True,
         )
-        return "cpu", "CPU"
+        return "cpu", "CPU", []
 
-    if req.startswith("xpu"):
-        dev_name = "Intel Arc XPU"
-        try:
-            idx = int(req.split(":")[1]) if ":" in req else 0
-            dev_name = torch.xpu.get_device_name(idx)
-        except Exception:
-            pass
+    if req.startswith("xpu") or ("," in req and xpu_avail and not cuda_avail):
+        if not xpu_avail:
+            print(
+                "[LS-Trainer Warning] XPU requested but torch.xpu is not available -> falling back to device=cpu",
+                flush=True,
+            )
+            return "cpu", "CPU", []
+        dev_count = int(torch.xpu.device_count())
+        indices = parse_xpu_device_indices(req, dev_count)
+        names = []
+        for idx in indices:
+            try:
+                names.append(torch.xpu.get_device_name(idx))
+            except Exception:
+                names.append(f"Intel Arc XPU:{idx}")
+        norm_req = "xpu:" + ",".join(str(i) for i in indices)
+        dev_name = ", ".join(names)
         print(
-            f"[LS-Trainer] RT-DETR device selection: using specified Intel Arc device={requested} ({dev_name})",
+            f"[LS-Trainer] RT-DETR device selection: using Intel Arc device={norm_req} ({dev_name})",
             flush=True,
         )
-        return req, dev_name
+        return norm_req, dev_name, indices
 
     if req.startswith("cuda"):
         dev_name = "CUDA GPU"
@@ -577,10 +610,10 @@ def select_training_device(requested):
             f"[LS-Trainer] RT-DETR device selection: using specified CUDA device={requested} ({dev_name})",
             flush=True,
         )
-        return req, dev_name
+        return req, dev_name, []
 
     print(f"[LS-Trainer] RT-DETR device selection: using custom device={requested}", flush=True)
-    return req, requested
+    return req, requested, []
 
 
 def find_annotation_file(split_dir):
@@ -825,9 +858,60 @@ def main():
     freeze_backbone = bool(cfg.get("freeze_backbone", False))
     amp = bool(cfg.get("amp", True))
     num_workers = detect_num_workers(cfg)
-    device_req, device_name = select_training_device(cfg.get("device", "auto"))
+    ddp_worker = os.environ.get("LS_RTDETR_DDP_WORKER") == "1"
+    if ddp_worker and os.environ.get("LS_RTDETR_XPU_DEVICES"):
+        xpu_indices = [
+            int(x) for x in os.environ["LS_RTDETR_XPU_DEVICES"].split(",") if x.strip().isdigit()
+        ]
+        device_req = "xpu:" + ",".join(str(i) for i in xpu_indices)
+        device_name = "Intel Arc XPU"
+    else:
+        device_req, device_name, xpu_indices = select_training_device(cfg.get("device", "auto"))
 
     os.makedirs(output_dir, exist_ok=True)
+    stop_file = os.path.join(output_dir, ".stop_requested")
+
+    if not ddp_worker and len(xpu_indices) > 1:
+        import socket
+        import subprocess
+
+        print(f"[LS-Trainer] Multi-GPU: {device_req} ({len(xpu_indices)} devices)", flush=True)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+
+        worker_env = os.environ.copy()
+        worker_env["LS_RTDETR_DDP_WORKER"] = "1"
+        worker_env["LS_RTDETR_XPU_DEVICES"] = ",".join(str(i) for i in xpu_indices)
+        worker_env["PYTHONUNBUFFERED"] = "1"
+        cmd = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--nproc_per_node",
+            str(len(xpu_indices)),
+            "--master_port",
+            str(port),
+            os.path.abspath(__file__),
+            cfg_path,
+        ]
+        proc = subprocess.Popen(cmd, env=worker_env)
+        try:
+            while proc.poll() is None:
+                if ctrl_state.is_stop_requested(stop_file):
+                    try:
+                        with open(stop_file, "w", encoding="utf-8") as sf:
+                            sf.write("stop")
+                    except Exception:
+                        pass
+                    proc.terminate()
+                    break
+                time.sleep(0.2)
+            rc = proc.wait()
+        except KeyboardInterrupt:
+            proc.terminate()
+            rc = proc.wait()
+        sys.exit(rc)
 
     # Locate dataset splits
     train_dir = os.path.join(dataset_dir, "train")
@@ -849,10 +933,32 @@ def main():
         valid_dir = train_dir
 
     import torch
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
     from torch.utils.data import DataLoader
+    from torch.utils.data.distributed import DistributedSampler
     from transformers import RTDetrV2ForObjectDetection
 
-    torch_device = torch.device(device_req)
+    is_ddp = ddp_worker and len(xpu_indices) > 1
+    rank = 0
+    local_rank = 0
+    world_size = 1
+    if is_ddp:
+        rank = int(os.environ.get("RANK", "0"))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        world_size = int(os.environ.get("WORLD_SIZE", str(len(xpu_indices))))
+        dev_idx = xpu_indices[local_rank % len(xpu_indices)]
+        torch.xpu.set_device(dev_idx)
+        torch_device = torch.device("xpu", dev_idx)
+        backend = "xccl" if (hasattr(dist, "is_xccl_available") and dist.is_xccl_available()) else "gloo"
+        dist.init_process_group(backend=backend)
+    elif xpu_indices:
+        torch.xpu.set_device(xpu_indices[0])
+        torch_device = torch.device("xpu", xpu_indices[0])
+    else:
+        torch_device = torch.device(device_req)
+    is_rank_zero = (rank == 0)
+    eval_device_str = str(torch_device)
 
     # Build datasets
     train_ds = RTDetrCocoDataset(train_dir, train_ann, resolution=resolution, is_train=True)
@@ -876,10 +982,16 @@ def main():
     # Pin memory when on GPU/XPU
     pin_mem = device_req != "cpu"
 
+    train_sampler = (
+        DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
+        if is_ddp
+        else None
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=pin_mem,
@@ -922,6 +1034,8 @@ def main():
         print("[LS-Trainer] RT-DETR: Backbone parameters frozen.", flush=True)
 
     model.to(torch_device)
+    if is_ddp:
+        model = DDP(model, device_ids=[torch_device.index])
 
     # Optimizer and LR scheduler
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -943,7 +1057,8 @@ def main():
             pass
 
     def _save_last_checkpoint(ep_idx, m50_val, m95_val):
-        state_dict_cpu = {k: v.cpu() for k, v in model.state_dict().items()}
+        raw_model = model.module if hasattr(model, "module") else model
+        state_dict_cpu = {k: v.cpu() for k, v in raw_model.state_dict().items()}
         payload = {
             "epoch": ep_idx,
             "state_dict": state_dict_cpu,
@@ -962,13 +1077,17 @@ def main():
     total_steps = max(1, len(train_loader))
     progress_tracker = ProgressTracker(epochs)
     cli_spinner = CliSpinner(progress_tracker)
-    cli_spinner.start()
+    if is_rank_zero:
+        cli_spinner.start()
 
     try:
         for epoch in range(1, epochs + 1):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
             ctrl_state.wait_if_paused(stop_file)
             if ctrl_state.is_stop_requested(stop_file):
-                cli_spinner.print_line(f"[LS-Trainer] Stop requested by user before epoch {epoch}. Stopping gracefully...")
+                if is_rank_zero:
+                    cli_spinner.print_line(f"[LS-Trainer] Stop requested by user before epoch {epoch}. Stopping gracefully...")
                 user_stopped = True
                 break
 
@@ -976,9 +1095,10 @@ def main():
             last_step_time = epoch_start_time
             progress_tracker.start_epoch(epoch, epochs)
             timing = progress_tracker.timing_summary(max(0, epoch - 1))
-            cli_spinner.print_line(
-                f"Epoch {epoch}/{epochs} - {model_name} training on {device_req}... | {timing}"
-            )
+            if is_rank_zero:
+                cli_spinner.print_line(
+                    f"Epoch {epoch}/{epochs} - {model_name} training on {device_req}... | {timing}"
+                )
 
             model.train()
             total_loss = 0.0
@@ -1030,21 +1150,22 @@ def main():
                 eta_secs = rem_steps * (ema_step_dt or dt)
                 current_lr = _safe_float(optimizer.param_groups[0].get("lr", 1e-4), 1e-4)
 
-                emit_metrics(
-                    epoch=epoch,
-                    total_epochs=epochs,
-                    step=step_idx,
-                    total_steps=total_steps,
-                    train_loss=step_loss,
-                    val_loss=None,
-                    map50=None,
-                    map50_95=None,
-                    lr=current_lr,
-                    samples_per_sec=last_sps,
-                    eta_secs=eta_secs,
-                )
+                if is_rank_zero:
+                    emit_metrics(
+                        epoch=epoch,
+                        total_epochs=epochs,
+                        step=step_idx,
+                        total_steps=total_steps,
+                        train_loss=step_loss,
+                        val_loss=None,
+                        map50=None,
+                        map50_95=None,
+                        lr=current_lr,
+                        samples_per_sec=last_sps,
+                        eta_secs=eta_secs,
+                    )
 
-                if ctrl_state.consume_checkpoint_request():
+                if is_rank_zero and ctrl_state.consume_checkpoint_request():
                     try:
                         _save_last_checkpoint(epoch, best_map50, best_map50_95)
                         print("[LS-Trainer] Immediate checkpoint saved.", flush=True)
@@ -1061,51 +1182,57 @@ def main():
             avg_loss = total_loss / max(1, num_batches)
             dur = time.time() - epoch_start_time
 
-            # Validation
-            print("[LS-Trainer] Running COCO validation evaluation...", flush=True)
-            map50, map50_95 = evaluate_coco(model, val_loader, valid_ann, device_req, amp=amp)
-            print(f"[LS-Trainer] Evaluation complete: map50={map50:.4f}, map50-95={map50_95:.4f}", flush=True)
+            # Validation (rank 0 only)
+            if is_ddp:
+                dist.barrier()
+            if is_rank_zero:
+                print("[LS-Trainer] Running COCO validation evaluation...", flush=True)
+                raw_eval_model = model.module if hasattr(model, "module") else model
+                map50, map50_95 = evaluate_coco(raw_eval_model, val_loader, valid_ann, eval_device_str, amp=amp)
+                print(f"[LS-Trainer] Evaluation complete: map50={map50:.4f}, map50-95={map50_95:.4f}", flush=True)
 
-            is_best = map50 >= best_map50
-            if is_best:
-                best_map50 = map50
-                best_map50_95 = map50_95
+                is_best = map50 >= best_map50
+                if is_best:
+                    best_map50 = map50
+                    best_map50_95 = map50_95
 
-            # Checkpoint saving
-            ckpt_payload = _save_last_checkpoint(epoch, map50, map50_95)
+                # Checkpoint saving
+                ckpt_payload = _save_last_checkpoint(epoch, map50, map50_95)
 
-            if is_best:
-                best_path = os.path.join(weights_dir, "best.pth")
-                torch.save(ckpt_payload, best_path)
-                torch.save(ckpt_payload, os.path.join(output_dir, "best.pth"))
+                if is_best:
+                    best_path = os.path.join(weights_dir, "best.pth")
+                    torch.save(ckpt_payload, best_path)
+                    torch.save(ckpt_payload, os.path.join(output_dir, "best.pth"))
 
-            # Save run metrics and training config
-            with open(os.path.join(output_dir, "ls_trainer_metrics.json"), "w", encoding="utf-8") as mf:
-                json.dump({"map50": best_map50, "map50_95": best_map50_95}, mf, indent=2)
+                # Save run metrics and training config
+                with open(os.path.join(output_dir, "ls_trainer_metrics.json"), "w", encoding="utf-8") as mf:
+                    json.dump({"map50": best_map50, "map50_95": best_map50_95}, mf, indent=2)
 
-            progress_tracker.finish_epoch()
-            timing_done = progress_tracker.timing_summary(epoch)
-            metrics_str = f"loss: {avg_loss:.4f} | mAP50={map50:.4f} | mAP50-95={map50_95:.4f} | {timing_done}"
-            cli_spinner.print_line(f"[LS-Trainer Epoch] Epoch {epoch}/{epochs} finished in {dur:.1f}s - {metrics_str}")
-            cli_spinner.print_line(f"Epoch {epoch}/{epochs} finished")
-            cli_spinner.print_line(f"[LS-Trainer Metrics] Epoch {epoch}/{epochs} | {metrics_str}")
+                progress_tracker.finish_epoch()
+                timing_done = progress_tracker.timing_summary(epoch)
+                metrics_str = f"loss: {avg_loss:.4f} | mAP50={map50:.4f} | mAP50-95={map50_95:.4f} | {timing_done}"
+                cli_spinner.print_line(f"[LS-Trainer Epoch] Epoch {epoch}/{epochs} finished in {dur:.1f}s - {metrics_str}")
+                cli_spinner.print_line(f"Epoch {epoch}/{epochs} finished")
+                cli_spinner.print_line(f"[LS-Trainer Metrics] Epoch {epoch}/{epochs} | {metrics_str}")
 
-            current_lr = _safe_float(optimizer.param_groups[0].get("lr", 1e-4), 1e-4)
-            rem_epochs = max(0, epochs - epoch)
-            eta_secs = rem_epochs * total_steps * (ema_step_dt or 0.0)
-            emit_metrics(
-                epoch=epoch,
-                total_epochs=epochs,
-                step=total_steps,
-                total_steps=total_steps,
-                train_loss=avg_loss,
-                val_loss=None,
-                map50=map50,
-                map50_95=map50_95,
-                lr=current_lr,
-                samples_per_sec=last_sps,
-                eta_secs=eta_secs,
-            )
+                current_lr = _safe_float(optimizer.param_groups[0].get("lr", 1e-4), 1e-4)
+                rem_epochs = max(0, epochs - epoch)
+                eta_secs = rem_epochs * total_steps * (ema_step_dt or 0.0)
+                emit_metrics(
+                    epoch=epoch,
+                    total_epochs=epochs,
+                    step=total_steps,
+                    total_steps=total_steps,
+                    train_loss=avg_loss,
+                    val_loss=None,
+                    map50=map50,
+                    map50_95=map50_95,
+                    lr=current_lr,
+                    samples_per_sec=last_sps,
+                    eta_secs=eta_secs,
+                )
+            if is_ddp:
+                dist.barrier()
 
             if user_stopped or ctrl_state.is_stop_requested(stop_file):
                 print(f"[LS-Trainer] RT-DETR training stopped by user. Checkpoints preserved at: {output_dir}", flush=True)
@@ -1117,28 +1244,31 @@ def main():
         user_stopped = True
     finally:
         cli_spinner.stop()
+        if is_ddp and dist.is_initialized():
+            dist.destroy_process_group()
 
-    # Save final training_config.json
-    final_config = {
-        "model_family": "RT-DETR",
-        "model_name": model_name,
-        "pretrain_weights": pretrain_weights,
-        "base_weights": base_weights,
-        "num_classes": num_classes,
-        "class_names": class_names,
-        "resolution": resolution,
-        "task": "detect",
-        "epochs": epochs,
-        "best_map50": best_map50,
-        "best_map50_95": best_map50_95,
-    }
-    with open(os.path.join(output_dir, "training_config.json"), "w", encoding="utf-8") as f:
-        json.dump(final_config, f, indent=2)
+    if is_rank_zero:
+        # Save final training_config.json
+        final_config = {
+            "model_family": "RT-DETR",
+            "model_name": model_name,
+            "pretrain_weights": pretrain_weights,
+            "base_weights": base_weights,
+            "num_classes": num_classes,
+            "class_names": class_names,
+            "resolution": resolution,
+            "task": "detect",
+            "epochs": epochs,
+            "best_map50": best_map50,
+            "best_map50_95": best_map50_95,
+        }
+        with open(os.path.join(output_dir, "training_config.json"), "w", encoding="utf-8") as f:
+            json.dump(final_config, f, indent=2)
 
-    print(
-        f"[LS-Trainer] {model_name} training completed successfully! Results saved to: {output_dir}",
-        flush=True,
-    )
+        print(
+            f"[LS-Trainer] {model_name} training completed successfully! Results saved to: {output_dir}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
