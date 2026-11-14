@@ -138,3 +138,30 @@ pub struct ExportResponse {
     pub onnx_path: String,
     pub message: String,
 }
+
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct GpuTelemetry {
+    pub index: u32,
+    pub name: String,
+    pub vram_used_gb: f64,
+    pub vram_total_gb: f64,
+    pub util_percent: f64,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct TrainMetrics {
+    pub epoch: u32,
+    pub total_epochs: u32,
+    pub step: u32,
+    pub total_steps: u32,
+    pub train_loss: f64,
+    pub val_loss: Option<f64>,
+    pub map50: Option<f64>,
+    pub map50_95: Option<f64>,
+    pub lr: f64,
+    pub samples_per_sec: f64,
+    pub eta_secs: f64,
+    pub gpus: Vec<GpuTelemetry>,
+}

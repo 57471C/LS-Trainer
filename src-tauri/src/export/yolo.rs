@@ -2,11 +2,15 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use tauri::ipc::Channel;
 
 use crate::export::embed_onnx_model_type_metadata;
 use crate::models::{ExportRequest, ExportResponse, default_export_imgsz};
-use crate::process::{hide_console_window, stream_child_output, to_display_path, venv_yolo_path};
+use crate::process::{
+    TauriChannelSink, TrainingEventSink, hide_console_window, stream_child_output, to_display_path,
+    venv_yolo_path,
+};
 
 /// Ultralytics YOLO ONNX export path. Dispatched from `export_to_onnx`.
 pub(crate) async fn export_yolo_to_onnx(
@@ -141,7 +145,8 @@ pub(crate) async fn export_yolo_to_onnx(
 
     match cmd.spawn() {
         Ok(mut child) => {
-            stream_child_output(&mut child, &on_log);
+            let sink: Arc<dyn TrainingEventSink> = Arc::new(TauriChannelSink::new(on_log.clone()));
+            stream_child_output(&mut child, &sink);
 
             let status = child
                 .wait()

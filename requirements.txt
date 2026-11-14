@@ -1,3 +1,6 @@
+# Note: PyTorch is installed separately by setup-venv.bat / setup-linux.sh based on GPU hardware.
+# On Windows with Intel Arc (XPU), requirements-win-xpu.txt is the single source of truth
+# for the deliberate temporary XPU pin (newer +xpu wheels regress with Ultralytics).
 ultralytics
 rfdetr
 pytorch_lightning

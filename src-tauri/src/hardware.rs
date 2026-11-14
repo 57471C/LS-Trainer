@@ -2,9 +2,13 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use tauri::ipc::Channel;
 
-use crate::process::{get_project_root, get_venv_python, hide_console_window, setup_script_name, stream_child_output, venv_python_path};
+use crate::process::{
+    TauriChannelSink, TrainingEventSink, get_project_root, get_venv_python, hide_console_window,
+    setup_script_name, stream_child_output, venv_python_path,
+};
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct GpuInfo {
@@ -166,6 +170,38 @@ pub(crate) fn is_blackwell_gpu(name: &str) -> bool {
         || lower.contains("gb20")
         || lower.contains("b100")
         || lower.contains("b200")
+}
+
+#[cfg(any(target_os = "windows", test))]
+const WIN_XPU_REQUIREMENTS: &str = include_str!("../../requirements-win-xpu.txt");
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn parse_win_xpu_requirements(contents: &str) -> (Option<String>, Vec<String>) {
+    let mut index_url: Option<String> = None;
+    let mut packages = Vec::new();
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(url) = line.strip_prefix("--index-url ") {
+            let trimmed = url.trim();
+            if !trimmed.is_empty() {
+                index_url = Some(trimmed.to_string());
+            }
+        } else {
+            packages.push(line.to_string());
+        }
+    }
+    (index_url, packages)
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn pinned_win_xpu_torch_version() -> Option<String> {
+    let (_, packages) = parse_win_xpu_requirements(WIN_XPU_REQUIREMENTS);
+    packages
+        .into_iter()
+        .find_map(|pkg| pkg.strip_prefix("torch==").map(|v| v.to_string()))
 }
 
 pub(crate) fn select_pytorch_wheel(
@@ -496,6 +532,12 @@ pub(crate) fn detect_gpu_info(project_root: &Path) -> GpuInfo {
         let short_name = shorten_gpu_name(gpu_name);
 
         if recommended_wheel == "xpu" || is_intel_arc_gpu(gpu_name) {
+            #[cfg(target_os = "windows")]
+            let has_xpu_wheel = match pinned_win_xpu_torch_version() {
+                Some(ref pinned) => ver_str == pinned,
+                None => ver_str.contains("+xpu"),
+            };
+            #[cfg(not(target_os = "windows"))]
             let has_xpu_wheel = ver_str.contains("+xpu");
             let xpu_working =
                 torch_installed && torch_xpu_avail && torch_xpu_kernel_ok && has_xpu_wheel;
@@ -598,6 +640,7 @@ pub(crate) fn detect_gpu_info(project_root: &Path) -> GpuInfo {
 
 #[tauri::command]
 pub async fn repair_cuda(on_log: Channel<String>) -> Result<GpuInfo, String> {
+    let sink: Arc<dyn TrainingEventSink> = Arc::new(TauriChannelSink::new(on_log.clone()));
     tauri::async_runtime::spawn_blocking(move || {
         let project_root = get_project_root();
         let (hw_gpu_name, driver_version, driver_major) = detect_hardware_gpu();
@@ -638,31 +681,62 @@ pub async fn repair_cuda(on_log: Channel<String>) -> Result<GpuInfo, String> {
         uninstall_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         hide_console_window(&mut uninstall_cmd);
         if let Ok(mut child) = uninstall_cmd.spawn() {
-            stream_child_output(&mut child, &on_log);
+            stream_child_output(&mut child, &sink);
             let _ = child.wait();
         }
 
         // 2. Install the matching wheel
+        #[cfg(target_os = "windows")]
+        let (effective_index_url, install_specs): (String, Vec<String>) = if wheel_id == "xpu" {
+            // Deliberate temporary pin for Windows Intel Arc stability (from requirements-win-xpu.txt).
+            let (req_url, req_pkgs) = parse_win_xpu_requirements(WIN_XPU_REQUIREMENTS);
+            let url = req_url.unwrap_or_else(|| index_url.to_string());
+            let pkgs = if req_pkgs.is_empty() {
+                vec![
+                    "torch".to_string(),
+                    "torchvision".to_string(),
+                    "torchaudio".to_string(),
+                ]
+            } else {
+                req_pkgs
+            };
+            (url, pkgs)
+        } else {
+            (
+                index_url.to_string(),
+                vec![
+                    "torch".to_string(),
+                    "torchvision".to_string(),
+                    "torchaudio".to_string(),
+                ],
+            )
+        };
+        #[cfg(not(target_os = "windows"))]
+        let (effective_index_url, install_specs): (String, Vec<String>) = (
+            index_url.to_string(),
+            vec![
+                "torch".to_string(),
+                "torchvision".to_string(),
+                "torchaudio".to_string(),
+            ],
+        );
+
         let _ = on_log.send(format!(
-            "[LS-Trainer] Running: pip install torch torchvision torchaudio --index-url {index_url}"
+            "[LS-Trainer] Running: pip install {} --index-url {effective_index_url}",
+            install_specs.join(" ")
         ));
         let mut install_cmd = Command::new(&venv_python);
-        install_cmd.args([
-            "-m",
-            "pip",
-            "install",
-            "torch",
-            "torchvision",
-            "torchaudio",
-            "--index-url",
-            index_url,
-        ]);
+        let mut args = vec!["-m".to_string(), "pip".to_string(), "install".to_string()];
+        args.extend(install_specs);
+        args.push("--index-url".to_string());
+        args.push(effective_index_url);
+        install_cmd.args(&args);
         install_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         hide_console_window(&mut install_cmd);
 
         match install_cmd.spawn() {
             Ok(mut child) => {
-                stream_child_output(&mut child, &on_log);
+                stream_child_output(&mut child, &sink);
                 let status = child
                     .wait()
                     .map_err(|e| format!("Failed waiting for pip install: {e}"))?;
@@ -721,14 +795,14 @@ pub(crate) fn is_cuda_available(project_root: &Path) -> bool {
 pub(crate) fn resolve_dataloader_workers(
     project_root: &Path,
     override_workers: Option<u32>,
-    on_log: &Channel<String>,
+    sink: &Arc<dyn TrainingEventSink>,
 ) -> u32 {
     let (auto_workers, phys_cores, log_cores) = detect_cpu_worker_info(project_root);
     let (effective_workers, worker_source) = match override_workers {
         Some(custom_w) => (custom_w.min(8), "manual override"),
         None => (auto_workers, "auto-detected"),
     };
-    let _ = on_log.send(format!(
+    sink.on_log(format!(
         "[LS-Trainer] DataLoader workers: {effective_workers} ({worker_source}; {phys_cores} physical / {log_cores} logical CPU cores, capped at 8)"
     ));
     effective_workers

@@ -29,8 +29,22 @@ mod tests;
 
 pub use dataset::labels::LabelCheckResult;
 pub use hardware::{GpuInfo, compute_recommended_workers};
-pub use models::{ExportRequest, ExportResponse, TrainingRequest, TrainingResponse};
-pub use process::to_display_path;
+pub use models::{
+    ExportRequest, ExportResponse, GpuTelemetry, TrainMetrics, TrainingRequest, TrainingResponse,
+};
+pub use process::{
+    METRICS_PREFIX, ProcessControlCommand, ProcessControlHandle, TauriChannelSink,
+    TrainingEventSink, to_display_path,
+};
+pub use training::{
+    ACTIVE_TRAINING, active_training_control, force_kill_active_child, run_training,
+    send_training_control, stop_training,
+};
+
+pub fn probe_local_gpu_info() -> GpuInfo {
+    let root = process::get_project_root();
+    hardware::detect_gpu_info(&root)
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

@@ -1,23 +1,27 @@
 //! Ultralytics YOLO training backend.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use tauri::ipc::Channel;
+use std::process::Stdio;
+use std::sync::Arc;
+use tokio::process::Command as TokioCommand;
 
 use crate::dataset::labels::inspect_label_tree;
 use crate::dataset::yolo::{find_data_yaml, resolve_and_fix_data_yaml, unpack_archive};
 use crate::hardware::{detect_gpu_info, resolve_dataloader_workers};
 use crate::models::{TrainingRequest, TrainingResponse};
-use crate::process::{hide_console_window, stream_child_output, venv_python_path, venv_yolo_path};
+use crate::process::{
+    TrainingEventSink, hide_console_window, hide_console_window_tokio, stream_child_output,
+    stream_tokio_child_output, venv_python_path, venv_yolo_path,
+};
 use crate::training::{
     extract_final_metrics_from_results_dir, is_stop_requested, log_final_metrics,
-    register_child_pid, save_run_config_metadata, unregister_child_pid,
+    register_tokio_child_process, save_run_config_metadata, unregister_child_pid,
 };
 
 pub(crate) fn resolve_or_download_model_weights(
     project_root: &Path,
     raw_model_choice: &str,
-    on_log: &Channel<String>,
+    sink: &Arc<dyn TrainingEventSink>,
 ) -> String {
     let trimmed = raw_model_choice.trim().trim_matches('"');
     if trimmed.is_empty() {
@@ -51,7 +55,7 @@ pub(crate) fn resolve_or_download_model_weights(
 
     for candidate in &candidate_paths {
         if candidate.is_file() && candidate.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-            let _ = on_log.send(format!(
+            sink.on_log(format!(
                 "[LS-Trainer] Using cached model weights: {}",
                 candidate.display()
             ));
@@ -63,17 +67,17 @@ pub(crate) fn resolve_or_download_model_weights(
     let _ = std::fs::create_dir_all(&models_dir);
     let target_weight_path = models_dir.join(&weight_filename);
 
-    let python_exe = venv_python_path(&project_root);
+    let python_exe = venv_python_path(project_root);
     if python_exe.is_file() {
-        let _ = on_log.send(format!(
+        sink.on_log(format!(
             "[LS-Trainer] Model '{weight_filename}' not cached locally. Downloading from Ultralytics assets..."
         ));
-        let _ = on_log.send(format!(
+        sink.on_log(format!(
             "[LS-Trainer Status] Downloading {weight_filename}…"
         ));
 
         let script = "import sys; from ultralytics.utils.downloads import attempt_download_asset; p = attempt_download_asset(sys.argv[1]); print(f'[LS-Trainer] Downloaded model asset: {p}', flush=True)";
-        let mut dl_cmd = Command::new(&python_exe);
+        let mut dl_cmd = std::process::Command::new(&python_exe);
         dl_cmd
             .args(["-c", script, &weight_filename])
             .current_dir(&models_dir)
@@ -85,7 +89,7 @@ pub(crate) fn resolve_or_download_model_weights(
         hide_console_window(&mut dl_cmd);
 
         if let Ok(mut child) = dl_cmd.spawn() {
-            stream_child_output(&mut child, &on_log);
+            stream_child_output(&mut child, sink);
             let _ = child.wait();
         }
 
@@ -95,7 +99,7 @@ pub(crate) fn resolve_or_download_model_weights(
                 .map(|m| m.len() > 0)
                 .unwrap_or(false)
         {
-            let _ = on_log.send(format!(
+            sink.on_log(format!(
                 "[LS-Trainer] Model cached at: {}",
                 target_weight_path.display()
             ));
@@ -115,7 +119,7 @@ pub(crate) async fn start_yolo_training(
     results_dir: String,
     dataset_input: PathBuf,
     request: TrainingRequest,
-    on_log: Channel<String>,
+    sink: Arc<dyn TrainingEventSink>,
 ) -> Result<TrainingResponse, String> {
     let project_runs_dir = abs_results_dir
         .parent()
@@ -130,21 +134,21 @@ pub(crate) async fn start_yolo_training(
             .as_millis();
         let temp_dir = std::env::temp_dir().join(format!("ls_trainer_{timestamp}"));
 
-        let _ = on_log.send(format!(
+        sink.on_log(format!(
             "[LS-Trainer] Unpacking archive '{}' to '{}'...",
             dataset_input.display(),
             temp_dir.display()
         ));
 
         unpack_archive(&dataset_input, &temp_dir)?;
-        let _ = on_log.send("[LS-Trainer] Unpacked dataset successfully.".to_string());
+        sink.on_log("[LS-Trainer] Unpacked dataset successfully.".to_string());
 
         let yaml = find_data_yaml(&temp_dir).ok_or_else(|| {
             let err = format!(
                 "data.yaml not found in unpacked archive directory: {}",
                 temp_dir.display()
             );
-            let _ = on_log.send(format!("[LS-Trainer] Error: {err}"));
+            sink.on_log(format!("[LS-Trainer] Error: {err}"));
             err
         })?;
         yaml
@@ -154,7 +158,7 @@ pub(crate) async fn start_yolo_training(
                 "data.yaml not found in dataset folder: {}",
                 dataset_input.display()
             );
-            let _ = on_log.send(format!("[LS-Trainer] Error: {err}"));
+            sink.on_log(format!("[LS-Trainer] Error: {err}"));
             err
         })?
     } else {
@@ -168,9 +172,9 @@ pub(crate) async fn start_yolo_training(
             .unwrap_or_else(|| dataset_input.clone());
         let label_check = inspect_label_tree(&label_root);
         if let Some(warning) = label_check.warning {
-            let _ = on_log.send(format!("[LS-Trainer] Warning: {warning}"));
+            sink.on_log(format!("[LS-Trainer] Warning: {warning}"));
         } else {
-            let _ = on_log.send(format!(
+            sink.on_log(format!(
                 "[LS-Trainer] Segmentation labels OK: polygon annotations found ({} label files, {} lines).",
                 label_check.files_scanned, label_check.lines_scanned
             ));
@@ -178,18 +182,26 @@ pub(crate) async fn start_yolo_training(
     }
 
     // Read data.yaml, resolve all relative paths to absolute, and rewrite it
-    let fixed_data_yaml_path = resolve_and_fix_data_yaml(&raw_data_yaml_path, &on_log)?;
+    let fixed_data_yaml_path = resolve_and_fix_data_yaml(&raw_data_yaml_path, &sink)?;
     let data_str = fixed_data_yaml_path.to_string_lossy().to_string();
     let dataset_working_dir = fixed_data_yaml_path
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| project_root.clone());
 
-    let resolved_model =
-        resolve_or_download_model_weights(&project_root, &request.model_choice, &on_log);
-    let _ = on_log.send("[LS-Trainer Status] Training in progress...".to_string());
+    let resolved_model = {
+        let root = project_root.clone();
+        let choice = request.model_choice.clone();
+        let sink_dl = Arc::clone(&sink);
+        tauri::async_runtime::spawn_blocking(move || {
+            resolve_or_download_model_weights(&root, &choice, &sink_dl)
+        })
+        .await
+        .map_err(|e| format!("Model resolution task failed: {e}"))?
+    };
+    sink.on_log("[LS-Trainer Status] Training in progress...".to_string());
 
-    let effective_workers = resolve_dataloader_workers(&project_root, request.workers, &on_log);
+    let effective_workers = resolve_dataloader_workers(&project_root, request.workers, &sink);
 
     let data_arg = format!("data={data_str}");
     let model_arg = format!("model={resolved_model}");
@@ -215,8 +227,8 @@ pub(crate) async fn start_yolo_training(
         None
     };
 
-    let _ = on_log.send(format!("[LS-Trainer] Ultralytics task=\"{yolo_task}\""));
-    let _ = on_log.send(format!(
+    sink.on_log(format!("[LS-Trainer] Ultralytics task=\"{yolo_task}\""));
+    sink.on_log(format!(
         "[LS-Trainer] Active config: task={} | model={} | workers={} | freeze={} | mosaic={} | close_mosaic={} | mixup={} | copy_paste={} | degrees={} | flipud={} | translate={} | scale={} | amp={}",
         yolo_task,
         request.model_choice,
@@ -238,9 +250,14 @@ pub(crate) async fn start_yolo_training(
     ));
 
     let device_input = request.device.trim();
-    let gpu_probe = detect_gpu_info(&project_root);
+    let gpu_probe = {
+        let root = project_root.clone();
+        tauri::async_runtime::spawn_blocking(move || detect_gpu_info(&root))
+            .await
+            .map_err(|e| format!("GPU probe task failed: {e}"))?
+    };
     let effective_device = if device_input.eq_ignore_ascii_case("cpu") {
-        let _ = on_log.send("[LS-Trainer] Device override: using device=cpu".to_string());
+        sink.on_log("[LS-Trainer] Device override: using device=cpu".to_string());
         "cpu".to_string()
     } else if device_input.is_empty()
         || device_input.eq_ignore_ascii_case("auto")
@@ -255,24 +272,24 @@ pub(crate) async fn start_yolo_training(
             && device_input != "0"
         {
             let dev_label = gpu_probe.device_name.as_deref().unwrap_or("Intel Arc XPU");
-            let _ = on_log.send(format!(
+            sink.on_log(format!(
                 "[LS-Trainer] Intel Arc XPU available (torch.xpu.is_available()=True), selecting device=xpu ({dev_label})"
             ));
             "xpu".to_string()
         } else if gpu_probe.cuda_available {
             let dev_label = gpu_probe.device_name.as_deref().unwrap_or("CUDA GPU");
-            let _ = on_log.send(format!(
+            sink.on_log(format!(
                 "[LS-Trainer] CUDA available (torch.cuda.is_available()=True), selecting device=0 ({dev_label})"
             ));
             "0".to_string()
         } else if gpu_probe.xpu_available {
             let dev_label = gpu_probe.device_name.as_deref().unwrap_or("Intel Arc XPU");
-            let _ = on_log.send(format!(
+            sink.on_log(format!(
                 "[LS-Trainer] Intel Arc XPU available (torch.xpu.is_available()=True), selecting device=xpu ({dev_label})"
             ));
             "xpu".to_string()
         } else {
-            let _ = on_log.send(
+            sink.on_log(
                 "[LS-Trainer] Neither Intel Arc XPU nor CUDA available, using device=cpu"
                     .to_string(),
             );
@@ -285,6 +302,7 @@ pub(crate) async fn start_yolo_training(
     let device_arg = format!("device={effective_device}");
 
     let expected_venv_yolo = venv_yolo_path(&project_root);
+    let expected_venv_python = venv_python_path(&project_root);
 
     let project_runs_str = project_runs_dir.to_string_lossy().replace('\\', "/");
     let project_arg = format!("project={project_runs_str}");
@@ -318,28 +336,41 @@ pub(crate) async fn start_yolo_training(
         scale_arg,
     ]);
     let joined_train_args = train_args.join(" ");
+    let yolo_runner_script = include_str!("../python/yolo_train.py");
 
-    let (mut cmd, exact_command) = if expected_venv_yolo.is_file() {
-        let _ = on_log.send(format!(
+    let (mut cmd, exact_command) = if expected_venv_yolo.is_file() || expected_venv_python.is_file() {
+        let display_exe = if expected_venv_yolo.is_file() {
+            &expected_venv_yolo
+        } else {
+            &expected_venv_python
+        };
+        sink.on_log(format!(
             "[LS-Trainer] Using local venv YOLO executable: {}",
-            expected_venv_yolo.display()
+            display_exe.display()
         ));
 
-        let mut c = Command::new(&expected_venv_yolo);
-        c.args(&train_args);
+        let c = if expected_venv_python.is_file() {
+            let mut py_cmd = TokioCommand::new(&expected_venv_python);
+            py_cmd.arg("-c").arg(yolo_runner_script).args(&train_args);
+            py_cmd
+        } else {
+            let mut yolo_cmd = TokioCommand::new(&expected_venv_yolo);
+            yolo_cmd.args(&train_args);
+            yolo_cmd
+        };
 
-        let cmd_str = format!("\"{}\" {joined_train_args}", expected_venv_yolo.display());
+        let cmd_str = format!("\"{}\" {joined_train_args}", display_exe.display());
 
         (c, cmd_str)
     } else {
-        let _ = on_log.send(format!(
+        sink.on_log(format!(
             "[LS-Trainer] Warning: Local .venv executable not found at '{}'. Falling back to system 'yolo'.",
             expected_venv_yolo.display()
         ));
 
         #[cfg(target_os = "windows")]
         let c = {
-            let mut cmd = Command::new("cmd");
+            let mut cmd = TokioCommand::new("cmd");
             cmd.args(["/C", "yolo"]);
             cmd.args(&train_args);
             cmd
@@ -347,7 +378,7 @@ pub(crate) async fn start_yolo_training(
 
         #[cfg(not(target_os = "windows"))]
         let c = {
-            let mut cmd = Command::new("yolo");
+            let mut cmd = TokioCommand::new("yolo");
             cmd.args(&train_args);
             cmd
         };
@@ -357,32 +388,53 @@ pub(crate) async fn start_yolo_training(
         (c, cmd_str)
     };
 
-    let _ = on_log.send(format!("[LS-Trainer] Executing: {exact_command}"));
+    sink.on_log(format!("[LS-Trainer] Executing: {exact_command}"));
 
     // Set working directory of the process to the unpacked dataset folder
     cmd.current_dir(&dataset_working_dir);
-    let _ = on_log.send(format!(
+    sink.on_log(format!(
         "[LS-Trainer] Set YOLO working directory to: {}",
         dataset_working_dir.display()
     ));
 
     cmd.env("PYTHONUNBUFFERED", "1")
         .env("PYTHONIOENCODING", "utf-8")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
-    hide_console_window(&mut cmd);
+    hide_console_window_tokio(&mut cmd);
+
+    let launch_exe_desc = if expected_venv_python.is_file() {
+        expected_venv_python.display().to_string()
+    } else if expected_venv_yolo.is_file() {
+        expected_venv_yolo.display().to_string()
+    } else {
+        "yolo (PATH)".to_string()
+    };
+    sink.on_log(format!(
+        "[LS-Trainer] Spawning child process: exe='{}' cwd='{}' env(PYTHONUNBUFFERED=1, PYTHONIOENCODING=utf-8)",
+        launch_exe_desc,
+        dataset_working_dir.display()
+    ));
 
     match cmd.spawn() {
         Ok(mut child) => {
-            register_child_pid(child.id());
-            stream_child_output(&mut child, &on_log);
-
-            let status = child
-                .wait()
-                .map_err(|e| format!("Failed while waiting for YOLO: {e}"))?;
+            sink.on_log(format!(
+                "[LS-Trainer] Child process spawned (pid={:?}). Streaming stdout/stderr...",
+                child.id()
+            ));
+            let _control = register_tokio_child_process(&mut child);
+            stream_tokio_child_output(&mut child, &sink).await;
+            let status = child.wait().await.map_err(|e| {
+                let msg = format!("Failed while waiting for YOLO: {e}");
+                sink.on_log(format!("[LS-Trainer Error] {msg}"));
+                msg
+            })?;
 
             unregister_child_pid();
+            sink.on_exit(status.code());
 
             save_run_config_metadata(
                 &abs_results_dir,
@@ -391,13 +443,13 @@ pub(crate) async fn start_yolo_training(
                 &effective_device,
                 effective_workers,
                 &exact_command,
-                &on_log,
+                &sink,
             );
 
             let (map50, map50_95) = extract_final_metrics_from_results_dir(&abs_results_dir);
 
             if is_stop_requested() {
-                let _ = on_log.send(format!(
+                sink.on_log(format!(
                     "[LS-Trainer] Training stopped by user. Checkpoints preserved at: {results_dir}"
                 ));
                 return Ok(TrainingResponse {
@@ -410,8 +462,8 @@ pub(crate) async fn start_yolo_training(
             }
 
             if status.success() {
-                log_final_metrics(&on_log, map50, map50_95);
-                let _ = on_log.send(format!(
+                log_final_metrics(&sink, map50, map50_95);
+                sink.on_log(format!(
                     "[LS-Trainer] Training completed successfully! Results saved to: {results_dir}"
                 ));
                 Ok(TrainingResponse {
@@ -422,7 +474,7 @@ pub(crate) async fn start_yolo_training(
                     map50_95,
                 })
             } else {
-                let _ = on_log.send(format!(
+                sink.on_log(format!(
                     "[LS-Trainer] YOLO exited with code: {:?}",
                     status.code()
                 ));
@@ -436,6 +488,7 @@ pub(crate) async fn start_yolo_training(
             }
         }
         Err(err) => {
+            sink.on_exit(None);
             save_run_config_metadata(
                 &abs_results_dir,
                 &request,
@@ -443,20 +496,19 @@ pub(crate) async fn start_yolo_training(
                 &effective_device,
                 effective_workers,
                 &exact_command,
-                &on_log,
+                &sink,
             );
 
-            let _ = on_log.send(format!(
+            sink.on_log(format!(
                 "[LS-Trainer] Notice: Could not launch YOLO process directly ({err})."
             ));
-            let _ = on_log.send(
+            sink.on_log(
                 "[LS-Trainer] Ensure 'ultralytics' is installed in the active environment ('pip install ultralytics')."
                     .to_string(),
             );
-            let _ = on_log.send(format!("[LS-Trainer] Command was: {exact_command}"));
-            let _ = on_log.send(format!("[LS-Trainer] Target results folder: {results_dir}"));
-            let _ =
-                on_log.send("[LS-Trainer] Wiring and parameter verification complete.".to_string());
+            sink.on_log(format!("[LS-Trainer] Command was: {exact_command}"));
+            sink.on_log(format!("[LS-Trainer] Target results folder: {results_dir}"));
+            sink.on_log("[LS-Trainer] Wiring and parameter verification complete.".to_string());
 
             Ok(TrainingResponse {
                 success: true,

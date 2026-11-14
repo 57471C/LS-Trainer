@@ -2,11 +2,15 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use tauri::ipc::Channel;
 
 use crate::hardware::is_cuda_available;
 use crate::models::{ExportRequest, ExportResponse, default_export_imgsz};
-use crate::process::{get_venv_python, hide_console_window, stream_child_output, to_display_path};
+use crate::process::{
+    TauriChannelSink, TrainingEventSink, get_venv_python, hide_console_window, stream_child_output,
+    to_display_path,
+};
 use crate::rfdetr::{ensure_rfdetr_installed, resolve_rfdetr_class_and_pretrain, snap_rfdetr_resolution};
 
 pub(crate) async fn export_rfdetr_to_onnx(
@@ -16,7 +20,8 @@ pub(crate) async fn export_rfdetr_to_onnx(
     request: &ExportRequest,
     on_log: &Channel<String>,
 ) -> Result<ExportResponse, String> {
-    ensure_rfdetr_installed(project_root, on_log);
+    let sink: Arc<dyn TrainingEventSink> = Arc::new(TauriChannelSink::new(on_log.clone()));
+    ensure_rfdetr_installed(project_root, &sink);
 
     let output_dir = if results_path.is_dir() {
         results_path.to_path_buf()
@@ -106,7 +111,7 @@ pub(crate) async fn export_rfdetr_to_onnx(
 
     match cmd.spawn() {
         Ok(mut child) => {
-            stream_child_output(&mut child, &on_log);
+            stream_child_output(&mut child, &sink);
 
             let status = child
                 .wait()

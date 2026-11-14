@@ -2,9 +2,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use tauri::ipc::Channel;
+use std::sync::Arc;
 
-use crate::process::{get_venv_python, hide_console_window, stream_child_output};
+use crate::process::{
+    TrainingEventSink, get_venv_python, hide_console_window, stream_child_output,
+};
 
 pub(crate) fn resolve_rfdetr_class_and_pretrain(
     model_choice: &str,
@@ -44,7 +46,7 @@ pub(crate) fn snap_rfdetr_resolution(imgsz: u32, block_size: u32) -> u32 {
     rounded.max(b)
 }
 
-pub(crate) fn ensure_rfdetr_installed(project_root: &Path, on_log: &Channel<String>) {
+pub(crate) fn ensure_rfdetr_installed(project_root: &Path, sink: &Arc<dyn TrainingEventSink>) {
     let Some(python_exe) = get_venv_python(project_root) else {
         return;
     };
@@ -61,7 +63,7 @@ pub(crate) fn ensure_rfdetr_installed(project_root: &Path, on_log: &Channel<Stri
         }
     }
 
-    let _ = on_log.send(
+    sink.on_log(
         "[LS-Trainer] Installing rfdetr (Apache 2.0) and COCO training dependencies into .venv..."
             .to_string(),
     );
@@ -89,7 +91,7 @@ pub(crate) fn ensure_rfdetr_installed(project_root: &Path, on_log: &Channel<Stri
         .stderr(Stdio::piped());
     hide_console_window(&mut install_cmd);
     if let Ok(mut child) = install_cmd.spawn() {
-        stream_child_output(&mut child, &on_log);
+        stream_child_output(&mut child, sink);
         let _ = child.wait();
     }
 }

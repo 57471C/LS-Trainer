@@ -6,12 +6,15 @@ pub(crate) mod yolo;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::ipc::Channel;
 
 use crate::models::{TrainingRequest, TrainingResponse};
-use crate::process::{get_project_root, hide_console_window, send_break_signal, to_display_path};
+use crate::process::{
+    ProcessControlHandle, TauriChannelSink, TrainingEventSink, get_project_root,
+    hide_console_window, send_break_signal, to_display_path,
+};
 use crate::rtdetr::is_rtdetr_request;
 use crate::settings::{
     describe_write_access, ensure_data_directory_writable, nearest_existing_dir, runs_base_dir,
@@ -25,6 +28,7 @@ pub struct ActiveTrainingState {
     pub stop_requested: AtomicBool,
     pub results_dir: Mutex<Option<PathBuf>>,
     pub child_pid: Mutex<Option<u32>>,
+    pub child_control: Mutex<Option<ProcessControlHandle>>,
 }
 
 pub static ACTIVE_TRAINING: ActiveTrainingState = ActiveTrainingState {
@@ -32,6 +36,7 @@ pub static ACTIVE_TRAINING: ActiveTrainingState = ActiveTrainingState {
     stop_requested: AtomicBool::new(false),
     results_dir: Mutex::new(None),
     child_pid: Mutex::new(None),
+    child_control: Mutex::new(None),
 };
 
 pub(crate) fn register_active_training(results_dir: PathBuf) {
@@ -52,8 +57,63 @@ pub(crate) fn register_child_pid(pid: u32) {
     }
 }
 
+pub(crate) fn register_tokio_child_process(
+    child: &mut tokio::process::Child,
+) -> ProcessControlHandle {
+    if let Some(pid) = child.id() {
+        register_child_pid(pid);
+    }
+    let handle = ProcessControlHandle::from_tokio_child(child);
+    if let Ok(mut lock) = ACTIVE_TRAINING.child_control.lock() {
+        *lock = Some(handle.clone());
+    }
+    handle
+}
+
+pub fn force_kill_active_child() {
+    let pid_opt = ACTIVE_TRAINING.child_pid.lock().ok().and_then(|g| *g);
+    if let Some(pid) = pid_opt {
+        #[cfg(windows)]
+        {
+            let mut cmd = Command::new("taskkill");
+            cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
+            hide_console_window(&mut cmd);
+            let _ = cmd.spawn();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).spawn();
+        }
+    }
+}
+
+pub fn active_training_control() -> Option<ProcessControlHandle> {
+    ACTIVE_TRAINING
+        .child_control
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+}
+
+pub fn send_training_control(command: &str) -> Result<bool, String> {
+    if !ACTIVE_TRAINING.is_running.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+    if let Some(handle) = active_training_control() {
+        handle.write_raw(command)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 pub(crate) fn unregister_child_pid() {
     if let Ok(mut lock) = ACTIVE_TRAINING.child_pid.lock() {
+        *lock = None;
+    }
+    if let Ok(mut lock) = ACTIVE_TRAINING.child_control.lock() {
+        if let Some(ref handle) = *lock {
+            handle.clear();
+        }
         *lock = None;
     }
 }
@@ -61,6 +121,12 @@ pub(crate) fn unregister_child_pid() {
 pub(crate) fn clear_active_training() {
     ACTIVE_TRAINING.is_running.store(false, Ordering::SeqCst);
     if let Ok(mut lock) = ACTIVE_TRAINING.child_pid.lock() {
+        *lock = None;
+    }
+    if let Ok(mut lock) = ACTIVE_TRAINING.child_control.lock() {
+        if let Some(ref handle) = *lock {
+            handle.clear();
+        }
         *lock = None;
     }
     if let Ok(mut lock) = ACTIVE_TRAINING.results_dir.lock() {
@@ -88,26 +154,21 @@ pub async fn stop_training() -> Result<bool, String> {
         }
     }
 
+    // 1b. Write STOP\n to piped child stdin if attached
+    if let Some(handle) = active_training_control() {
+        let _ = handle.stop();
+    }
+
     // 2. Send break signal to active child process group
     let pid_opt = ACTIVE_TRAINING.child_pid.lock().ok().and_then(|g| *g);
     if let Some(pid) = pid_opt {
         send_break_signal(pid);
 
         // 3. Fallback watchdog: if training is still running after 6 seconds, terminate process
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(6));
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
             if ACTIVE_TRAINING.is_running.load(Ordering::SeqCst) {
-                #[cfg(windows)]
-                {
-                    let mut cmd = Command::new("taskkill");
-                    cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
-                    hide_console_window(&mut cmd);
-                    let _ = cmd.spawn();
-                }
-                #[cfg(not(windows))]
-                {
-                    let _ = Command::new("kill").args(["-9", &pid.to_string()]).spawn();
-                }
+                force_kill_active_child();
             }
         });
     }
@@ -119,6 +180,14 @@ pub async fn stop_training() -> Result<bool, String> {
 pub async fn start_training(
     _app: tauri::AppHandle,
     on_log: Channel<String>,
+    request: TrainingRequest,
+) -> Result<TrainingResponse, String> {
+    let sink: Arc<dyn TrainingEventSink> = Arc::new(TauriChannelSink::new(on_log));
+    run_training(sink, request).await
+}
+
+pub async fn run_training(
+    sink: Arc<dyn TrainingEventSink>,
     request: TrainingRequest,
 ) -> Result<TrainingResponse, String> {
     let run_name = if request.run_name.trim().is_empty() {
@@ -136,19 +205,19 @@ pub async fn start_training(
     let abs_results_dir = project_runs_dir.join(&run_name);
     let results_dir = to_display_path(&abs_results_dir);
 
-    let _ = on_log.send(format!(
+    sink.on_log(format!(
         "[LS-Trainer] Initializing training run '{run_name}'..."
     ));
-    let _ = on_log.send(format!("[LS-Trainer] Results directory: {}", results_dir));
+    sink.on_log(format!("[LS-Trainer] Results directory: {}", results_dir));
 
     // Do not create the data directory here. A missing `/mnt/datasets` is usually an
     // unmounted disk, and creating it would hide that mount.
     if let Err(err) = require_existing_directory(&base) {
-        let _ = on_log.send(format!("[LS-Trainer] Error: {err}"));
+        sink.on_log(format!("[LS-Trainer] Error: {err}"));
         return Err(err);
     }
     if let Err(err) = ensure_data_directory_writable(&base) {
-        let _ = on_log.send(format!("[LS-Trainer] Error: {err}"));
+        sink.on_log(format!("[LS-Trainer] Error: {err}"));
         return Err(err);
     }
 
@@ -157,7 +226,7 @@ pub async fn start_training(
     // existing name as taken and increments it.
     if let Some(parent) = abs_results_dir.parent() {
         if let Err(err) = ensure_directory(parent) {
-            let _ = on_log.send(format!("[LS-Trainer] Error: {err}"));
+            sink.on_log(format!("[LS-Trainer] Error: {err}"));
             return Err(err);
         }
     }
@@ -165,7 +234,7 @@ pub async fn start_training(
     let dataset_input = PathBuf::from(&request.dataset_path);
     if !dataset_input.exists() {
         let msg = format!("Dataset path does not exist: {}", request.dataset_path);
-        let _ = on_log.send(format!("[LS-Trainer] Error: {msg}"));
+        sink.on_log(format!("[LS-Trainer] Error: {msg}"));
         return Err(msg);
     }
 
@@ -180,7 +249,7 @@ pub async fn start_training(
             results_dir,
             dataset_input,
             request,
-            on_log,
+            sink,
         )
         .await
     } else if is_rfdetr_request(&request) {
@@ -192,7 +261,7 @@ pub async fn start_training(
             results_dir,
             dataset_input,
             request,
-            on_log,
+            sink,
         )
         .await
     } else {
@@ -204,7 +273,7 @@ pub async fn start_training(
             results_dir,
             dataset_input,
             request,
-            on_log,
+            sink,
         )
         .await
     };
@@ -378,7 +447,7 @@ pub(crate) fn save_run_config_metadata(
     effective_device: &str,
     effective_workers: u32,
     exact_command: &str,
-    on_log: &Channel<String>,
+    sink: &Arc<dyn TrainingEventSink>,
 ) {
     if std::fs::create_dir_all(abs_results_dir).is_err() {
         return;
@@ -422,7 +491,7 @@ pub(crate) fn save_run_config_metadata(
 
     if let Ok(serialized) = serde_json::to_string_pretty(&payload) {
         if std::fs::write(&config_path, serialized).is_ok() {
-            let _ = on_log.send(format!(
+            sink.on_log(format!(
                 "[LS-Trainer] Saved run settings to: {}",
                 config_path.display()
             ));
@@ -517,12 +586,12 @@ pub(crate) fn extract_final_metrics_from_results_dir(
 
 /// Log the best mAP50 / mAP50-95 for a finished run when both are known.
 pub(crate) fn log_final_metrics(
-    on_log: &Channel<String>,
+    sink: &Arc<dyn TrainingEventSink>,
     map50: Option<f64>,
     map50_95: Option<f64>,
 ) {
     if let (Some(m50), Some(m95)) = (map50, map50_95) {
-        let _ = on_log.send(format!(
+        sink.on_log(format!(
             "[LS-Trainer] Final Metrics — mAP50: {:.1}% ({:.4}) | mAP50-95: {:.1}% ({:.4})",
             m50 * 100.0,
             m50,

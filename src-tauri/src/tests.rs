@@ -234,6 +234,25 @@ fn intel_arc_and_pytorch_wheel_selection() {
     let (cpu_wheel, cpu_url, _) = select_pytorch_wheel(None, None);
     assert_eq!(cpu_wheel, "cpu");
     assert_eq!(cpu_url, "https://download.pytorch.org/whl/cpu");
+
+    let (win_xpu_url, win_xpu_pkgs) =
+        crate::hardware::parse_win_xpu_requirements(include_str!("../../requirements-win-xpu.txt"));
+    assert_eq!(
+        win_xpu_url.as_deref(),
+        Some("https://download.pytorch.org/whl/xpu")
+    );
+    assert_eq!(
+        win_xpu_pkgs,
+        vec![
+            "torch==2.9.1+xpu".to_string(),
+            "torchvision==0.24.1+xpu".to_string(),
+            "torchaudio==2.9.1+xpu".to_string(),
+        ]
+    );
+    assert_eq!(
+        crate::hardware::pinned_win_xpu_torch_version().as_deref(),
+        Some("2.9.1+xpu")
+    );
 }
 
 #[test]
@@ -457,4 +476,155 @@ fn data_directory_survives_reload_and_sets_runs_base() {
     assert_eq!(resolve_runs_base(&relative, &project_root), project_root);
 
     let _ = std::fs::remove_dir_all(&temp);
+}
+
+#[test]
+fn sideband_metrics_parsed_and_filtered_from_logs() {
+    use crate::models::{GpuTelemetry, TrainMetrics};
+    use crate::process::{TrainingEventSink, stream_reader_lines};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RecordingSink {
+        logs: Mutex<Vec<String>>,
+        metrics: Mutex<Vec<TrainMetrics>>,
+        exits: Mutex<Vec<Option<i32>>>,
+    }
+
+    impl TrainingEventSink for RecordingSink {
+        fn on_log(&self, line: String) {
+            self.logs.lock().unwrap().push(line);
+        }
+        fn on_metrics(&self, m: TrainMetrics) {
+            self.metrics.lock().unwrap().push(m);
+        }
+        fn on_exit(&self, code: Option<i32>) {
+            self.exits.lock().unwrap().push(code);
+        }
+    }
+
+    let sink = Arc::new(RecordingSink::default());
+    let sample_metrics = TrainMetrics {
+        epoch: 3,
+        total_epochs: 60,
+        step: 12,
+        total_steps: 100,
+        train_loss: 1.25,
+        val_loss: Some(0.95),
+        map50: Some(0.82),
+        map50_95: Some(0.61),
+        lr: 0.0001,
+        samples_per_sec: 32.5,
+        eta_secs: 420.0,
+        gpus: vec![GpuTelemetry {
+            index: 0,
+            name: "Intel Arc B580".to_string(),
+            vram_used_gb: 6.4,
+            vram_total_gb: 12.0,
+            util_percent: 53.3,
+        }],
+    };
+    let json_line = format!(
+        "@@LS_METRICS@@{}\n",
+        serde_json::to_string(&sample_metrics).unwrap()
+    );
+    let stream_input = format!(
+        "\x1b[32mEpoch 3/60 starting\x1b[0m\n{json_line}Step 12 complete\n"
+    );
+
+    stream_reader_lines(std::io::Cursor::new(stream_input.into_bytes()), sink.as_ref());
+
+    let logs = sink.logs.lock().unwrap().clone();
+    assert_eq!(logs, vec!["Epoch 3/60 starting", "Step 12 complete"]);
+
+    let recorded_metrics = sink.metrics.lock().unwrap().clone();
+    assert_eq!(recorded_metrics.len(), 1);
+    assert_eq!(recorded_metrics[0], sample_metrics);
+}
+
+#[test]
+#[ignore = "Requires Windows + Intel Arc XPU .venv and synthetic dataset in %TEMP%/ls_xpu_smoke"]
+fn xpu_async_train_smoke() {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use crate::models::{TrainMetrics, TrainingRequest};
+    use crate::process::TrainingEventSink;
+    use crate::training::run_training;
+
+    #[derive(Default)]
+    struct LiveSink {
+        logs: Mutex<Vec<String>>,
+        metrics: Mutex<Vec<TrainMetrics>>,
+        exits: Mutex<Vec<Option<i32>>>,
+    }
+    impl TrainingEventSink for LiveSink {
+        fn on_log(&self, line: String) {
+            println!("[LOG] {line}");
+            self.logs.lock().unwrap().push(line);
+        }
+        fn on_metrics(&self, metrics: TrainMetrics) {
+            println!(
+                "[METRIC] ep={}/{} step={}/{} loss={:.4}",
+                metrics.epoch, metrics.total_epochs, metrics.step, metrics.total_steps, metrics.train_loss
+            );
+            self.metrics.lock().unwrap().push(metrics);
+        }
+        fn on_exit(&self, code: Option<i32>) {
+            println!("[EXIT] code={code:?}");
+            self.exits.lock().unwrap().push(code);
+        }
+    }
+
+    let dataset_dir = std::env::temp_dir().join("ls_xpu_smoke");
+    assert!(dataset_dir.is_dir(), "Missing {:?}", dataset_dir);
+
+    let sink = Arc::new(LiveSink::default());
+    let sink_trait: Arc<dyn TrainingEventSink> = sink.clone();
+    let req = TrainingRequest {
+        dataset_path: dataset_dir.to_string_lossy().to_string(),
+        model_family: "YOLO".to_string(),
+        model_choice: "yolo11n.pt".to_string(),
+        run_name: "xpu_smoke_test".to_string(),
+        epochs: 1,
+        batch: 1,
+        imgsz: 64,
+        workers: Some(0),
+        device: "xpu".to_string(),
+        amp: false,
+        freeze_backbone: false,
+        freeze_layers: 0,
+        mosaic: 0.0,
+        mixup: 0.0,
+        copy_paste: 0.0,
+        degrees: 0.0,
+        flipud: 0.0,
+        translate: 0.0,
+        scale: 0.0,
+        close_mosaic: 0,
+        task: "detect".to_string(),
+    };
+
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_flag = Arc::clone(&done);
+    let handle = tauri::async_runtime::spawn(async move {
+        let out = run_training(sink_trait, req).await;
+        done_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        out
+    });
+    let start = Instant::now();
+    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            start.elapsed() < Duration::from_secs(90),
+            "XPU training hung for >90s"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let res = tauri::async_runtime::block_on(handle)
+        .expect("spawn join failed")
+        .expect("run_training failed");
+    assert!(res.success, "Expected success, got: {:?}", res.message);
+    assert!(!sink.logs.lock().unwrap().is_empty());
+    assert!(!sink.metrics.lock().unwrap().is_empty());
+    assert_eq!(sink.exits.lock().unwrap().as_slice(), &[Some(0)]);
 }
