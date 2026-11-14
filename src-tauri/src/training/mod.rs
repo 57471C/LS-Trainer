@@ -13,7 +13,7 @@ use tauri::ipc::Channel;
 use crate::models::{TrainingRequest, TrainingResponse};
 use crate::process::{
     ProcessControlHandle, TauriChannelSink, TrainingEventSink, get_project_root,
-    hide_console_window, send_break_signal, to_display_path,
+    send_break_signal, to_display_path,
 };
 use crate::rtdetr::is_rtdetr_request;
 use crate::settings::{
@@ -77,7 +77,7 @@ pub fn force_kill_active_child() {
         {
             let mut cmd = Command::new("taskkill");
             cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
-            hide_console_window(&mut cmd);
+            crate::process::hide_console_window(&mut cmd);
             let _ = cmd.spawn();
         }
         #[cfg(not(windows))]

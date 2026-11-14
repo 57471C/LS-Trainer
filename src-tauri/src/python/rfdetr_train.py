@@ -29,6 +29,10 @@ warnings.filterwarnings(
     message=r".*default training augmentation backend.*",
     category=UserWarning,
 )
+warnings.filterwarnings(
+    "ignore",
+    message=r".*LeafSpec.*",
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -611,9 +615,40 @@ def main():
     import rfdetr.detr as rf_detr_mod
     import rfdetr.training as rf_training
     import rfdetr.training.trainer as rf_trainer_mod
+    import rfdetr.utilities.distributed as rf_dist
     from pytorch_lightning import Callback
     from pytorch_lightning.accelerators import Accelerator
     from pytorch_lightning.strategies import DDPStrategy, SingleDeviceStrategy
+
+    orig_all_gather = getattr(rf_dist, "all_gather", None)
+    if orig_all_gather is not None:
+        def xpu_safe_all_gather(data, device=None):
+            if (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_backend() == "xccl"
+                and hasattr(torch, "xpu")
+                and torch.xpu.is_available()
+                and (device is None or (isinstance(device, torch.device) and device.type == "cpu"))
+            ):
+                device = torch.device("xpu", torch.xpu.current_device())
+            return orig_all_gather(data, device=device)
+
+        rf_dist.all_gather = xpu_safe_all_gather
+        for mod_name in (
+            "rfdetr.utilities",
+            "rfdetr.evaluation.coco_eval",
+            "rfdetr.evaluation.keypoint_oks",
+            "rfdetr.evaluation.matching",
+            "rfdetr.training.coco_map",
+            "rfdetr.training.callbacks.coco_eval",
+        ):
+            try:
+                mod = __import__(mod_name, fromlist=["all_gather"])
+                if hasattr(mod, "all_gather"):
+                    setattr(mod, "all_gather", xpu_safe_all_gather)
+            except Exception:
+                pass
 
     try:
         import rfdetr.utilities.console as rf_console
