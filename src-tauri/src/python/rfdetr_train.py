@@ -7,6 +7,18 @@ import sys
 import threading
 import time
 import traceback
+import warnings
+
+os.environ.setdefault("TORCH_DISABLE_FLOP_COUNTER", "1")
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torch\.jit\.script.*deprecated.*",
+    category=FutureWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*triton not found.*",
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -692,12 +704,14 @@ def main():
             dm = getattr(trainer, "datamodule", None)
             if dm is not None and hasattr(dm, "_num_workers"):
                 dm._num_workers = num_workers
-            root_dev = getattr(getattr(trainer, "strategy", None), "root_device", device)
-            accel_name = type(getattr(trainer, "accelerator", None)).__name__
-            print(
-                f"[LS-Trainer] Lightning Trainer active: accelerator={accel_name}, root_device={root_dev}, train/val num_workers={num_workers}",
-                flush=True,
-            )
+            if getattr(trainer, "is_global_zero", True):
+                root_dev = getattr(getattr(trainer, "strategy", None), "root_device", device)
+                accel_name = type(getattr(trainer, "accelerator", None)).__name__
+                strat_name = type(getattr(trainer, "strategy", None)).__name__
+                print(
+                    f"[LS-Trainer] Lightning Trainer active: accelerator={accel_name}, strategy={strat_name}, root_device={root_dev}, train/val num_workers={num_workers}",
+                    flush=True,
+                )
 
         def _check_stop_requested(self, trainer):
             ctrl_state.wait_if_paused(stop_file)
@@ -862,6 +876,29 @@ def main():
                 eta_secs=eta_secs,
             )
 
+    class XPUDDPStrategy(DDPStrategy):
+        """DDPStrategy subclass that avoids CUDA stream creation on XPU devices."""
+
+        def _setup_model(self, model):
+            if self.root_device.type == "xpu":
+                from contextlib import nullcontext
+                from torch.nn.parallel.distributed import DistributedDataParallel
+
+                device_ids = self.determine_ddp_device_ids()
+                if (
+                    device_ids is not None
+                    and hasattr(torch, "xpu")
+                    and hasattr(torch.xpu, "Stream")
+                ):
+                    ctx = torch.xpu.stream(torch.xpu.Stream())
+                else:
+                    ctx = nullcontext()
+                with ctx:
+                    return DistributedDataParallel(
+                        module=model, device_ids=device_ids, **self._ddp_kwargs
+                    )
+            return super()._setup_model(model)
+
     orig_build_trainer = rf_training.build_trainer
 
     def hooked_build_trainer(*args, **kw):
@@ -874,7 +911,11 @@ def main():
                 )
                 kw["accelerator"] = XPUAccelerator()
                 kw["devices"] = xpu_indices
-                kw["strategy"] = DDPStrategy(process_group_backend=backend)
+                kw["strategy"] = XPUDDPStrategy(process_group_backend=backend)
+                print(
+                    f"[LS-Trainer] RF-DETR Multi-GPU strategy: accelerator=XPUAccelerator, strategy=XPUDDPStrategy, backend={backend}, devices={xpu_indices}",
+                    flush=True,
+                )
             else:
                 kw["accelerator"] = "auto"
                 kw["devices"] = 1
