@@ -33,6 +33,17 @@ warnings.filterwarnings(
     "ignore",
     message=r".*LeafSpec.*",
 )
+warnings.filterwarnings(
+    "ignore",
+    message=r".*sync_dist.*",
+)
+
+
+def _is_rank_zero() -> bool:
+    return (
+        os.environ.get("RANK", "0") in ("", "0")
+        and os.environ.get("LOCAL_RANK", "0") in ("", "0")
+    )
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -594,7 +605,8 @@ def main():
         cfg = json.load(f)
 
     ctrl_state = TrainingControlState()
-    start_stdin_control_listener(ctrl_state)
+    if _is_rank_zero():
+        start_stdin_control_listener(ctrl_state)
 
     models_dir = cfg["models_dir"]
     os.makedirs(models_dir, exist_ok=True)
@@ -1000,10 +1012,11 @@ def main():
             continue
 
     model_cls = getattr(rfdetr, class_name)
-    print(
-        f"[LS-Trainer] Initializing {class_name} (resolution={resolution}, pretrain_weights={pretrain_weights}, device={device}, eval_backend={eval_backend}, num_workers={num_workers})...",
-        flush=True,
-    )
+    if _is_rank_zero():
+        print(
+            f"[LS-Trainer] Initializing {class_name} (resolution={resolution}, pretrain_weights={pretrain_weights}, device={device}, eval_backend={eval_backend}, num_workers={num_workers})...",
+            flush=True,
+        )
     model = model_cls(resolution=resolution, pretrain_weights=pretrain_weights, device=single_device)
 
     train_kwargs = {
@@ -1022,15 +1035,20 @@ def main():
     if freeze_backbone:
         train_kwargs["lr_encoder"] = 0.0
 
-    print(f"Epoch 1/{epochs} - Starting RF-DETR training loop on device={device} (num_workers={num_workers})...", flush=True)
-    cli_spinner.start()
+    if _is_rank_zero():
+        print(f"Epoch 1/{epochs} - Starting RF-DETR training loop on device={device} (num_workers={num_workers})...", flush=True)
+        cli_spinner.start()
     try:
         model.train(**train_kwargs)
     except KeyboardInterrupt:
         cli_spinner.stop()
-        print("[LS-Trainer] Training interrupted by user.", flush=True)
+        if _is_rank_zero():
+            print("[LS-Trainer] Training interrupted by user.", flush=True)
     finally:
         cli_spinner.stop()
+
+    if not _is_rank_zero():
+        return
 
     if ctrl_state.is_stop_requested(stop_file):
         print(f"[LS-Trainer] RF-DETR training stopped by user. Checkpoints preserved at: {output_dir}", flush=True)
@@ -1039,10 +1057,47 @@ def main():
     with open(metrics_file, "w", encoding="utf-8") as mf:
         json.dump(best_state, mf, indent=2)
 
+    weight_candidates = (
+        "checkpoint_best_total.pth",
+        "checkpoint_best_ema.pth",
+        "checkpoint_best_regular.pth",
+        "last.pth",
+        "last_ema.pth",
+        "checkpoint.pth",
+        "best.pt",
+        "last.pt",
+    )
+    saved_weights_path = None
+    for candidate in weight_candidates:
+        cand_path = os.path.join(output_dir, candidate)
+        if os.path.isfile(cand_path):
+            saved_weights_path = cand_path
+            break
+
+    if saved_weights_path is None:
+        fallback_path = os.path.join(output_dir, "checkpoint_best_total.pth")
+        try:
+            inner = getattr(getattr(model, "model", None), "model", None) or getattr(model, "model", None)
+            if inner is not None and hasattr(inner, "state_dict"):
+                torch.save({"model": inner.state_dict(), "epoch": epochs}, fallback_path)
+                saved_weights_path = fallback_path
+        except Exception as save_exc:
+            print(f"[LS-Trainer Warning] Could not save fallback weights: {save_exc}", flush=True)
+
     print(
         f"[LS-Trainer Metrics] Final | mAP50={best_state['map50']:.4f} | mAP50-95={best_state['map50_95']:.4f} | elapsed {format_duration_hm(progress_tracker.elapsed_secs())}",
         flush=True,
     )
+    if saved_weights_path:
+        print(
+            f"[LS-Trainer] Training complete! mAP50={best_state['map50']:.4f} | mAP50-95={best_state['map50_95']:.4f} | weights={saved_weights_path}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[LS-Trainer] Training complete! mAP50={best_state['map50']:.4f} | mAP50-95={best_state['map50_95']:.4f} | output_dir={output_dir}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
