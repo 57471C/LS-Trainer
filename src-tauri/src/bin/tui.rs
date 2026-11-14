@@ -9,8 +9,8 @@ use app_lib as ls_trainer_lib;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ls_trainer_lib::{
     GpuTelemetry, ProcessControlCommand, TrainMetrics, TrainingEventSink, TrainingRequest,
-    active_training_control, probe_local_gpu_info, run_training, send_training_control,
-    stop_training,
+    active_training_control, force_kill_active_child, probe_local_gpu_info, run_training,
+    send_training_control, stop_training,
 };
 use ratatui::{
     Frame,
@@ -94,6 +94,7 @@ struct CliConfig {
     batch: String,
     device: String,
     imgsz: u32,
+    workers: Option<u32>,
     run_name: String,
     focused_field: usize,
     error_banner: Option<String>,
@@ -110,6 +111,7 @@ impl Default for CliConfig {
             batch: "4".to_string(),
             device: "auto".to_string(),
             imgsz: 960,
+            workers: None,
             run_name: "BB-Parts-v3".to_string(),
             focused_field: 0,
             error_banner: None,
@@ -175,7 +177,7 @@ impl CliConfig {
             close_mosaic: 10,
             task,
             model_family: self.arch.as_family_str().to_string(),
-            workers: None,
+            workers: self.workers,
         })
     }
 }
@@ -248,6 +250,9 @@ pub struct AppState {
     logs: VecDeque<String>,
     log_scroll_offset: usize,
     follow_logs: bool,
+    spinner_tick: usize,
+    training_started_at: Option<Instant>,
+    training_ended_at: Option<Instant>,
 }
 
 impl AppState {
@@ -283,6 +288,9 @@ impl AppState {
             logs: VecDeque::with_capacity(MAX_LOG_LINES),
             log_scroll_offset: 0,
             follow_logs: true,
+            spinner_tick: 0,
+            training_started_at: None,
+            training_ended_at: None,
         }
     }
 
@@ -392,6 +400,7 @@ impl TrainingEventSink for TuiEventSink {
             guard.exit_code = code;
             guard.is_running = false;
             guard.is_paused = false;
+            guard.training_ended_at = Some(Instant::now());
             guard.status_line = match code {
                 Some(0) => "Completed".to_string(),
                 Some(c) if guard.stop_initiated => format!("Stopped (exit {c})"),
@@ -611,6 +620,8 @@ fn launch_training_thread(state: Arc<Mutex<AppState>>, request: TrainingRequest)
         guard.is_paused = false;
         guard.stop_initiated = false;
         guard.exit_code = None;
+        guard.training_started_at = Some(Instant::now());
+        guard.training_ended_at = None;
         guard.status_line = "Initializing training...".to_string();
         guard.latest_metrics = TrainMetrics {
             epoch: 0,
@@ -620,8 +631,8 @@ fn launch_training_thread(state: Arc<Mutex<AppState>>, request: TrainingRequest)
     }
 
     let sink: Arc<dyn TrainingEventSink> = Arc::new(TuiEventSink::new(Arc::clone(&state)));
-    std::thread::spawn(move || {
-        let result = tauri::async_runtime::block_on(run_training(sink.clone(), request));
+    tauri::async_runtime::spawn(async move {
+        let result = run_training(sink.clone(), request).await;
         if let Err(err) = result {
             sink.on_log(format!("[LS-Trainer Error] {err}"));
             sink.on_exit(Some(1));
@@ -1066,12 +1077,20 @@ fn render_run_summary(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         Color::Cyan
     };
+    let spinner_frames = ["|", "/", "-", "\\"];
+    let spinner_char = spinner_frames[state.spinner_tick % spinner_frames.len()];
     let status_badge = if state.is_paused {
-        "PAUSED"
+        "PAUSED".to_string()
     } else if state.is_running {
-        "TRAINING"
+        format!("TRAINING {spinner_char}")
     } else {
-        state.status_line.as_str()
+        state.status_line.clone()
+    };
+
+    let elapsed_str = match (state.training_started_at, state.training_ended_at) {
+        (Some(start), Some(end)) => format_eta_seconds(end.saturating_duration_since(start).as_secs_f64()),
+        (Some(start), None) => format_eta_seconds(start.elapsed().as_secs_f64()),
+        _ => "--:--".to_string(),
     };
 
     let map50_str = state
@@ -1087,7 +1106,7 @@ fn render_run_summary(frame: &mut Frame, area: Rect, state: &AppState) {
         Line::from(vec![
             Span::styled("State:   ", Style::default().fg(Color::Gray)),
             Span::styled(
-                status_badge.to_string(),
+                status_badge,
                 Style::default()
                     .fg(status_color)
                     .add_modifier(Modifier::BOLD),
@@ -1130,7 +1149,7 @@ fn render_run_summary(frame: &mut Frame, area: Rect, state: &AppState) {
         Line::from(vec![
             Span::styled("ETA:     ", Style::default().fg(Color::Gray)),
             Span::styled(
-                format_eta_seconds(m.eta_secs),
+                format!("{}  (elapsed {elapsed_str})", format_eta_seconds(m.eta_secs)),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -1413,6 +1432,7 @@ fn parse_cli_args() -> Result<Option<CliConfig>, String> {
                        --batch <n>                     Batch size (default: 4)\n  \
                        --device <str>                  Device (auto, xpu, cuda, 0, cpu)\n  \
                        --imgsz <n>                     Image resolution (640, 960, 1280)\n  \
+                       --workers <n>                   DataLoader workers (default: auto; 0 for Windows Arc)\n  \
                        --run-name <name>               Output run directory name\n"
                 );
                 return Ok(None);
@@ -1447,6 +1467,13 @@ fn parse_cli_args() -> Result<Option<CliConfig>, String> {
                 cfg.imgsz = raw
                     .parse::<u32>()
                     .map_err(|_| format!("Invalid --imgsz value '{raw}'"))?;
+            }
+            "--workers" => {
+                let raw = next_val()?;
+                let parsed = raw
+                    .parse::<u32>()
+                    .map_err(|_| format!("Invalid --workers value '{raw}'"))?;
+                cfg.workers = Some(parsed);
             }
             "--run-name" => {
                 cfg.run_name = next_val()?;
@@ -1562,14 +1589,17 @@ fn graceful_stop_and_wait(state: &Arc<Mutex<AppState>>) {
     }
     let _ = tauri::async_runtime::block_on(stop_training());
 
-    let deadline = Instant::now() + Duration::from_millis(1500);
+    let deadline = Instant::now() + Duration::from_millis(2500);
     while Instant::now() < deadline {
         let still_running = state.lock().map(|g| g.is_running).unwrap_or(false);
         if !still_running {
-            break;
+            return;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+
+    // Ensure no orphaned child process remains when the TUI exits after Ctrl+C / [q].
+    force_kill_active_child();
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1613,7 +1643,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tick_rate = Duration::from_millis(80);
 
     loop {
-        if let Ok(guard) = state.lock() {
+        if let Ok(mut guard) = state.lock() {
+            if guard.is_running && !guard.is_paused {
+                guard.spinner_tick = guard.spinner_tick.wrapping_add(1);
+            }
             let _ = terminal.draw(|frame| draw_ui(frame, &guard));
         }
 

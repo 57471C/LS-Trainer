@@ -1,15 +1,16 @@
 //! RF-DETR training backend (runs `python/rfdetr_train.py` in the project venv).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
+use tokio::process::Command as TokioCommand;
 
 use crate::dataset::coco::prepare_rfdetr_coco_dataset;
 use crate::dataset::labels::inspect_label_tree;
 use crate::hardware::{detect_gpu_info, resolve_dataloader_workers};
 use crate::models::{TrainingRequest, TrainingResponse};
 use crate::process::{
-    TrainingEventSink, get_venv_python, hide_console_window, stream_child_output,
+    TrainingEventSink, get_venv_python, hide_console_window_tokio, stream_tokio_child_output,
 };
 use crate::rfdetr::{
     ensure_rfdetr_installed, resolve_rfdetr_class_and_pretrain, snap_rfdetr_resolution,
@@ -17,7 +18,7 @@ use crate::rfdetr::{
 };
 use crate::training::{
     ensure_directory, extract_final_metrics_from_results_dir, is_stop_requested, log_final_metrics,
-    register_child_process, save_run_config_metadata, unregister_child_pid, write_text_file,
+    register_tokio_child_process, save_run_config_metadata, unregister_child_pid, write_text_file,
 };
 
 pub(crate) async fn start_rfdetr_training(
@@ -70,7 +71,12 @@ pub(crate) async fn start_rfdetr_training(
     };
 
     let device_input = request.device.trim();
-    let gpu_probe = detect_gpu_info(&project_root);
+    let gpu_probe = {
+        let root = project_root.clone();
+        tauri::async_runtime::spawn_blocking(move || detect_gpu_info(&root))
+            .await
+            .map_err(|e| format!("GPU probe task failed: {e}"))?
+    };
     let effective_device = if device_input.eq_ignore_ascii_case("cpu") {
         sink.on_log("[LS-Trainer] Device override: using device=cpu".to_string());
         "cpu".to_string()
@@ -159,7 +165,7 @@ pub(crate) async fn start_rfdetr_training(
     ));
     sink.on_log(format!("[LS-Trainer] Executing: {exact_command}"));
 
-    let mut cmd = Command::new(&python_exe);
+    let mut cmd = TokioCommand::new(&python_exe);
     cmd.args([
         runner_script_path.to_string_lossy().as_ref(),
         runner_cfg_path.to_string_lossy().as_ref(),
@@ -170,18 +176,30 @@ pub(crate) async fn start_rfdetr_training(
     .env("PYTHONIOENCODING", "utf-8")
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
 
-    hide_console_window(&mut cmd);
+    hide_console_window_tokio(&mut cmd);
+
+    sink.on_log(format!(
+        "[LS-Trainer] Spawning child process: exe='{}' cwd='{}' env(PYTHONUNBUFFERED=1, PYTHONUTF8=1, PYTHONIOENCODING=utf-8)",
+        python_exe.display(),
+        project_root.display()
+    ));
 
     match cmd.spawn() {
         Ok(mut child) => {
-            let _control = register_child_process(&mut child);
-            stream_child_output(&mut child, &sink);
-
-            let status = child
-                .wait()
-                .map_err(|e| format!("Failed while waiting for RF-DETR process: {e}"))?;
+            sink.on_log(format!(
+                "[LS-Trainer] Child process spawned (pid={:?}). Streaming stdout/stderr...",
+                child.id()
+            ));
+            let _control = register_tokio_child_process(&mut child);
+            stream_tokio_child_output(&mut child, &sink).await;
+            let status = child.wait().await.map_err(|e| {
+                let msg = format!("Failed while waiting for RF-DETR process: {e}");
+                sink.on_log(format!("[LS-Trainer Error] {msg}"));
+                msg
+            })?;
 
             unregister_child_pid();
             sink.on_exit(status.code());

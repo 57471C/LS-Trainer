@@ -1,19 +1,21 @@
 //! Ultralytics YOLO training backend.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
+use tokio::process::Command as TokioCommand;
 
 use crate::dataset::labels::inspect_label_tree;
 use crate::dataset::yolo::{find_data_yaml, resolve_and_fix_data_yaml, unpack_archive};
 use crate::hardware::{detect_gpu_info, resolve_dataloader_workers};
 use crate::models::{TrainingRequest, TrainingResponse};
 use crate::process::{
-    TrainingEventSink, hide_console_window, stream_child_output, venv_python_path, venv_yolo_path,
+    TrainingEventSink, hide_console_window, hide_console_window_tokio, stream_child_output,
+    stream_tokio_child_output, venv_python_path, venv_yolo_path,
 };
 use crate::training::{
     extract_final_metrics_from_results_dir, is_stop_requested, log_final_metrics,
-    register_child_process, save_run_config_metadata, unregister_child_pid,
+    register_tokio_child_process, save_run_config_metadata, unregister_child_pid,
 };
 
 pub(crate) fn resolve_or_download_model_weights(
@@ -75,7 +77,7 @@ pub(crate) fn resolve_or_download_model_weights(
         ));
 
         let script = "import sys; from ultralytics.utils.downloads import attempt_download_asset; p = attempt_download_asset(sys.argv[1]); print(f'[LS-Trainer] Downloaded model asset: {p}', flush=True)";
-        let mut dl_cmd = Command::new(&python_exe);
+        let mut dl_cmd = std::process::Command::new(&python_exe);
         dl_cmd
             .args(["-c", script, &weight_filename])
             .current_dir(&models_dir)
@@ -187,8 +189,16 @@ pub(crate) async fn start_yolo_training(
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| project_root.clone());
 
-    let resolved_model =
-        resolve_or_download_model_weights(&project_root, &request.model_choice, &sink);
+    let resolved_model = {
+        let root = project_root.clone();
+        let choice = request.model_choice.clone();
+        let sink_dl = Arc::clone(&sink);
+        tauri::async_runtime::spawn_blocking(move || {
+            resolve_or_download_model_weights(&root, &choice, &sink_dl)
+        })
+        .await
+        .map_err(|e| format!("Model resolution task failed: {e}"))?
+    };
     sink.on_log("[LS-Trainer Status] Training in progress...".to_string());
 
     let effective_workers = resolve_dataloader_workers(&project_root, request.workers, &sink);
@@ -240,7 +250,12 @@ pub(crate) async fn start_yolo_training(
     ));
 
     let device_input = request.device.trim();
-    let gpu_probe = detect_gpu_info(&project_root);
+    let gpu_probe = {
+        let root = project_root.clone();
+        tauri::async_runtime::spawn_blocking(move || detect_gpu_info(&root))
+            .await
+            .map_err(|e| format!("GPU probe task failed: {e}"))?
+    };
     let effective_device = if device_input.eq_ignore_ascii_case("cpu") {
         sink.on_log("[LS-Trainer] Device override: using device=cpu".to_string());
         "cpu".to_string()
@@ -335,11 +350,11 @@ pub(crate) async fn start_yolo_training(
         ));
 
         let c = if expected_venv_python.is_file() {
-            let mut py_cmd = Command::new(&expected_venv_python);
+            let mut py_cmd = TokioCommand::new(&expected_venv_python);
             py_cmd.arg("-c").arg(yolo_runner_script).args(&train_args);
             py_cmd
         } else {
-            let mut yolo_cmd = Command::new(&expected_venv_yolo);
+            let mut yolo_cmd = TokioCommand::new(&expected_venv_yolo);
             yolo_cmd.args(&train_args);
             yolo_cmd
         };
@@ -355,7 +370,7 @@ pub(crate) async fn start_yolo_training(
 
         #[cfg(target_os = "windows")]
         let c = {
-            let mut cmd = Command::new("cmd");
+            let mut cmd = TokioCommand::new("cmd");
             cmd.args(["/C", "yolo"]);
             cmd.args(&train_args);
             cmd
@@ -363,7 +378,7 @@ pub(crate) async fn start_yolo_training(
 
         #[cfg(not(target_os = "windows"))]
         let c = {
-            let mut cmd = Command::new("yolo");
+            let mut cmd = TokioCommand::new("yolo");
             cmd.args(&train_args);
             cmd
         };
@@ -386,18 +401,37 @@ pub(crate) async fn start_yolo_training(
         .env("PYTHONIOENCODING", "utf-8")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
-    hide_console_window(&mut cmd);
+    hide_console_window_tokio(&mut cmd);
+
+    let launch_exe_desc = if expected_venv_python.is_file() {
+        expected_venv_python.display().to_string()
+    } else if expected_venv_yolo.is_file() {
+        expected_venv_yolo.display().to_string()
+    } else {
+        "yolo (PATH)".to_string()
+    };
+    sink.on_log(format!(
+        "[LS-Trainer] Spawning child process: exe='{}' cwd='{}' env(PYTHONUNBUFFERED=1, PYTHONIOENCODING=utf-8)",
+        launch_exe_desc,
+        dataset_working_dir.display()
+    ));
 
     match cmd.spawn() {
         Ok(mut child) => {
-            let _control = register_child_process(&mut child);
-            stream_child_output(&mut child, &sink);
-
-            let status = child
-                .wait()
-                .map_err(|e| format!("Failed while waiting for YOLO: {e}"))?;
+            sink.on_log(format!(
+                "[LS-Trainer] Child process spawned (pid={:?}). Streaming stdout/stderr...",
+                child.id()
+            ));
+            let _control = register_tokio_child_process(&mut child);
+            stream_tokio_child_output(&mut child, &sink).await;
+            let status = child.wait().await.map_err(|e| {
+                let msg = format!("Failed while waiting for YOLO: {e}");
+                sink.on_log(format!("[LS-Trainer Error] {msg}"));
+                msg
+            })?;
 
             unregister_child_pid();
             sink.on_exit(status.code());

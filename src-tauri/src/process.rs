@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 pub use crate::models::TrainMetrics;
 
@@ -71,17 +72,41 @@ impl ProcessControlCommand {
 #[derive(Clone, Default)]
 pub struct ProcessControlHandle {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
+    tokio_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
 }
 
 impl ProcessControlHandle {
     pub fn new(stdin: Option<ChildStdin>) -> Self {
         Self {
             stdin: Arc::new(Mutex::new(stdin)),
+            tokio_tx: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn from_child(child: &mut Child) -> Self {
         Self::new(child.stdin.take())
+    }
+
+    /// Attach a `tokio::process::Child`'s piped `stdin` via a non-blocking async writer task.
+    pub fn from_tokio_child(child: &mut tokio::process::Child) -> Self {
+        let Some(mut stdin) = child.stdin.take() else {
+            return Self::default();
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tauri::async_runtime::spawn(async move {
+            while let Some(payload) = rx.recv().await {
+                if stdin.write_all(payload.as_bytes()).await.is_err() {
+                    break;
+                }
+                if stdin.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            stdin: Arc::new(Mutex::new(None)),
+            tokio_tx: Arc::new(Mutex::new(Some(tx))),
+        }
     }
 
     pub fn attach(&self, stdin: ChildStdin) {
@@ -94,20 +119,32 @@ impl ProcessControlHandle {
         if let Ok(mut guard) = self.stdin.lock() {
             *guard = None;
         }
+        if let Ok(mut guard) = self.tokio_tx.lock() {
+            *guard = None;
+        }
     }
 
     pub fn write_raw(&self, command_line: &str) -> Result<(), String> {
+        let payload = if command_line.ends_with('\n') {
+            command_line.to_string()
+        } else {
+            format!("{command_line}\n")
+        };
+
+        if let Ok(guard) = self.tokio_tx.lock() {
+            if let Some(tx) = guard.as_ref() {
+                return tx
+                    .send(payload)
+                    .map_err(|e| format!("Failed to queue control command for child stdin: {e}"));
+            }
+        }
+
         let mut guard = self
             .stdin
             .lock()
             .map_err(|_| "Failed to lock child stdin handle".to_string())?;
         let Some(stdin) = guard.as_mut() else {
             return Err("No active child stdin pipe attached".to_string());
-        };
-        let payload = if command_line.ends_with('\n') {
-            command_line.to_string()
-        } else {
-            format!("{command_line}\n")
         };
         stdin
             .write_all(payload.as_bytes())
@@ -146,6 +183,16 @@ pub(crate) fn hide_console_window(cmd: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
+/// Prevent a console window from flashing up for async Tokio child processes on Windows. No-op elsewhere.
+pub(crate) fn hide_console_window_tokio(cmd: &mut tokio::process::Command) {
+    #[cfg(windows)]
+    {
         cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
     #[cfg(not(windows))]
@@ -218,6 +265,33 @@ pub(crate) fn stream_child_output(child: &mut Child, sink: &Arc<dyn TrainingEven
     });
     let _ = t_out.join();
     let _ = t_err.join();
+}
+
+/// Asynchronously stream a Tokio child's stdout and stderr line-by-line until both pipes close.
+pub(crate) async fn stream_tokio_child_output(
+    child: &mut tokio::process::Child,
+    sink: &Arc<dyn TrainingEventSink>,
+) {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let sink_out = Arc::clone(sink);
+    let t_out = tauri::async_runtime::spawn(async move {
+        if let Some(out) = stdout {
+            stream_tokio_reader_lines(out, "stdout", sink_out.as_ref()).await;
+        } else {
+            sink_out.on_log("[LS-Trainer Error] [stdout] Pipe was not attached.".to_string());
+        }
+    });
+    let sink_err = Arc::clone(sink);
+    let t_err = tauri::async_runtime::spawn(async move {
+        if let Some(err) = stderr {
+            stream_tokio_reader_lines(err, "stderr", sink_err.as_ref()).await;
+        } else {
+            sink_err.on_log("[LS-Trainer Error] [stderr] Pipe was not attached.".to_string());
+        }
+    });
+    let _ = t_out.await;
+    let _ = t_err.await;
 }
 
 pub(crate) fn get_project_root() -> PathBuf {
@@ -316,6 +390,33 @@ fn process_raw_output_line(raw: &str, last_sent: &mut String, sink: &dyn Trainin
     }
 }
 
+fn feed_output_chunk(
+    chunk: &[u8],
+    line_buf: &mut Vec<u8>,
+    last_sent: &mut String,
+    sink: &dyn TrainingEventSink,
+) {
+    for &b in chunk {
+        if b == b'\n' || b == b'\r' {
+            if !line_buf.is_empty() {
+                let raw = String::from_utf8_lossy(line_buf);
+                process_raw_output_line(&raw, last_sent, sink);
+                line_buf.clear();
+            }
+        } else {
+            line_buf.push(b);
+        }
+    }
+}
+
+fn flush_output_line(line_buf: &mut Vec<u8>, last_sent: &mut String, sink: &dyn TrainingEventSink) {
+    if !line_buf.is_empty() {
+        let raw = String::from_utf8_lossy(line_buf);
+        process_raw_output_line(&raw, last_sent, sink);
+        line_buf.clear();
+    }
+}
+
 pub(crate) fn stream_reader_lines<R: Read>(mut reader: R, sink: &dyn TrainingEventSink) {
     let mut buf = [0u8; 1024];
     let mut line_buf = Vec::with_capacity(256);
@@ -325,20 +426,41 @@ pub(crate) fn stream_reader_lines<R: Read>(mut reader: R, sink: &dyn TrainingEve
         if n == 0 {
             break;
         }
-        for &b in &buf[..n] {
-            if b == b'\n' || b == b'\r' {
-                if !line_buf.is_empty() {
-                    let raw = String::from_utf8_lossy(&line_buf);
-                    process_raw_output_line(&raw, &mut last_sent, sink);
-                    line_buf.clear();
+        feed_output_chunk(&buf[..n], &mut line_buf, &mut last_sent, sink);
+    }
+    flush_output_line(&mut line_buf, &mut last_sent, sink);
+}
+
+pub(crate) async fn stream_tokio_reader_lines<R: AsyncRead + Unpin>(
+    mut reader: R,
+    stream_name: &str,
+    sink: &dyn TrainingEventSink,
+) {
+    let mut buf = [0u8; 1024];
+    let mut line_buf = Vec::with_capacity(256);
+    let mut last_sent = String::new();
+    let mut saw_first_bytes = false;
+
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if !saw_first_bytes {
+                    saw_first_bytes = true;
+                    let preview = String::from_utf8_lossy(&buf[..n.min(120)])
+                        .replace('\r', "\\r")
+                        .replace('\n', "\\n");
+                    sink.on_log(format!(
+                        "[LS-Trainer] [{stream_name}] First output received ({n} bytes): {preview}"
+                    ));
                 }
-            } else {
-                line_buf.push(b);
+                feed_output_chunk(&buf[..n], &mut line_buf, &mut last_sent, sink);
+            }
+            Err(e) => {
+                sink.on_log(format!("[LS-Trainer Error] [{stream_name}] Read error: {e}"));
+                break;
             }
         }
     }
-    if !line_buf.is_empty() {
-        let raw = String::from_utf8_lossy(&line_buf);
-        process_raw_output_line(&raw, &mut last_sent, sink);
-    }
+    flush_output_line(&mut line_buf, &mut last_sent, sink);
 }

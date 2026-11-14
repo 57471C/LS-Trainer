@@ -37,7 +37,8 @@ pub use process::{
     TrainingEventSink, to_display_path,
 };
 pub use training::{
-    ACTIVE_TRAINING, active_training_control, run_training, send_training_control, stop_training,
+    ACTIVE_TRAINING, active_training_control, force_kill_active_child, run_training,
+    send_training_control, stop_training,
 };
 
 pub fn probe_local_gpu_info() -> GpuInfo {

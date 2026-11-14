@@ -117,10 +117,66 @@ class TrainingControlState:
             self._resume_event.wait(timeout=0.2)
 
 
+def _iter_stdin_control_lines():
+    """Yield control lines from piped stdin without holding Python's sys.stdin buffer lock."""
+    if sys.stdin is None:
+        return
+    try:
+        fd = sys.stdin.fileno()
+    except Exception:
+        return
+    try:
+        if os.isatty(fd):
+            return
+    except Exception:
+        pass
+
+    buf = b""
+    if os.name == "nt":
+        import ctypes
+        import ctypes.wintypes as wintypes
+        import msvcrt
+
+        handle = msvcrt.get_osfhandle(fd)
+        kernel32 = ctypes.windll.kernel32
+        avail = wintypes.DWORD(0)
+        while True:
+            ok = kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(avail), None)
+            if not ok:
+                break
+            if avail.value == 0:
+                time.sleep(0.05)
+                continue
+            chunk = os.read(fd, min(4096, avail.value))
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                yield line.decode("utf-8", errors="replace")
+    else:
+        import select
+
+        while True:
+            rlist, _, _ = select.select([fd], [], [], 0.1)
+            if not rlist:
+                continue
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                yield line.decode("utf-8", errors="replace")
+
+    if buf.strip():
+        yield buf.decode("utf-8", errors="replace")
+
+
 def start_stdin_control_listener(ctrl_state):
     def _listener():
         try:
-            for raw_line in sys.stdin:
+            for raw_line in _iter_stdin_control_lines():
                 cmd = raw_line.strip().upper()
                 if not cmd:
                     continue

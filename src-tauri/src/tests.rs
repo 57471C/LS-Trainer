@@ -541,3 +541,90 @@ fn sideband_metrics_parsed_and_filtered_from_logs() {
     assert_eq!(recorded_metrics.len(), 1);
     assert_eq!(recorded_metrics[0], sample_metrics);
 }
+
+#[test]
+#[ignore = "Requires Windows + Intel Arc XPU .venv and synthetic dataset in %TEMP%/ls_xpu_smoke"]
+fn xpu_async_train_smoke() {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use crate::models::{TrainMetrics, TrainingRequest};
+    use crate::process::TrainingEventSink;
+    use crate::training::run_training;
+
+    #[derive(Default)]
+    struct LiveSink {
+        logs: Mutex<Vec<String>>,
+        metrics: Mutex<Vec<TrainMetrics>>,
+        exits: Mutex<Vec<Option<i32>>>,
+    }
+    impl TrainingEventSink for LiveSink {
+        fn on_log(&self, line: String) {
+            println!("[LOG] {line}");
+            self.logs.lock().unwrap().push(line);
+        }
+        fn on_metrics(&self, metrics: TrainMetrics) {
+            println!(
+                "[METRIC] ep={}/{} step={}/{} loss={:.4}",
+                metrics.epoch, metrics.total_epochs, metrics.step, metrics.total_steps, metrics.train_loss
+            );
+            self.metrics.lock().unwrap().push(metrics);
+        }
+        fn on_exit(&self, code: Option<i32>) {
+            println!("[EXIT] code={code:?}");
+            self.exits.lock().unwrap().push(code);
+        }
+    }
+
+    let dataset_dir = std::env::temp_dir().join("ls_xpu_smoke");
+    assert!(dataset_dir.is_dir(), "Missing {:?}", dataset_dir);
+
+    let sink = Arc::new(LiveSink::default());
+    let sink_trait: Arc<dyn TrainingEventSink> = sink.clone();
+    let req = TrainingRequest {
+        dataset_path: dataset_dir.to_string_lossy().to_string(),
+        model_family: "YOLO".to_string(),
+        model_choice: "yolo11n.pt".to_string(),
+        run_name: "xpu_smoke_test".to_string(),
+        epochs: 1,
+        batch: 1,
+        imgsz: 64,
+        workers: Some(0),
+        device: "xpu".to_string(),
+        amp: false,
+        freeze_backbone: false,
+        freeze_layers: 0,
+        mosaic: 0.0,
+        mixup: 0.0,
+        copy_paste: 0.0,
+        degrees: 0.0,
+        flipud: 0.0,
+        translate: 0.0,
+        scale: 0.0,
+        close_mosaic: 0,
+        task: "detect".to_string(),
+    };
+
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_flag = Arc::clone(&done);
+    let handle = tauri::async_runtime::spawn(async move {
+        let out = run_training(sink_trait, req).await;
+        done_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        out
+    });
+    let start = Instant::now();
+    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            start.elapsed() < Duration::from_secs(90),
+            "XPU training hung for >90s"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let res = tauri::async_runtime::block_on(handle)
+        .expect("spawn join failed")
+        .expect("run_training failed");
+    assert!(res.success, "Expected success, got: {:?}", res.message);
+    assert!(!sink.logs.lock().unwrap().is_empty());
+    assert!(!sink.metrics.lock().unwrap().is_empty());
+    assert_eq!(sink.exits.lock().unwrap().as_slice(), &[Some(0)]);
+}

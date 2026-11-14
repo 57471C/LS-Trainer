@@ -5,7 +5,7 @@ pub(crate) mod rtdetr;
 pub(crate) mod yolo;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::ipc::Channel;
@@ -57,13 +57,34 @@ pub(crate) fn register_child_pid(pid: u32) {
     }
 }
 
-pub(crate) fn register_child_process(child: &mut Child) -> ProcessControlHandle {
-    register_child_pid(child.id());
-    let handle = ProcessControlHandle::from_child(child);
+pub(crate) fn register_tokio_child_process(
+    child: &mut tokio::process::Child,
+) -> ProcessControlHandle {
+    if let Some(pid) = child.id() {
+        register_child_pid(pid);
+    }
+    let handle = ProcessControlHandle::from_tokio_child(child);
     if let Ok(mut lock) = ACTIVE_TRAINING.child_control.lock() {
         *lock = Some(handle.clone());
     }
     handle
+}
+
+pub fn force_kill_active_child() {
+    let pid_opt = ACTIVE_TRAINING.child_pid.lock().ok().and_then(|g| *g);
+    if let Some(pid) = pid_opt {
+        #[cfg(windows)]
+        {
+            let mut cmd = Command::new("taskkill");
+            cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
+            hide_console_window(&mut cmd);
+            let _ = cmd.spawn();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).spawn();
+        }
+    }
 }
 
 pub fn active_training_control() -> Option<ProcessControlHandle> {
@@ -144,20 +165,10 @@ pub async fn stop_training() -> Result<bool, String> {
         send_break_signal(pid);
 
         // 3. Fallback watchdog: if training is still running after 6 seconds, terminate process
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(6));
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
             if ACTIVE_TRAINING.is_running.load(Ordering::SeqCst) {
-                #[cfg(windows)]
-                {
-                    let mut cmd = Command::new("taskkill");
-                    cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
-                    hide_console_window(&mut cmd);
-                    let _ = cmd.spawn();
-                }
-                #[cfg(not(windows))]
-                {
-                    let _ = Command::new("kill").args(["-9", &pid.to_string()]).spawn();
-                }
+                force_kill_active_child();
             }
         });
     }
