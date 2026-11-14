@@ -2,12 +2,11 @@
 
 use std::collections::VecDeque;
 use std::env;
-use std::io::Write;
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use app_lib as ls_trainer_lib;
+use arboard::Clipboard;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ls_trainer_lib::{
     GpuTelemetry, ProcessControlCommand, TrainMetrics, TrainingEventSink, TrainingRequest,
@@ -1791,58 +1790,6 @@ fn copy_logs_with_feedback(state: &Arc<Mutex<AppState>>) {
 }
 
 fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        return pipe_to_clipboard_command("clip", &[], text);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        return pipe_to_clipboard_command("pbcopy", &[], text);
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        for (cmd, args) in [
-            ("wl-copy", &[][..]),
-            ("xclip", &["-selection", "clipboard"][..]),
-            ("xsel", &["--clipboard", "--input"][..]),
-        ] {
-            if pipe_to_clipboard_command(cmd, args, text).is_ok() {
-                return Ok(());
-            }
-        }
-        return Err("no clipboard utility found (tried wl-copy, xclip, xsel)".to_string());
-    }
-}
-
-fn pipe_to_clipboard_command(program: &str, args: &[&str], text: &str) -> Result<(), String> {
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to launch {program}: {e}"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(text.as_bytes())
-            .map_err(|e| format!("failed to write to {program}: {e}"))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("failed waiting for {program}: {e}"))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.is_empty() {
-            Err(format!("{program} exited with status {}", output.status))
-        } else {
-            Err(format!("{program} failed: {stderr}"))
-        }
-    }
+    let mut cb = Clipboard::new().map_err(|e| e.to_string())?;
+    cb.set_text(text.to_owned()).map_err(|e| e.to_string())
 }

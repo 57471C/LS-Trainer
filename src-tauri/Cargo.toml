@@ -41,3 +41,4 @@ ratatui = "0.29"
 crossterm = "0.28"
 sysinfo = "0.33"
 tokio = { version = "1", features = ["process", "io-util", "sync", "time", "rt"] }
+arboard = "3"
