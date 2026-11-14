@@ -7,12 +7,21 @@ license = ""
 repository = ""
 edition = "2024"
 rust-version = "1.90"
+default-run = "app"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
 name = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "app"
+path = "src/main.rs"
+
+[[bin]]
+name = "ls-trainer-tui"
+path = "src/bin/tui.rs"
 
 [build-dependencies]
 tauri-build = { version = "2.7.3", features = [] }
@@ -28,3 +37,6 @@ flate2 = "1.1.10"
 rfd = "0.17.2"
 walkdir = "2.5.0"
 serde_yaml = "0.9.34"
+ratatui = "0.29"
+crossterm = "0.28"
+sysinfo = "0.33"

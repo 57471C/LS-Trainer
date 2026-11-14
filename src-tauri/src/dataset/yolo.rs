@@ -3,7 +3,9 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use tauri::ipc::Channel;
+use std::sync::Arc;
+
+use crate::process::TrainingEventSink;
 
 pub(crate) fn unpack_archive(archive_path: &Path, target_dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(target_dir).map_err(|e| format!("Failed to create temp dir: {e}"))?;
@@ -72,7 +74,7 @@ pub(crate) fn resolve_single_path(base_dir: &Path, raw: &str) -> (String, bool) 
 
 pub(crate) fn resolve_and_fix_data_yaml(
     data_yaml_path: &Path,
-    on_log: &Channel<String>,
+    sink: &Arc<dyn TrainingEventSink>,
 ) -> Result<PathBuf, String> {
     let base_dir = data_yaml_path
         .parent()
@@ -151,14 +153,14 @@ pub(crate) fn resolve_and_fix_data_yaml(
     }
 
     if changes.is_empty() {
-        let _ = on_log.send("[LS-Trainer] Dataset paths in data.yaml are already absolute.".to_string());
+        sink.on_log("[LS-Trainer] Dataset paths in data.yaml are already absolute.".to_string());
     } else {
-        let _ = on_log.send(format!(
+        sink.on_log(format!(
             "[LS-Trainer] Resolving relative dataset paths against '{}':",
             base_dir_str
         ));
         for change in &changes {
-            let _ = on_log.send(format!("[LS-Trainer]   * {change}"));
+            sink.on_log(format!("[LS-Trainer]   * {change}"));
         }
     }
 
@@ -172,7 +174,7 @@ pub(crate) fn resolve_and_fix_data_yaml(
     // Also overwrite unpacked data.yaml in-place for consistency
     let _ = std::fs::write(data_yaml_path, &serialized);
 
-    let _ = on_log.send(format!(
+    sink.on_log(format!(
         "[LS-Trainer] Fixed absolute-path data.yaml written to: {}",
         resolved_yaml_path.display()
     ));

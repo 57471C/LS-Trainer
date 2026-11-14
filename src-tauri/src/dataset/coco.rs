@@ -1,9 +1,10 @@
 //! LS-Marker COCO dataset preparation into the Roboflow layout expected by RF-DETR.
 
 use std::path::{Path, PathBuf};
-use tauri::ipc::Channel;
+use std::sync::Arc;
 
 use crate::dataset::yolo::unpack_archive;
+use crate::process::TrainingEventSink;
 
 pub(crate) fn copy_or_hardlink_file(src: &Path, dst: &Path) -> Result<(), String> {
     if dst.exists() {
@@ -211,7 +212,7 @@ pub(crate) fn populate_rfdetr_split_from_coco(
 
 pub(crate) fn prepare_rfdetr_coco_dataset(
     dataset_input: &Path,
-    on_log: &Channel<String>,
+    sink: &Arc<dyn TrainingEventSink>,
 ) -> Result<PathBuf, String> {
     let base_dir = if dataset_input.is_file() {
         let lower = dataset_input.to_string_lossy().to_ascii_lowercase();
@@ -221,13 +222,13 @@ pub(crate) fn prepare_rfdetr_coco_dataset(
                 .unwrap_or_default()
                 .as_millis();
             let temp_dir = std::env::temp_dir().join(format!("ls_trainer_coco_{timestamp}"));
-            let _ = on_log.send(format!(
+            sink.on_log(format!(
                 "[LS-Trainer] Unpacking dataset archive '{}' to '{}'...",
                 dataset_input.display(),
                 temp_dir.display()
             ));
             unpack_archive(dataset_input, &temp_dir)?;
-            let _ = on_log.send("[LS-Trainer] Unpacked dataset archive.".to_string());
+            sink.on_log("[LS-Trainer] Unpacked dataset archive.".to_string());
             temp_dir
         } else if lower.ends_with(".json") {
             let parent = dataset_input.parent().unwrap_or(dataset_input);
@@ -270,7 +271,7 @@ pub(crate) fn prepare_rfdetr_coco_dataset(
     let rf_valid_ann = dataset_root.join("valid").join("_annotations.coco.json");
     let rf_test_ann = dataset_root.join("test").join("_annotations.coco.json");
     if rf_train_ann.is_file() {
-        let _ = on_log.send(format!(
+        sink.on_log(format!(
             "[LS-Trainer] Detected COCO dataset layout in '{}'",
             dataset_root.display()
         ));
@@ -313,7 +314,7 @@ pub(crate) fn prepare_rfdetr_coco_dataset(
         .join("instances_train.json");
     let ls_val_ann = dataset_root.join("annotations").join("instances_val.json");
     if ls_train_ann.is_file() {
-        let _ = on_log.send(format!(
+        sink.on_log(format!(
             "[LS-Trainer] Detected LS-Marker COCO export in '{}'. Preparing RF-DETR splits...",
             dataset_root.display()
         ));
@@ -376,7 +377,7 @@ pub(crate) fn prepare_rfdetr_coco_dataset(
             &manifest_map,
         )?;
 
-        let _ = on_log.send(format!(
+        sink.on_log(format!(
             "[LS-Trainer] Prepared RF-DETR COCO splits: {train_count} train images, {val_count} valid images."
         ));
         return Ok(dataset_root);

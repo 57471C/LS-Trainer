@@ -1,9 +1,140 @@
-//! Process and path helpers: project root, venv executables, console hiding, and log streaming.
+//! Process and path helpers: project root, venv executables, console hiding, event sinks, and log/metrics streaming.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, ChildStdin, Command};
+use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
+
+pub use crate::models::TrainMetrics;
+
+pub const METRICS_PREFIX: &str = "@@LS_METRICS@@";
+
+/// Cross-platform event sink for decoupled training logs, telemetry metrics, and process exit events.
+pub trait TrainingEventSink: Send + Sync + 'static {
+    fn on_log(&self, line: String);
+    fn on_metrics(&self, metrics: TrainMetrics);
+    fn on_exit(&self, code: Option<i32>);
+    fn preserve_ansi(&self) -> bool {
+        false
+    }
+}
+
+/// Event sink adapter wrapping Tauri's `Channel<String>` so existing GUI commands work identically.
+#[derive(Clone)]
+pub struct TauriChannelSink {
+    channel: Channel<String>,
+}
+
+impl TauriChannelSink {
+    pub fn new(channel: Channel<String>) -> Self {
+        Self { channel }
+    }
+
+    pub fn channel(&self) -> &Channel<String> {
+        &self.channel
+    }
+}
+
+impl TrainingEventSink for TauriChannelSink {
+    fn on_log(&self, line: String) {
+        let _ = self.channel.send(line);
+    }
+
+    fn on_metrics(&self, _metrics: TrainMetrics) {}
+
+    fn on_exit(&self, _code: Option<i32>) {}
+}
+
+/// Control commands supported by the Python training starters over piped stdin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessControlCommand {
+    Pause,
+    Resume,
+    Checkpoint,
+    Stop,
+}
+
+impl ProcessControlCommand {
+    pub fn as_wire_line(&self) -> &'static str {
+        match self {
+            Self::Pause => "PAUSE\n",
+            Self::Resume => "RESUME\n",
+            Self::Checkpoint => "CHECKPOINT\n",
+            Self::Stop => "STOP\n",
+        }
+    }
+}
+
+/// Thread-safe handle on a running child process's piped `stdin` for sending control commands
+/// (`PAUSE\n`, `RESUME\n`, `CHECKPOINT\n`, `STOP\n`) on both Windows and Linux.
+#[derive(Clone, Default)]
+pub struct ProcessControlHandle {
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+}
+
+impl ProcessControlHandle {
+    pub fn new(stdin: Option<ChildStdin>) -> Self {
+        Self {
+            stdin: Arc::new(Mutex::new(stdin)),
+        }
+    }
+
+    pub fn from_child(child: &mut Child) -> Self {
+        Self::new(child.stdin.take())
+    }
+
+    pub fn attach(&self, stdin: ChildStdin) {
+        if let Ok(mut guard) = self.stdin.lock() {
+            *guard = Some(stdin);
+        }
+    }
+
+    pub fn clear(&self) {
+        if let Ok(mut guard) = self.stdin.lock() {
+            *guard = None;
+        }
+    }
+
+    pub fn write_raw(&self, command_line: &str) -> Result<(), String> {
+        let mut guard = self
+            .stdin
+            .lock()
+            .map_err(|_| "Failed to lock child stdin handle".to_string())?;
+        let Some(stdin) = guard.as_mut() else {
+            return Err("No active child stdin pipe attached".to_string());
+        };
+        let payload = if command_line.ends_with('\n') {
+            command_line.to_string()
+        } else {
+            format!("{command_line}\n")
+        };
+        stdin
+            .write_all(payload.as_bytes())
+            .and_then(|_| stdin.flush())
+            .map_err(|e| format!("Failed to write control command to child stdin: {e}"))
+    }
+
+    pub fn send_command(&self, cmd: ProcessControlCommand) -> Result<(), String> {
+        self.write_raw(cmd.as_wire_line())
+    }
+
+    pub fn pause(&self) -> Result<(), String> {
+        self.send_command(ProcessControlCommand::Pause)
+    }
+
+    pub fn resume(&self) -> Result<(), String> {
+        self.send_command(ProcessControlCommand::Resume)
+    }
+
+    pub fn checkpoint(&self) -> Result<(), String> {
+        self.send_command(ProcessControlCommand::Checkpoint)
+    }
+
+    pub fn stop(&self) -> Result<(), String> {
+        self.send_command(ProcessControlCommand::Stop)
+    }
+}
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -69,20 +200,20 @@ pub(crate) fn setup_script_name() -> &'static str {
     }
 }
 
-/// Stream a child's stdout and stderr line-by-line to the log channel and wait for both pipes to close.
-pub(crate) fn stream_child_output(child: &mut Child, on_log: &Channel<String>) {
+/// Stream a child's stdout and stderr line-by-line to the event sink and wait for both pipes to close.
+pub(crate) fn stream_child_output(child: &mut Child, sink: &Arc<dyn TrainingEventSink>) {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let log_out = on_log.clone();
+    let sink_out = Arc::clone(sink);
     let t_out = std::thread::spawn(move || {
         if let Some(out) = stdout {
-            stream_reader_lines(out, &log_out);
+            stream_reader_lines(out, sink_out.as_ref());
         }
     });
-    let log_err = on_log.clone();
+    let sink_err = Arc::clone(sink);
     let t_err = std::thread::spawn(move || {
         if let Some(err) = stderr {
-            stream_reader_lines(err, &log_err);
+            stream_reader_lines(err, sink_err.as_ref());
         }
     });
     let _ = t_out.join();
@@ -165,7 +296,27 @@ pub(crate) fn strip_ansi_codes(input: &str) -> String {
     out
 }
 
-pub(crate) fn stream_reader_lines<R: Read>(mut reader: R, on_log: &Channel<String>) {
+fn process_raw_output_line(raw: &str, last_sent: &mut String, sink: &dyn TrainingEventSink) {
+    let trimmed = raw.trim();
+    if let Some(json_str) = trimmed.strip_prefix(METRICS_PREFIX) {
+        if let Ok(metrics) = serde_json::from_str::<TrainMetrics>(json_str.trim()) {
+            sink.on_metrics(metrics);
+        }
+        return;
+    }
+
+    let cleaned = strip_ansi_codes(raw).trim_end().to_string();
+    if !cleaned.trim().is_empty() && cleaned != *last_sent {
+        if sink.preserve_ansi() {
+            sink.on_log(raw.trim_end().to_string());
+        } else {
+            sink.on_log(cleaned.clone());
+        }
+        *last_sent = cleaned;
+    }
+}
+
+pub(crate) fn stream_reader_lines<R: Read>(mut reader: R, sink: &dyn TrainingEventSink) {
     let mut buf = [0u8; 1024];
     let mut line_buf = Vec::with_capacity(256);
     let mut last_sent = String::new();
@@ -178,11 +329,7 @@ pub(crate) fn stream_reader_lines<R: Read>(mut reader: R, on_log: &Channel<Strin
             if b == b'\n' || b == b'\r' {
                 if !line_buf.is_empty() {
                     let raw = String::from_utf8_lossy(&line_buf);
-                    let cleaned = strip_ansi_codes(&raw).trim_end().to_string();
-                    if !cleaned.trim().is_empty() && cleaned != last_sent {
-                        let _ = on_log.send(cleaned.clone());
-                        last_sent = cleaned;
-                    }
+                    process_raw_output_line(&raw, &mut last_sent, sink);
                     line_buf.clear();
                 }
             } else {
@@ -192,9 +339,6 @@ pub(crate) fn stream_reader_lines<R: Read>(mut reader: R, on_log: &Channel<Strin
     }
     if !line_buf.is_empty() {
         let raw = String::from_utf8_lossy(&line_buf);
-        let cleaned = strip_ansi_codes(&raw).trim_end().to_string();
-        if !cleaned.trim().is_empty() && cleaned != last_sent {
-            let _ = on_log.send(cleaned);
-        }
+        process_raw_output_line(&raw, &mut last_sent, sink);
     }
 }

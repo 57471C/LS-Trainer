@@ -1,6 +1,8 @@
 import json
+import math
 import os
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -61,6 +63,228 @@ if hasattr(torch, "xpu") and torch.xpu.is_available():
     except Exception:
         pass
 
+
+class TrainingControlState:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._resume_event = threading.Event()
+        self._resume_event.set()
+        self.paused = False
+        self.checkpoint_requested = False
+        self.stop_requested = False
+
+    def request_pause(self):
+        with self._lock:
+            self.paused = True
+            self._resume_event.clear()
+        print("[LS-Trainer] Training paused.", flush=True)
+
+    def request_resume(self):
+        with self._lock:
+            self.paused = False
+            self._resume_event.set()
+        print("[LS-Trainer] Training resumed.", flush=True)
+
+    def request_checkpoint(self):
+        with self._lock:
+            self.checkpoint_requested = True
+
+    def consume_checkpoint_request(self):
+        with self._lock:
+            req = self.checkpoint_requested
+            self.checkpoint_requested = False
+            return req
+
+    def request_stop(self):
+        with self._lock:
+            self.stop_requested = True
+            self.paused = False
+            self._resume_event.set()
+
+    def is_stop_requested(self, stop_file=None):
+        with self._lock:
+            if self.stop_requested:
+                return True
+        if stop_file and os.path.exists(stop_file):
+            return True
+        return False
+
+    def wait_if_paused(self, stop_file=None):
+        while not self._resume_event.is_set():
+            if self.is_stop_requested(stop_file):
+                return
+            self._resume_event.wait(timeout=0.2)
+
+
+def start_stdin_control_listener(ctrl_state):
+    def _listener():
+        try:
+            for raw_line in sys.stdin:
+                cmd = raw_line.strip().upper()
+                if not cmd:
+                    continue
+                if cmd == "PAUSE":
+                    ctrl_state.request_pause()
+                elif cmd == "RESUME":
+                    ctrl_state.request_resume()
+                elif cmd == "CHECKPOINT":
+                    ctrl_state.request_checkpoint()
+                elif cmd == "STOP":
+                    ctrl_state.request_stop()
+                    break
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_listener, name="ls-trainer-stdin-control", daemon=True)
+    t.start()
+    return t
+
+
+def _safe_float(val, default=0.0):
+    if val is None:
+        return default
+    if hasattr(val, "item"):
+        try:
+            val = val.item()
+        except Exception:
+            pass
+    try:
+        f = float(val)
+        return f if math.isfinite(f) else default
+    except Exception:
+        return default
+
+
+def _safe_opt_float(val):
+    if val is None:
+        return None
+    if hasattr(val, "item"):
+        try:
+            val = val.item()
+        except Exception:
+            pass
+    try:
+        f = float(val)
+        return f if math.isfinite(f) else None
+    except Exception:
+        return None
+
+
+def query_gpu_telemetry():
+    gpus = []
+    try:
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            count = int(torch.xpu.device_count())
+            for idx in range(count):
+                name = "Intel Arc XPU"
+                try:
+                    name = str(torch.xpu.get_device_name(idx))
+                except Exception:
+                    pass
+                used_bytes = 0
+                total_bytes = 0
+                try:
+                    used_bytes = max(
+                        int(torch.xpu.memory_reserved(idx)),
+                        int(torch.xpu.memory_allocated(idx)),
+                    )
+                except Exception:
+                    pass
+                try:
+                    props = torch.xpu.get_device_properties(idx)
+                    total_bytes = int(
+                        getattr(props, "total_memory", 0)
+                        or getattr(props, "max_mem_alloc_size", 0)
+                        or 0
+                    )
+                except Exception:
+                    pass
+                used_gb = round(used_bytes / (1024.0 ** 3), 3)
+                total_gb = round(total_bytes / (1024.0 ** 3), 3)
+                util = round((used_gb / total_gb) * 100.0, 1) if total_gb > 0 else 0.0
+                gpus.append({
+                    "index": idx,
+                    "name": name,
+                    "vram_used_gb": _safe_float(used_gb),
+                    "vram_total_gb": _safe_float(total_gb),
+                    "util_percent": _safe_float(util),
+                })
+        elif torch.cuda.is_available():
+            count = int(torch.cuda.device_count())
+            for idx in range(count):
+                name = "CUDA GPU"
+                try:
+                    name = str(torch.cuda.get_device_name(idx))
+                except Exception:
+                    pass
+                used_bytes = 0
+                total_bytes = 0
+                try:
+                    used_bytes = max(
+                        int(torch.cuda.memory_reserved(idx)),
+                        int(torch.cuda.memory_allocated(idx)),
+                    )
+                except Exception:
+                    pass
+                try:
+                    props = torch.cuda.get_device_properties(idx)
+                    total_bytes = int(getattr(props, "total_memory", 0) or 0)
+                except Exception:
+                    pass
+                used_gb = round(used_bytes / (1024.0 ** 3), 3)
+                total_gb = round(total_bytes / (1024.0 ** 3), 3)
+                util = 0.0
+                try:
+                    if hasattr(torch.cuda, "utilization"):
+                        util = float(torch.cuda.utilization(idx))
+                except Exception:
+                    util = round((used_gb / total_gb) * 100.0, 1) if total_gb > 0 else 0.0
+                gpus.append({
+                    "index": idx,
+                    "name": name,
+                    "vram_used_gb": _safe_float(used_gb),
+                    "vram_total_gb": _safe_float(total_gb),
+                    "util_percent": _safe_float(util),
+                })
+    except Exception:
+        return []
+    return gpus
+
+
+def emit_metrics(
+    epoch,
+    total_epochs,
+    step,
+    total_steps,
+    train_loss,
+    val_loss=None,
+    map50=None,
+    map50_95=None,
+    lr=0.0,
+    samples_per_sec=0.0,
+    eta_secs=0.0,
+):
+    payload = {
+        "epoch": max(0, int(epoch)),
+        "total_epochs": max(0, int(total_epochs)),
+        "step": max(0, int(step)),
+        "total_steps": max(0, int(total_steps)),
+        "train_loss": _safe_float(train_loss),
+        "val_loss": _safe_opt_float(val_loss),
+        "map50": _safe_opt_float(map50),
+        "map50_95": _safe_opt_float(map50_95),
+        "lr": _safe_float(lr),
+        "samples_per_sec": _safe_float(samples_per_sec),
+        "eta_secs": _safe_float(eta_secs),
+        "gpus": query_gpu_telemetry(),
+    }
+    try:
+        out_stream = getattr(sys, "__stdout__", None) or sys.stdout
+        print(f"@@LS_METRICS@@{json.dumps(payload, allow_nan=False)}", file=out_stream, flush=True)
+    except Exception:
+        pass
+
+
 def detect_num_workers(cfg):
     if "num_workers" in cfg and cfg["num_workers"] is not None:
         return max(0, min(8, int(cfg["num_workers"])))
@@ -73,6 +297,7 @@ def detect_num_workers(cfg):
     logical = os.cpu_count() or 2
     base_cores = phys if (phys is not None and phys > 0) else max(1, logical // 2)
     return min(8, max(1, base_cores - 1))
+
 
 def select_training_device(requested):
     import torch
@@ -148,6 +373,7 @@ def select_training_device(requested):
     print(f"[LS-Trainer] RT-DETR device selection: using custom device={requested}", flush=True)
     return req, requested
 
+
 def find_annotation_file(split_dir):
     candidates = [
         "_annotations.coco.json",
@@ -164,6 +390,7 @@ def find_annotation_file(split_dir):
         if item.endswith(".json") and "annotation" in item.lower():
             return os.path.join(split_dir, item)
     return None
+
 
 class RTDetrCocoDataset:
     def __init__(self, split_dir, ann_file, resolution=640, cat_id_to_idx=None, is_train=True):
@@ -272,11 +499,13 @@ class RTDetrCocoDataset:
         }
         return img_tensor, target
 
+
 def collate_fn(batch):
     import torch
     pixel_values = torch.stack([item[0] for item in batch], dim=0)
     labels = [item[1] for item in batch]
     return pixel_values, labels
+
 
 def evaluate_coco(model, val_loader, raw_val_ann_file, device, amp=False):
     import torch
@@ -357,6 +586,7 @@ def evaluate_coco(model, val_loader, raw_val_ann_file, device, amp=False):
         print(f"[LS-Trainer Warning] COCO evaluation error: {e}", flush=True)
         return 0.0, 0.0
 
+
 def main():
     if len(sys.argv) < 2:
         print("[LS-Trainer Error] Missing configuration argument.", flush=True)
@@ -365,6 +595,9 @@ def main():
     cfg_path = sys.argv[1]
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
+
+    ctrl_state = TrainingControlState()
+    start_stdin_control_listener(ctrl_state)
 
     models_dir = cfg.get("models_dir", "models")
     os.makedirs(models_dir, exist_ok=True)
@@ -500,23 +733,44 @@ def main():
         except Exception:
             pass
 
+    def _save_last_checkpoint(ep_idx, m50_val, m95_val):
+        state_dict_cpu = {k: v.cpu() for k, v in model.state_dict().items()}
+        payload = {
+            "epoch": ep_idx,
+            "state_dict": state_dict_cpu,
+            "class_names": class_names,
+            "map50": m50_val,
+            "map50_95": m95_val,
+        }
+        last_path = os.path.join(weights_dir, "last.pth")
+        torch.save(payload, last_path)
+        torch.save(payload, os.path.join(output_dir, "last.pth"))
+        return payload
+
     user_stopped = False
+    ema_step_dt = None
+    last_sps = 0.0
+    total_steps = max(1, len(train_loader))
+
     try:
         for epoch in range(1, epochs + 1):
-            if os.path.exists(stop_file):
+            ctrl_state.wait_if_paused(stop_file)
+            if ctrl_state.is_stop_requested(stop_file):
                 print(f"[LS-Trainer] Stop requested by user before epoch {epoch}. Stopping gracefully...", flush=True)
                 user_stopped = True
                 break
 
             epoch_start_time = time.time()
+            last_step_time = epoch_start_time
             print(f"Epoch {epoch}/{epochs} - {model_name} training on {device_req}...", flush=True)
 
             model.train()
             total_loss = 0.0
             num_batches = 0
 
-            for pixel_values, labels in train_loader:
-                if os.path.exists(stop_file):
+            for step_idx, (pixel_values, labels) in enumerate(train_loader, start=1):
+                ctrl_state.wait_if_paused(stop_file)
+                if ctrl_state.is_stop_requested(stop_file):
                     print(f"[LS-Trainer] Stop requested by user at epoch {epoch}. Stopping gracefully...", flush=True)
                     user_stopped = True
                     break
@@ -533,7 +787,8 @@ def main():
                 with torch.autocast(device_type=dev_type, enabled=amp and dev_type != "cpu"):
                     outputs = model(pixel_values=pixel_values, labels=device_labels)
                     loss = outputs.loss
-                print(f"[LS-Trainer] Step forward complete, loss={float(loss.detach().item()):.4f}", flush=True)
+                step_loss = float(loss.detach().item())
+                print(f"[LS-Trainer] Step forward complete, loss={step_loss:.4f}", flush=True)
 
                 loss.backward()
                 print("[LS-Trainer] Step backward complete", flush=True)
@@ -541,8 +796,50 @@ def main():
                 optimizer.step()
                 print("[LS-Trainer] Optimizer step complete", flush=True)
 
-                total_loss += float(loss.detach().item())
+                total_loss += step_loss
                 num_batches += 1
+
+                now = time.time()
+                dt = max(1e-6, now - last_step_time)
+                last_step_time = now
+                if ema_step_dt is None:
+                    ema_step_dt = dt
+                else:
+                    ema_step_dt = 0.85 * ema_step_dt + 0.15 * dt
+
+                last_sps = len(labels) / dt
+                done_global = (epoch - 1) * total_steps + step_idx
+                total_global = max(done_global, epochs * total_steps)
+                rem_steps = max(0, total_global - done_global)
+                eta_secs = rem_steps * (ema_step_dt or dt)
+                current_lr = _safe_float(optimizer.param_groups[0].get("lr", 1e-4), 1e-4)
+
+                emit_metrics(
+                    epoch=epoch,
+                    total_epochs=epochs,
+                    step=step_idx,
+                    total_steps=total_steps,
+                    train_loss=step_loss,
+                    val_loss=None,
+                    map50=None,
+                    map50_95=None,
+                    lr=current_lr,
+                    samples_per_sec=last_sps,
+                    eta_secs=eta_secs,
+                )
+
+                if ctrl_state.consume_checkpoint_request():
+                    try:
+                        _save_last_checkpoint(epoch, best_map50, best_map50_95)
+                        print("[LS-Trainer] Immediate checkpoint saved.", flush=True)
+                    except Exception as exc:
+                        print(f"[LS-Trainer Warning] Immediate checkpoint save failed: {exc}", flush=True)
+
+                ctrl_state.wait_if_paused(stop_file)
+                if ctrl_state.is_stop_requested(stop_file):
+                    print(f"[LS-Trainer] Stop requested by user at epoch {epoch}. Stopping gracefully...", flush=True)
+                    user_stopped = True
+                    break
 
             lr_scheduler.step()
             avg_loss = total_loss / max(1, num_batches)
@@ -559,19 +856,7 @@ def main():
                 best_map50_95 = map50_95
 
             # Checkpoint saving
-            state_dict_cpu = {k: v.cpu() for k, v in model.state_dict().items()}
-            ckpt_payload = {
-                "epoch": epoch,
-                "state_dict": state_dict_cpu,
-                "class_names": class_names,
-                "map50": map50,
-                "map50_95": map50_95,
-            }
-
-            last_path = os.path.join(weights_dir, "last.pth")
-            torch.save(ckpt_payload, last_path)
-            # Also save directly in output_dir for easy location
-            torch.save(ckpt_payload, os.path.join(output_dir, "last.pth"))
+            ckpt_payload = _save_last_checkpoint(epoch, map50, map50_95)
 
             if is_best:
                 best_path = os.path.join(weights_dir, "best.pth")
@@ -587,7 +872,24 @@ def main():
             print(f"Epoch {epoch}/{epochs} finished", flush=True)
             print(f"[LS-Trainer Metrics] Epoch {epoch}/{epochs} | {metrics_str}", flush=True)
 
-            if user_stopped or os.path.exists(stop_file):
+            current_lr = _safe_float(optimizer.param_groups[0].get("lr", 1e-4), 1e-4)
+            rem_epochs = max(0, epochs - epoch)
+            eta_secs = rem_epochs * total_steps * (ema_step_dt or 0.0)
+            emit_metrics(
+                epoch=epoch,
+                total_epochs=epochs,
+                step=total_steps,
+                total_steps=total_steps,
+                train_loss=avg_loss,
+                val_loss=None,
+                map50=map50,
+                map50_95=map50_95,
+                lr=current_lr,
+                samples_per_sec=last_sps,
+                eta_secs=eta_secs,
+            )
+
+            if user_stopped or ctrl_state.is_stop_requested(stop_file):
                 print(f"[LS-Trainer] RT-DETR training stopped by user. Checkpoints preserved at: {output_dir}", flush=True)
                 user_stopped = True
                 break
@@ -616,6 +918,7 @@ def main():
         f"[LS-Trainer] {model_name} training completed successfully! Results saved to: {output_dir}",
         flush=True,
     )
+
 
 if __name__ == "__main__":
     main()

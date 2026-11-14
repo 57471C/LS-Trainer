@@ -2,11 +2,15 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use tauri::ipc::Channel;
 
 use crate::hardware::is_cuda_available;
 use crate::models::{ExportRequest, ExportResponse, default_export_imgsz};
-use crate::process::{get_venv_python, hide_console_window, stream_child_output, to_display_path};
+use crate::process::{
+    TauriChannelSink, TrainingEventSink, get_venv_python, hide_console_window, stream_child_output,
+    to_display_path,
+};
 use crate::rtdetr::resolve_rtdetr_model_meta;
 
 pub(crate) async fn export_rtdetr_to_onnx(
@@ -142,7 +146,8 @@ pub(crate) async fn export_rtdetr_to_onnx(
 
     match cmd.spawn() {
         Ok(mut child) => {
-            stream_child_output(&mut child, &on_log);
+            let sink: Arc<dyn TrainingEventSink> = Arc::new(TauriChannelSink::new(on_log.clone()));
+            stream_child_output(&mut child, &sink);
 
             let status = child
                 .wait()

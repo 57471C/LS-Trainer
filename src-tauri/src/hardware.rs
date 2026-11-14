@@ -2,9 +2,13 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use tauri::ipc::Channel;
 
-use crate::process::{get_project_root, get_venv_python, hide_console_window, setup_script_name, stream_child_output, venv_python_path};
+use crate::process::{
+    TauriChannelSink, TrainingEventSink, get_project_root, get_venv_python, hide_console_window,
+    setup_script_name, stream_child_output, venv_python_path,
+};
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct GpuInfo {
@@ -598,6 +602,7 @@ pub(crate) fn detect_gpu_info(project_root: &Path) -> GpuInfo {
 
 #[tauri::command]
 pub async fn repair_cuda(on_log: Channel<String>) -> Result<GpuInfo, String> {
+    let sink: Arc<dyn TrainingEventSink> = Arc::new(TauriChannelSink::new(on_log.clone()));
     tauri::async_runtime::spawn_blocking(move || {
         let project_root = get_project_root();
         let (hw_gpu_name, driver_version, driver_major) = detect_hardware_gpu();
@@ -638,7 +643,7 @@ pub async fn repair_cuda(on_log: Channel<String>) -> Result<GpuInfo, String> {
         uninstall_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         hide_console_window(&mut uninstall_cmd);
         if let Ok(mut child) = uninstall_cmd.spawn() {
-            stream_child_output(&mut child, &on_log);
+            stream_child_output(&mut child, &sink);
             let _ = child.wait();
         }
 
@@ -662,7 +667,7 @@ pub async fn repair_cuda(on_log: Channel<String>) -> Result<GpuInfo, String> {
 
         match install_cmd.spawn() {
             Ok(mut child) => {
-                stream_child_output(&mut child, &on_log);
+                stream_child_output(&mut child, &sink);
                 let status = child
                     .wait()
                     .map_err(|e| format!("Failed waiting for pip install: {e}"))?;
@@ -721,14 +726,14 @@ pub(crate) fn is_cuda_available(project_root: &Path) -> bool {
 pub(crate) fn resolve_dataloader_workers(
     project_root: &Path,
     override_workers: Option<u32>,
-    on_log: &Channel<String>,
+    sink: &Arc<dyn TrainingEventSink>,
 ) -> u32 {
     let (auto_workers, phys_cores, log_cores) = detect_cpu_worker_info(project_root);
     let (effective_workers, worker_source) = match override_workers {
         Some(custom_w) => (custom_w.min(8), "manual override"),
         None => (auto_workers, "auto-detected"),
     };
-    let _ = on_log.send(format!(
+    sink.on_log(format!(
         "[LS-Trainer] DataLoader workers: {effective_workers} ({worker_source}; {phys_cores} physical / {log_cores} logical CPU cores, capped at 8)"
     ));
     effective_workers

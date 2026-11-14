@@ -458,3 +458,67 @@ fn data_directory_survives_reload_and_sets_runs_base() {
 
     let _ = std::fs::remove_dir_all(&temp);
 }
+
+#[test]
+fn sideband_metrics_parsed_and_filtered_from_logs() {
+    use crate::models::{GpuTelemetry, TrainMetrics};
+    use crate::process::{TrainingEventSink, stream_reader_lines};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RecordingSink {
+        logs: Mutex<Vec<String>>,
+        metrics: Mutex<Vec<TrainMetrics>>,
+        exits: Mutex<Vec<Option<i32>>>,
+    }
+
+    impl TrainingEventSink for RecordingSink {
+        fn on_log(&self, line: String) {
+            self.logs.lock().unwrap().push(line);
+        }
+        fn on_metrics(&self, m: TrainMetrics) {
+            self.metrics.lock().unwrap().push(m);
+        }
+        fn on_exit(&self, code: Option<i32>) {
+            self.exits.lock().unwrap().push(code);
+        }
+    }
+
+    let sink = Arc::new(RecordingSink::default());
+    let sample_metrics = TrainMetrics {
+        epoch: 3,
+        total_epochs: 60,
+        step: 12,
+        total_steps: 100,
+        train_loss: 1.25,
+        val_loss: Some(0.95),
+        map50: Some(0.82),
+        map50_95: Some(0.61),
+        lr: 0.0001,
+        samples_per_sec: 32.5,
+        eta_secs: 420.0,
+        gpus: vec![GpuTelemetry {
+            index: 0,
+            name: "Intel Arc B580".to_string(),
+            vram_used_gb: 6.4,
+            vram_total_gb: 12.0,
+            util_percent: 53.3,
+        }],
+    };
+    let json_line = format!(
+        "@@LS_METRICS@@{}\n",
+        serde_json::to_string(&sample_metrics).unwrap()
+    );
+    let stream_input = format!(
+        "\x1b[32mEpoch 3/60 starting\x1b[0m\n{json_line}Step 12 complete\n"
+    );
+
+    stream_reader_lines(std::io::Cursor::new(stream_input.into_bytes()), sink.as_ref());
+
+    let logs = sink.logs.lock().unwrap().clone();
+    assert_eq!(logs, vec!["Epoch 3/60 starting", "Step 12 complete"]);
+
+    let recorded_metrics = sink.metrics.lock().unwrap().clone();
+    assert_eq!(recorded_metrics.len(), 1);
+    assert_eq!(recorded_metrics[0], sample_metrics);
+}

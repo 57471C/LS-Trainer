@@ -2,18 +2,20 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use tauri::ipc::Channel;
+use std::sync::Arc;
 
 use crate::dataset::coco::prepare_rfdetr_coco_dataset;
 use crate::hardware::{detect_gpu_info, resolve_dataloader_workers};
 use crate::models::{TrainingRequest, TrainingResponse};
-use crate::process::{get_venv_python, hide_console_window, stream_child_output};
+use crate::process::{
+    TrainingEventSink, get_venv_python, hide_console_window, stream_child_output,
+};
 use crate::rtdetr::{
     resolve_rtdetr_model_meta, rtdetr_architecture_from_run, rtdetr_run_dir_for_checkpoint,
 };
 use crate::training::{
     ensure_directory, extract_final_metrics_from_results_dir, is_stop_requested, log_final_metrics,
-    register_child_pid, save_run_config_metadata, unregister_child_pid, write_text_file,
+    register_child_process, save_run_config_metadata, unregister_child_pid, write_text_file,
 };
 
 pub(crate) async fn start_rtdetr_training(
@@ -24,12 +26,12 @@ pub(crate) async fn start_rtdetr_training(
     results_dir: String,
     dataset_input: PathBuf,
     request: TrainingRequest,
-    on_log: Channel<String>,
+    sink: Arc<dyn TrainingEventSink>,
 ) -> Result<TrainingResponse, String> {
     let mut request = request;
     request.model_family = "RT-DETR".to_string();
 
-    let coco_root = prepare_rfdetr_coco_dataset(&dataset_input, &on_log)?;
+    let coco_root = prepare_rfdetr_coco_dataset(&dataset_input, &sink)?;
 
     let models_dir = project_root.join("models");
     let _ = std::fs::create_dir_all(&models_dir);
@@ -40,7 +42,7 @@ pub(crate) async fn start_rtdetr_training(
         let (base, label) = rtdetr_run_dir_for_checkpoint(custom_path)
             .and_then(|run_dir| rtdetr_architecture_from_run(&run_dir))
             .unwrap_or_else(|| (default_hf_weights.to_string(), default_label.to_string()));
-        let _ = on_log.send(format!(
+        sink.on_log(format!(
             "[LS-Trainer] Continuing RT-DETR from checkpoint '{}' with base {base}.",
             custom_path.display()
         ));
@@ -56,7 +58,7 @@ pub(crate) async fn start_rtdetr_training(
     let device_input = request.device.trim();
     let gpu_probe = detect_gpu_info(&project_root);
     let effective_device = if device_input.eq_ignore_ascii_case("cpu") {
-        let _ = on_log.send("[LS-Trainer] Device override: using device=cpu".to_string());
+        sink.on_log("[LS-Trainer] Device override: using device=cpu".to_string());
         "cpu".to_string()
     } else if device_input.is_empty()
         || device_input.eq_ignore_ascii_case("auto")
@@ -68,18 +70,18 @@ pub(crate) async fn start_rtdetr_training(
     {
         if gpu_probe.xpu_available && !device_input.eq_ignore_ascii_case("cuda") {
             let dev_label = gpu_probe.device_name.as_deref().unwrap_or("Intel Arc XPU");
-            let _ = on_log.send(format!(
+            sink.on_log(format!(
                 "[LS-Trainer] Intel Arc XPU available (torch.xpu.is_available()=True), selecting device=xpu ({dev_label})"
             ));
             "xpu".to_string()
         } else if gpu_probe.cuda_available {
             let dev_label = gpu_probe.device_name.as_deref().unwrap_or("CUDA GPU");
-            let _ = on_log.send(format!(
+            sink.on_log(format!(
                 "[LS-Trainer] CUDA available (torch.cuda.is_available()=True), selecting device=cuda ({dev_label})"
             ));
             "cuda".to_string()
         } else {
-            let _ = on_log.send(
+            sink.on_log(
                 "[LS-Trainer] Neither Intel Arc XPU nor CUDA available, using device=cpu"
                     .to_string(),
             );
@@ -89,7 +91,7 @@ pub(crate) async fn start_rtdetr_training(
         device_input.to_string()
     };
 
-    let effective_workers = resolve_dataloader_workers(&project_root, request.workers, &on_log);
+    let effective_workers = resolve_dataloader_workers(&project_root, request.workers, &sink);
 
     ensure_directory(&abs_results_dir)?;
     let runner_script_path = abs_results_dir.join("ls_trainer_rtdetr_run.py");
@@ -129,8 +131,8 @@ pub(crate) async fn start_rtdetr_training(
         runner_cfg_path.display()
     );
 
-    let _ = on_log.send("[LS-Trainer Status] Training in progress...".to_string());
-    let _ = on_log.send(format!(
+    sink.on_log("[LS-Trainer Status] Training in progress...".to_string());
+    sink.on_log(format!(
         "[LS-Trainer] Active config: family=RT-DETR | task={} | model={} ({}) | resolution={} | epochs={} | batch={} | workers={} | freeze_backbone={} | amp={} | device={}",
         yolo_task,
         model_name,
@@ -143,7 +145,7 @@ pub(crate) async fn start_rtdetr_training(
         request.amp,
         effective_device
     ));
-    let _ = on_log.send(format!("[LS-Trainer] Executing: {exact_command}"));
+    sink.on_log(format!("[LS-Trainer] Executing: {exact_command}"));
 
     let mut cmd = Command::new(&python_exe);
     cmd.args([
@@ -154,6 +156,7 @@ pub(crate) async fn start_rtdetr_training(
     .env("PYTHONUNBUFFERED", "1")
     .env("PYTHONUTF8", "1")
     .env("PYTHONIOENCODING", "utf-8")
+    .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
 
@@ -161,14 +164,15 @@ pub(crate) async fn start_rtdetr_training(
 
     match cmd.spawn() {
         Ok(mut child) => {
-            register_child_pid(child.id());
-            stream_child_output(&mut child, &on_log);
+            let _control = register_child_process(&mut child);
+            stream_child_output(&mut child, &sink);
 
             let status = child
                 .wait()
                 .map_err(|e| format!("Failed while waiting for RT-DETR process: {e}"))?;
 
             unregister_child_pid();
+            sink.on_exit(status.code());
 
             save_run_config_metadata(
                 &abs_results_dir,
@@ -177,13 +181,13 @@ pub(crate) async fn start_rtdetr_training(
                 &effective_device,
                 effective_workers,
                 &exact_command,
-                &on_log,
+                &sink,
             );
 
             let (map50, map50_95) = extract_final_metrics_from_results_dir(&abs_results_dir);
 
             if is_stop_requested() {
-                let _ = on_log.send(format!(
+                sink.on_log(format!(
                     "[LS-Trainer] Training stopped by user. Checkpoints preserved at: {results_dir}"
                 ));
                 return Ok(TrainingResponse {
@@ -196,8 +200,8 @@ pub(crate) async fn start_rtdetr_training(
             }
 
             if status.success() {
-                log_final_metrics(&on_log, map50, map50_95);
-                let _ = on_log.send(format!(
+                log_final_metrics(&sink, map50, map50_95);
+                sink.on_log(format!(
                     "[LS-Trainer] {model_name} training completed successfully! Results saved to: {results_dir} (run '{run_name}')"
                 ));
                 Ok(TrainingResponse {
@@ -208,7 +212,7 @@ pub(crate) async fn start_rtdetr_training(
                     map50_95,
                 })
             } else {
-                let _ = on_log.send(format!(
+                sink.on_log(format!(
                     "[LS-Trainer] RT-DETR exited with code: {:?}",
                     status.code()
                 ));
@@ -221,6 +225,9 @@ pub(crate) async fn start_rtdetr_training(
                 })
             }
         }
-        Err(err) => Err(format!("Failed to launch RT-DETR process: {err}")),
+        Err(err) => {
+            sink.on_exit(None);
+            Err(format!("Failed to launch RT-DETR process: {err}"))
+        }
     }
 }
