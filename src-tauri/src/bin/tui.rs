@@ -248,6 +248,8 @@ pub struct AppState {
     host_ram_used_gb: f64,
     host_ram_total_gb: f64,
     host_cpu_history: VecDeque<u64>,
+    host_core_count: usize,
+    host_load_avg: (f64, f64, f64),
     logs: VecDeque<String>,
     log_scroll_offset: usize,
     follow_logs: bool,
@@ -286,6 +288,8 @@ impl AppState {
             host_ram_used_gb: 0.0,
             host_ram_total_gb: 0.0,
             host_cpu_history,
+            host_core_count: 0,
+            host_load_avg: (0.0, 0.0, 0.0),
             logs: VecDeque::with_capacity(MAX_LOG_LINES),
             log_scroll_offset: 0,
             follow_logs: true,
@@ -589,6 +593,8 @@ fn spawn_hardware_polling_tasks(state: Arc<Mutex<AppState>>) {
             sys.refresh_cpu_usage();
             sys.refresh_memory();
             let cpu_usage = sys.global_cpu_usage() as f64;
+            let core_count = sys.cpus().len();
+            let load_avg = System::load_average();
             let used_ram_gb = sys.used_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
             let total_ram_gb = sys.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
 
@@ -596,6 +602,8 @@ fn spawn_hardware_polling_tasks(state: Arc<Mutex<AppState>>) {
                 guard.host_cpu_percent = cpu_usage.clamp(0.0, 100.0);
                 guard.host_ram_used_gb = used_ram_gb;
                 guard.host_ram_total_gb = total_ram_gb;
+                guard.host_core_count = core_count;
+                guard.host_load_avg = (load_avg.one, load_avg.five, load_avg.fifteen);
                 let cpu_sample = guard.host_cpu_percent.round() as u64;
                 if guard.host_cpu_history.len() >= MAX_SPARKLINE_SAMPLES {
                     guard.host_cpu_history.pop_front();
@@ -997,6 +1005,97 @@ fn render_center_chart(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_run_summary(frame: &mut Frame, area: Rect, state: &AppState) {
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(area);
+
+    render_host_cpu_panel(frame, split[0], state);
+    render_run_details_panel(frame, split[1], state);
+}
+
+fn render_host_cpu_panel(frame: &mut Frame, area: Rect, state: &AppState) {
+    let block = Block::default()
+        .title(Span::styled(
+            " Host / CPU ",
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    let cpu_ratio = (state.host_cpu_percent / 100.0).clamp(0.0, 1.0);
+    let cores_label = if state.host_core_count > 0 {
+        format!(" ({} cores)", state.host_core_count)
+    } else {
+        String::new()
+    };
+    let cpu_gauge = Gauge::default()
+        .gauge_style(
+            Style::default()
+                .fg(Color::LightCyan)
+                .bg(Color::Rgb(28, 36, 48)),
+        )
+        .ratio(cpu_ratio)
+        .label(format!("CPU {:.1}%{cores_label}", state.host_cpu_percent));
+    frame.render_widget(cpu_gauge, rows[0]);
+
+    let ram_ratio = if state.host_ram_total_gb > 0.0 {
+        (state.host_ram_used_gb / state.host_ram_total_gb).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let ram_pct = ram_ratio * 100.0;
+    let ram_gauge = Gauge::default()
+        .gauge_style(
+            Style::default()
+                .fg(Color::LightYellow)
+                .bg(Color::Rgb(28, 36, 48)),
+        )
+        .ratio(ram_ratio)
+        .label(format!(
+            "RAM {:.1}/{:.1} GiB ({ram_pct:.0}%)",
+            state.host_ram_used_gb, state.host_ram_total_gb
+        ));
+    frame.render_widget(ram_gauge, rows[1]);
+
+    let (l1, l5, l15) = state.host_load_avg;
+    let load_line = Line::from(vec![
+        Span::styled("Load: ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            format!("{l1:.2}  {l5:.2}  {l15:.2}"),
+            Style::default().fg(Color::White),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(load_line), rows[2]);
+
+    let cpu_samples: Vec<u64> = state.host_cpu_history.iter().copied().collect();
+    let sparkline = Sparkline::default()
+        .data(&cpu_samples)
+        .max(100)
+        .style(Style::default().fg(Color::Cyan));
+    frame.render_widget(sparkline, rows[3]);
+}
+
+fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .title(Span::styled(
             " Run Summary ",

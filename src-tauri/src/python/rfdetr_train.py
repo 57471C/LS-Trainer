@@ -1,5 +1,6 @@
 from collections import deque
 import json
+import logging
 import math
 import multiprocessing
 import os
@@ -10,33 +11,45 @@ import traceback
 import warnings
 
 os.environ.setdefault("TORCH_DISABLE_FLOP_COUNTER", "1")
-warnings.filterwarnings(
-    "ignore",
-    message=r".*torch\.jit\.script.*deprecated.*",
-    category=FutureWarning,
+
+_NOISY_WARNING_PATTERNS = (
+    (r".*torch\.jit\.script.*deprecated.*", FutureWarning),
+    (r".*(triton not found|flop counting).*", Warning),
+    (r".*AccumulateGrad.*stream.*", UserWarning),
+    (r".*default training augmentation backend.*", UserWarning),
+    (r".*LeafSpec.*", Warning),
+    (r".*sync_dist.*", Warning),
 )
-warnings.filterwarnings(
-    "ignore",
-    message=r".*(triton not found|flop counting).*",
+
+_NOISY_LOG_SUBSTRINGS = (
+    "triton not found",
+    "flop counting will not work",
+    "torch.jit.script",
+    "accumulategrad",
+    "default training augmentation backend",
+    "leafspec",
+    "sync_dist",
 )
-warnings.filterwarnings(
-    "ignore",
-    message=r".*AccumulateGrad.*stream.*",
-    category=UserWarning,
-)
-warnings.filterwarnings(
-    "ignore",
-    message=r".*default training augmentation backend.*",
-    category=UserWarning,
-)
-warnings.filterwarnings(
-    "ignore",
-    message=r".*LeafSpec.*",
-)
-warnings.filterwarnings(
-    "ignore",
-    message=r".*sync_dist.*",
-)
+
+
+class _NoisyLogFilter(logging.Filter):
+    def filter(self, record):
+        try:
+            msg = record.getMessage().lower()
+        except Exception:
+            msg = str(getattr(record, "msg", "")).lower()
+        return not any(sub in msg for sub in _NOISY_LOG_SUBSTRINGS)
+
+
+def _install_warning_and_log_filters():
+    for pattern, cat in _NOISY_WARNING_PATTERNS:
+        warnings.filterwarnings("ignore", message=pattern, category=cat)
+    root_logger = logging.getLogger()
+    if not any(isinstance(f, _NoisyLogFilter) for f in root_logger.filters):
+        root_logger.addFilter(_NoisyLogFilter())
+
+
+_install_warning_and_log_filters()
 
 
 def _is_rank_zero() -> bool:
@@ -237,22 +250,32 @@ def query_gpu_telemetry():
                     pass
                 used_bytes = 0
                 total_bytes = 0
+                if hasattr(torch.xpu, "mem_get_info"):
+                    try:
+                        free_b, dev_total_b = torch.xpu.mem_get_info(idx)
+                        if dev_total_b and dev_total_b > 0:
+                            total_bytes = int(dev_total_b)
+                            used_bytes = max(0, total_bytes - int(free_b))
+                    except Exception:
+                        pass
                 try:
-                    used_bytes = max(
+                    proc_used = max(
                         int(torch.xpu.memory_reserved(idx)),
                         int(torch.xpu.memory_allocated(idx)),
                     )
+                    used_bytes = max(used_bytes, proc_used)
                 except Exception:
                     pass
-                try:
-                    props = torch.xpu.get_device_properties(idx)
-                    total_bytes = int(
-                        getattr(props, "total_memory", 0)
-                        or getattr(props, "max_mem_alloc_size", 0)
-                        or 0
-                    )
-                except Exception:
-                    pass
+                if total_bytes <= 0:
+                    try:
+                        props = torch.xpu.get_device_properties(idx)
+                        total_bytes = int(
+                            getattr(props, "total_memory", 0)
+                            or getattr(props, "max_mem_alloc_size", 0)
+                            or 0
+                        )
+                    except Exception:
+                        pass
                 used_gb = round(used_bytes / (1024.0 ** 3), 3)
                 total_gb = round(total_bytes / (1024.0 ** 3), 3)
                 util = round((used_gb / total_gb) * 100.0, 1) if total_gb > 0 else 0.0
@@ -631,6 +654,7 @@ def main():
     from pytorch_lightning import Callback
     from pytorch_lightning.accelerators import Accelerator
     from pytorch_lightning.strategies import DDPStrategy, SingleDeviceStrategy
+    _install_warning_and_log_filters()
 
     orig_all_gather = getattr(rf_dist, "all_gather", None)
     if orig_all_gather is not None:
