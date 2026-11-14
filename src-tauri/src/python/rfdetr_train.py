@@ -1,3 +1,4 @@
+from collections import deque
 import json
 import math
 import multiprocessing
@@ -245,6 +246,158 @@ def emit_metrics(
         pass
 
 
+def format_duration_hm(total_seconds):
+    sec = max(0, round(total_seconds))
+    total_mins = sec // 60
+    hours = total_mins // 60
+    mins = total_mins % 60
+    return f"{hours}h {mins:02d}m"
+
+
+def format_epoch_rate(sec_per_epoch):
+    if sec_per_epoch is None or sec_per_epoch <= 0:
+        return ""
+    if sec_per_epoch < 60:
+        return f"~{max(1, round(sec_per_epoch))}s/epoch"
+    total_mins = round(sec_per_epoch / 60)
+    hours = total_mins // 60
+    mins = total_mins % 60
+    if hours > 0:
+        return f"~{hours}h {mins:02d}m/epoch"
+    return f"~{mins}m/epoch"
+
+
+def format_time_remaining(sec_left):
+    if sec_left is None or sec_left <= 0:
+        return ""
+    if sec_left < 45:
+        return f"~{max(1, round(sec_left))}s left"
+    total_mins = round(sec_left / 60)
+    hours = total_mins // 60
+    mins = total_mins % 60
+    if hours > 0:
+        return f"~{hours}h {mins:02d}m left"
+    return f"~{mins}m left"
+
+
+class ProgressTracker:
+    def __init__(self, total_epochs=1):
+        self.start_time = time.monotonic()
+        self.epoch_start_time = None
+        self.recent_epoch_durations = deque(maxlen=5)
+        self.current_epoch = 0
+        self.total_epochs = max(1, int(total_epochs))
+
+    def start_epoch(self, epoch, total_epochs):
+        self.current_epoch = int(epoch)
+        self.total_epochs = max(1, int(total_epochs))
+        self.epoch_start_time = time.monotonic()
+
+    def finish_epoch(self):
+        if self.epoch_start_time is not None:
+            dur = time.monotonic() - self.epoch_start_time
+            if dur > 0.02:
+                self.recent_epoch_durations.append(dur)
+            self.epoch_start_time = None
+
+    def elapsed_secs(self):
+        return max(0.0, time.monotonic() - self.start_time)
+
+    def avg_epoch_secs(self):
+        if not self.recent_epoch_durations:
+            return None
+        return sum(self.recent_epoch_durations) / len(self.recent_epoch_durations)
+
+    def timing_summary(self, completed_epochs=None):
+        if completed_epochs is None:
+            completed_epochs = max(0, self.current_epoch - 1)
+        parts = [f"elapsed {format_duration_hm(self.elapsed_secs())}"]
+        avg = self.avg_epoch_secs()
+        if avg is not None and avg > 0:
+            rate = format_epoch_rate(avg)
+            if rate:
+                parts.append(rate)
+            remaining = max(0, self.total_epochs - completed_epochs)
+            if remaining == 0:
+                parts.append("Complete")
+            else:
+                eta = format_time_remaining(remaining * avg)
+                if eta:
+                    parts.append(eta)
+        else:
+            parts.append("estimating...")
+        return " | ".join(parts)
+
+
+class CliSpinner:
+    FRAMES = ("|", "/", "-", "\\")
+
+    def __init__(self, tracker):
+        self.tracker = tracker
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._active = False
+        self._paused = False
+        self._last_len = 0
+        self._frame_idx = 0
+        self._is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        self._thread = None
+
+    def start(self):
+        if not self._is_tty or self._thread is not None:
+            return
+        self._stop_event.clear()
+        self._active = True
+        self._thread = threading.Thread(
+            target=self._run, name="ls-trainer-cli-spinner", daemon=True
+        )
+        self._thread.start()
+
+    def set_paused(self, paused):
+        with self._lock:
+            self._paused = paused
+            if paused:
+                self._clear_locked()
+
+    def _clear_locked(self):
+        if self._is_tty and self._last_len > 0:
+            sys.stdout.write("\r" + (" " * self._last_len) + "\r")
+            sys.stdout.flush()
+            self._last_len = 0
+
+    def print_line(self, msg):
+        with self._lock:
+            self._clear_locked()
+            print(msg, flush=True)
+
+    def _run(self):
+        while not self._stop_event.wait(0.25):
+            with self._lock:
+                if not self._active or self._paused or self.tracker.current_epoch <= 0:
+                    continue
+                frame = self.FRAMES[self._frame_idx % len(self.FRAMES)]
+                self._frame_idx += 1
+                summary = self.tracker.timing_summary()
+                line = (
+                    f"[LS-Trainer] {frame} Epoch {self.tracker.current_epoch}/{self.tracker.total_epochs} "
+                    f"running... {summary}"
+                )
+                pad = " " * max(0, self._last_len - len(line))
+                sys.stdout.write(f"\r{line}{pad}")
+                sys.stdout.flush()
+                self._last_len = len(line)
+
+    def stop(self):
+        with self._lock:
+            self._active = False
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        with self._lock:
+            self._clear_locked()
+
+
 def detect_num_workers(cfg):
     if "num_workers" in cfg and cfg["num_workers"] is not None:
         return max(0, min(8, int(cfg["num_workers"])))
@@ -421,6 +574,8 @@ def main():
         rf_detr_mod.RFDETR._resolve_trainer_device_kwargs = patched_resolve_device_kwargs
 
     best_state = {"map50": 0.0, "map50_95": 0.0}
+    progress_tracker = ProgressTracker(epochs)
+    cli_spinner = CliSpinner(progress_tracker)
     step_state = {
         "last_time": time.time(),
         "ema_dt": None,
@@ -533,6 +688,7 @@ def main():
             self._check_stop_requested(trainer)
 
         def on_train_epoch_end(self, trainer, pl_module):
+            progress_tracker.finish_epoch()
             self._check_stop_requested(trainer)
 
         def on_train_epoch_start(self, trainer, pl_module):
@@ -540,7 +696,11 @@ def main():
             self._check_stop_requested(trainer)
             ep = int(trainer.current_epoch) + 1
             total = int(trainer.max_epochs)
-            print(f"Epoch {ep}/{total} - RF-DETR ({class_name}) training on {device}...", flush=True)
+            progress_tracker.start_epoch(ep, total)
+            timing = progress_tracker.timing_summary(max(0, ep - 1))
+            cli_spinner.print_line(
+                f"Epoch {ep}/{total} - RF-DETR ({class_name}) training on {device}... | {timing}"
+            )
 
         def on_validation_epoch_end(self, trainer, pl_module):
             if getattr(trainer, "sanity_checking", False):
@@ -575,9 +735,10 @@ def main():
 
             m50_disp = m50 if m50 is not None else best_state["map50"]
             m95_disp = m50_95 if m50_95 is not None else best_state["map50_95"]
-            print(
-                f"[LS-Trainer Metrics] Epoch {ep}/{total} | mAP50={m50_disp:.4f} | mAP50-95={m95_disp:.4f}",
-                flush=True,
+            progress_tracker.finish_epoch()
+            timing = progress_tracker.timing_summary(ep)
+            cli_spinner.print_line(
+                f"[LS-Trainer Metrics] Epoch {ep}/{total} | mAP50={m50_disp:.4f} | mAP50-95={m95_disp:.4f} | {timing}"
             )
 
             total_steps = max(1, int(step_state["last_total_steps"]))
@@ -665,10 +826,14 @@ def main():
         train_kwargs["lr_encoder"] = 0.0
 
     print(f"Epoch 1/{epochs} - Starting RF-DETR training loop on device={device} (num_workers={num_workers})...", flush=True)
+    cli_spinner.start()
     try:
         model.train(**train_kwargs)
     except KeyboardInterrupt:
+        cli_spinner.stop()
         print("[LS-Trainer] Training interrupted by user.", flush=True)
+    finally:
+        cli_spinner.stop()
 
     if ctrl_state.is_stop_requested(stop_file):
         print(f"[LS-Trainer] RF-DETR training stopped by user. Checkpoints preserved at: {output_dir}", flush=True)
@@ -678,7 +843,7 @@ def main():
         json.dump(best_state, mf, indent=2)
 
     print(
-        f"[LS-Trainer Metrics] Final | mAP50={best_state['map50']:.4f} | mAP50-95={best_state['map50_95']:.4f}",
+        f"[LS-Trainer Metrics] Final | mAP50={best_state['map50']:.4f} | mAP50-95={best_state['map50_95']:.4f} | elapsed {format_duration_hm(progress_tracker.elapsed_secs())}",
         flush=True,
     )
 
