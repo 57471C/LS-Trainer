@@ -2,7 +2,7 @@
 
 Desktop app and terminal UI (`ls-trainer-tui`) for training YOLO, RF-DETR, and RT-DETR models on your own labeled datasets and exporting them to ONNX.
 
-Built for the Lean Studio / LS-Vision workflow. Point it at a Label Studio (YOLO or COCO format) export, run a training job, and get a usable `.onnx` model without leaving the app.
+Built for the [LS-Marker](https://github.com/57471C/LS-Marker) &rarr; LS-Trainer &rarr; LS-Vision workflow. Point it at an LS-Marker (YOLO or COCO format) export, run a training job, and get a usable `.onnx` model without leaving the app.
 
 ## Features
 
