@@ -3,22 +3,21 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use tauri::ipc::Channel;
 
 use crate::hardware::is_cuda_available;
 use crate::models::{ExportRequest, ExportResponse, default_export_imgsz};
 use crate::process::{
-    TauriChannelSink, TrainingEventSink, get_venv_python, hide_console_window, stream_child_output,
-    to_display_path,
+    TrainingEventSink, get_venv_python, hide_console_window, stream_child_output, to_display_path,
 };
 use crate::rtdetr::resolve_rtdetr_model_meta;
+use crate::training::{register_child_pid, unregister_child_pid};
 
 pub(crate) async fn export_rtdetr_to_onnx(
     project_root: &Path,
     results_path: &Path,
     checkpoint_path: &Path,
     request: &ExportRequest,
-    on_log: &Channel<String>,
+    sink: &Arc<dyn TrainingEventSink>,
 ) -> Result<ExportResponse, String> {
     let output_dir = if results_path.is_dir() {
         results_path.to_path_buf()
@@ -58,7 +57,10 @@ pub(crate) async fn export_rtdetr_to_onnx(
 
     let search_dirs = [
         output_dir.clone(),
-        checkpoint_path.parent().unwrap_or(project_root).to_path_buf(),
+        checkpoint_path
+            .parent()
+            .unwrap_or(project_root)
+            .to_path_buf(),
         checkpoint_path
             .parent()
             .and_then(|p| p.parent())
@@ -97,10 +99,10 @@ pub(crate) async fn export_rtdetr_to_onnx(
     }
 
     let ckpt_display = checkpoint_path.to_string_lossy().replace('\\', "/");
-    let _ = on_log.send(format!(
+    sink.on_log(format!(
         "[LS-Trainer] Found RT-DETR checkpoint: {ckpt_display}"
     ));
-    let _ = on_log.send(format!(
+    sink.on_log(format!(
         "[LS-Trainer] Exporting {model_name} to ONNX (shape=({export_res}, {export_res}), dynamic={}, simplify={})...",
         request.dynamic, request.simplify
     ));
@@ -146,11 +148,17 @@ pub(crate) async fn export_rtdetr_to_onnx(
 
     match cmd.spawn() {
         Ok(mut child) => {
-            let sink: Arc<dyn TrainingEventSink> = Arc::new(TauriChannelSink::new(on_log.clone()));
-            stream_child_output(&mut child, &sink);
+            register_child_pid(child.id());
+            let sink_stream = Arc::clone(sink);
+            let wait_res = tauri::async_runtime::spawn_blocking(move || {
+                stream_child_output(&mut child, &sink_stream);
+                child.wait()
+            })
+            .await
+            .map_err(|e| format!("RT-DETR export task join failed: {e}"))?;
+            unregister_child_pid();
 
-            let status = child
-                .wait()
+            let status = wait_res
                 .map_err(|e| format!("Failed while waiting for RT-DETR ONNX export: {e}"))?;
 
             let expected_onnx = output_dir.join("best.onnx");
@@ -166,10 +174,10 @@ pub(crate) async fn export_rtdetr_to_onnx(
             if status.success() && final_onnx.is_some() {
                 let onnx_path_ref = final_onnx.as_ref().unwrap();
                 let onnx_str = to_display_path(onnx_path_ref);
-                let _ = on_log.send(format!(
+                sink.on_log(format!(
                     "[LS-Trainer] ONNX export completed successfully! File: {onnx_str}"
                 ));
-                let _ = on_log.send(
+                sink.on_log(
                     "[LS-Trainer] Note: This model is optimized and ready for inference in LS-Vision."
                         .to_string(),
                 );
@@ -183,7 +191,7 @@ pub(crate) async fn export_rtdetr_to_onnx(
                     "RT-DETR ONNX export failed with status code: {:?}",
                     status.code()
                 );
-                let _ = on_log.send(format!("[LS-Trainer Error] {err_msg}"));
+                sink.on_log(format!("[LS-Trainer Error] {err_msg}"));
                 Ok(ExportResponse {
                     success: false,
                     onnx_path: String::new(),
@@ -194,4 +202,3 @@ pub(crate) async fn export_rtdetr_to_onnx(
         Err(err) => Err(format!("Failed to launch RT-DETR ONNX export: {err}")),
     }
 }
-

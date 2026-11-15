@@ -6,13 +6,16 @@ pub(crate) mod yolo;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use tauri::ipc::Channel;
 
 use crate::export::rfdetr::export_rfdetr_to_onnx;
 use crate::export::rtdetr::export_rtdetr_to_onnx;
 use crate::export::yolo::export_yolo_to_onnx;
 use crate::models::{ExportRequest, ExportResponse};
-use crate::process::{get_project_root, get_venv_python, hide_console_window};
+use crate::process::{
+    TauriChannelSink, TrainingEventSink, get_project_root, get_venv_python, hide_console_window,
+};
 use crate::rfdetr::find_rfdetr_checkpoint_in_dir;
 use crate::rtdetr::find_rtdetr_checkpoint_in_dir;
 
@@ -22,6 +25,14 @@ pub async fn export_to_onnx(
     on_log: Channel<String>,
     request: ExportRequest,
 ) -> Result<ExportResponse, String> {
+    let sink: Arc<dyn TrainingEventSink> = Arc::new(TauriChannelSink::new(on_log));
+    run_export_to_onnx(sink, request).await
+}
+
+pub async fn run_export_to_onnx(
+    sink: Arc<dyn TrainingEventSink>,
+    request: ExportRequest,
+) -> Result<ExportResponse, String> {
     let project_root = get_project_root();
 
     let mut results_path = PathBuf::from(&request.results_dir);
@@ -29,34 +40,22 @@ pub async fn export_to_onnx(
         results_path = project_root.join(&results_path);
     }
 
-    let _ = on_log.send(format!(
+    sink.on_log(format!(
         "[LS-Trainer] Preparing ONNX export for results in '{}'...",
         results_path.display()
     ));
 
     if let Some(rtdetr_ckpt) = find_rtdetr_checkpoint_in_dir(&results_path) {
-        return export_rtdetr_to_onnx(
-            &project_root,
-            &results_path,
-            &rtdetr_ckpt,
-            &request,
-            &on_log,
-        )
-        .await;
+        return export_rtdetr_to_onnx(&project_root, &results_path, &rtdetr_ckpt, &request, &sink)
+            .await;
     }
 
     if let Some(rfdetr_ckpt) = find_rfdetr_checkpoint_in_dir(&results_path) {
-        return export_rfdetr_to_onnx(
-            &project_root,
-            &results_path,
-            &rfdetr_ckpt,
-            &request,
-            &on_log,
-        )
-        .await;
+        return export_rfdetr_to_onnx(&project_root, &results_path, &rfdetr_ckpt, &request, &sink)
+            .await;
     }
 
-    export_yolo_to_onnx(project_root, results_path, request, on_log).await
+    export_yolo_to_onnx(project_root, results_path, request, sink).await
 }
 
 pub(crate) fn embed_onnx_model_type_metadata(
@@ -64,7 +63,7 @@ pub(crate) fn embed_onnx_model_type_metadata(
     onnx_path: &Path,
     model_type: &str,
     model_family: &str,
-    on_log: &Channel<String>,
+    sink: &Arc<dyn TrainingEventSink>,
 ) {
     if !onnx_path.is_file() {
         return;
@@ -86,7 +85,7 @@ pub(crate) fn embed_onnx_model_type_metadata(
     hide_console_window(&mut cmd);
     if let Ok(status) = cmd.status() {
         if status.success() {
-            let _ = on_log.send(format!(
+            sink.on_log(format!(
                 "[LS-Trainer] Embedded ONNX metadata: ls_model_type=\"{model_type}\" (ls_model_family=\"{model_family}\")"
             ));
         }

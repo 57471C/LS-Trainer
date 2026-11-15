@@ -28,6 +28,7 @@ mod training;
 mod tests;
 
 pub use dataset::labels::LabelCheckResult;
+pub use export::run_export_to_onnx;
 pub use hardware::{GpuInfo, compute_recommended_workers};
 pub use models::{
     ExportRequest, ExportResponse, GpuTelemetry, TrainMetrics, TrainingRequest, TrainingResponse,

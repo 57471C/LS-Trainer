@@ -2,19 +2,27 @@
 
 use std::collections::VecDeque;
 use std::env;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use app_lib as ls_trainer_lib;
 use arboard::Clipboard;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::{
+    cursor::MoveTo,
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{Clear, ClearType},
+};
 use ls_trainer_lib::{
-    GpuTelemetry, ProcessControlCommand, TrainMetrics, TrainingEventSink, TrainingRequest,
-    active_training_control, force_kill_active_child, probe_local_gpu_info, run_training,
-    send_training_control, stop_training,
+    ExportRequest, GpuTelemetry, ProcessControlCommand, TrainMetrics, TrainingEventSink,
+    TrainingRequest, active_training_control, force_kill_active_child, probe_local_gpu_info,
+    run_export_to_onnx, run_training, send_training_control, stop_training, to_display_path,
 };
 use ratatui::{
-    Frame,
+    Frame, Terminal,
+    backend::Backend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
@@ -22,6 +30,17 @@ use ratatui::{
     widgets::{Axis, Block, BorderType, Borders, Chart, Dataset, GraphType, Paragraph, Sparkline},
 };
 use sysinfo::System;
+
+const SPLASH_ASCII_LINES: [&str; 8] = [
+    r" /$$        /$$$$$$       /$$$$$$$$                 /$$                              ",
+    r"| $$       /$$__  $$     |__  $$__/                |__/                              ",
+    r"| $$      | $$  \__/        | $$  /$$$$$$  /$$$$$$  /$$ /$$$$$$$   /$$$$$$   /$$$$$$ ",
+    r"| $$      |  $$$$$$  /$$$$$$| $$ /$$__  $$|____  $$| $$| $$__  $$ /$$__  $$ /$$__  $$",
+    r"| $$       \____  $$|______/| $$| $$  \__/ /$$$$$$$| $$| $$  \ $$| $$$$$$$$| $$  \__/",
+    r"| $$       /$$  \ $$        | $$| $$      /$$__  $$| $$| $$  | $$| $$_____/| $$      ",
+    r"| $$$$$$$$|  $$$$$$/        | $$| $$     |  $$$$$$$| $$| $$  | $$|  $$$$$$$| $$      ",
+    r"|________/ \______/         |__/|__/      \_______/|__/|__/  |__/ \_______/|__/      ",
+];
 
 const MAX_LOG_LINES: usize = 500;
 const MAX_HISTORY_POINTS: usize = 300;
@@ -309,6 +328,9 @@ pub struct AppState {
     spinner_tick: usize,
     training_started_at: Option<Instant>,
     training_ended_at: Option<Instant>,
+    results_dir: Option<String>,
+    best_weights_path: Option<String>,
+    onnx_path: Option<String>,
 }
 
 impl AppState {
@@ -349,6 +371,38 @@ impl AppState {
             spinner_tick: 0,
             training_started_at: None,
             training_ended_at: None,
+            results_dir: None,
+            best_weights_path: None,
+            onnx_path: None,
+        }
+    }
+
+    fn refresh_run_artifacts(&mut self) {
+        if self.results_dir.is_none() {
+            if let Some(ref req) = self.active_request {
+                let fallback_dir = PathBuf::from("runs").join(&req.task).join(&req.run_name);
+                if fallback_dir.exists() {
+                    self.results_dir = Some(to_display_path(&fallback_dir));
+                }
+            }
+        }
+        if let Some(ref dir_str) = self.results_dir {
+            let dir_path = PathBuf::from(dir_str);
+            if self.best_weights_path.is_none() {
+                self.best_weights_path =
+                    find_best_checkpoint_in_dir(&dir_path).map(|p| to_display_path(&p));
+            }
+            if self.onnx_path.is_none() {
+                self.onnx_path = find_onnx_in_dir(&dir_path).map(|p| to_display_path(&p));
+            }
+        }
+    }
+
+    fn elapsed_seconds(&self) -> f64 {
+        match (self.training_started_at, self.training_ended_at) {
+            (Some(start), Some(end)) => end.saturating_duration_since(start).as_secs_f64(),
+            (Some(start), None) => start.elapsed().as_secs_f64(),
+            _ => 0.0,
         }
     }
 
@@ -461,17 +515,22 @@ impl TrainingEventSink for TuiEventSink {
 
     fn on_exit(&self, code: Option<i32>) {
         if let Ok(mut guard) = self.state.lock() {
-            guard.exit_code = code;
-            guard.is_running = false;
-            guard.is_paused = false;
-            guard.training_ended_at = Some(Instant::now());
-            guard.status_line = match code {
-                Some(0) => "Completed".to_string(),
-                Some(c) if guard.stop_initiated => format!("Stopped (exit {c})"),
-                Some(c) => format!("Exited (code {c})"),
-                None if guard.stop_initiated => "Stopped".to_string(),
-                None => "Finished".to_string(),
-            };
+            if code == Some(0) && !guard.stop_initiated {
+                // Keep `is_running = true` while the post-training ONNX export executes.
+                guard.status_line = "Training complete — exporting ONNX...".to_string();
+            } else {
+                guard.exit_code = code;
+                guard.is_running = false;
+                guard.is_paused = false;
+                guard.training_ended_at = Some(Instant::now());
+                guard.status_line = match code {
+                    Some(0) => "Completed".to_string(),
+                    Some(c) if guard.stop_initiated => format!("Stopped (exit {c})"),
+                    Some(c) => format!("Exited (code {c})"),
+                    None if guard.stop_initiated => "Stopped".to_string(),
+                    None => "Finished".to_string(),
+                };
+            }
         }
     }
 
@@ -680,6 +739,42 @@ fn spawn_hardware_polling_tasks(state: Arc<Mutex<AppState>>) {
     });
 }
 
+fn find_best_checkpoint_in_dir(run_dir: &Path) -> Option<PathBuf> {
+    let candidates = [
+        run_dir.join("weights").join("best.pt"),
+        run_dir.join("best.pt"),
+        run_dir.join("checkpoint_best_total.pth"),
+        run_dir.join("checkpoint_best_ema.pth"),
+        run_dir.join("checkpoint_best_regular.pth"),
+        run_dir.join("weights").join("best.pth"),
+        run_dir.join("best.pth"),
+        run_dir.join("weights").join("last.pt"),
+        run_dir.join("last.pt"),
+        run_dir.join("weights").join("last.pth"),
+        run_dir.join("last.pth"),
+        run_dir.join("checkpoint.pth"),
+    ];
+    for c in candidates {
+        if c.is_file() {
+            return Some(c);
+        }
+    }
+    None
+}
+
+fn find_onnx_in_dir(run_dir: &Path) -> Option<PathBuf> {
+    let candidates = [
+        run_dir.join("best.onnx"),
+        run_dir.join("weights").join("best.onnx"),
+    ];
+    for c in candidates {
+        if c.is_file() {
+            return Some(c);
+        }
+    }
+    None
+}
+
 fn launch_training_thread(state: Arc<Mutex<AppState>>, request: TrainingRequest) {
     if let Ok(mut guard) = state.lock() {
         guard.mode = UiMode::Training;
@@ -688,6 +783,9 @@ fn launch_training_thread(state: Arc<Mutex<AppState>>, request: TrainingRequest)
         guard.is_paused = false;
         guard.stop_initiated = false;
         guard.exit_code = None;
+        guard.results_dir = None;
+        guard.best_weights_path = None;
+        guard.onnx_path = None;
         guard.training_started_at = Some(Instant::now());
         guard.training_ended_at = None;
         guard.status_line = "Initializing training...".to_string();
@@ -700,10 +798,95 @@ fn launch_training_thread(state: Arc<Mutex<AppState>>, request: TrainingRequest)
 
     let sink: Arc<dyn TrainingEventSink> = Arc::new(TuiEventSink::new(Arc::clone(&state)));
     tauri::async_runtime::spawn(async move {
-        let result = run_training(sink.clone(), request).await;
-        if let Err(err) = result {
-            sink.on_log(format!("[LS-Trainer Error] {err}"));
-            sink.on_exit(Some(1));
+        let result = run_training(sink.clone(), request.clone()).await;
+        match result {
+            Ok(train_resp) => {
+                let actual_dir_path = PathBuf::from(&train_resp.results_dir);
+                let best_ckpt =
+                    find_best_checkpoint_in_dir(&actual_dir_path).map(|p| to_display_path(&p));
+                if let Ok(mut guard) = state.lock() {
+                    guard.results_dir = Some(train_resp.results_dir.clone());
+                    if let Some(ref ckpt) = best_ckpt {
+                        guard.best_weights_path = Some(ckpt.clone());
+                    }
+                    if let Some(m50) = train_resp.map50 {
+                        guard.best_map50 = Some(guard.best_map50.map_or(m50, |prev| prev.max(m50)));
+                    }
+                    if let Some(m95) = train_resp.map50_95 {
+                        guard.best_map50_95 =
+                            Some(guard.best_map50_95.map_or(m95, |prev| prev.max(m95)));
+                    }
+                }
+
+                let stop_was_initiated = state.lock().map(|g| g.stop_initiated).unwrap_or(false);
+                if train_resp.success
+                    && train_resp.message.to_ascii_lowercase().contains("complete")
+                    && !stop_was_initiated
+                {
+                    sink.on_log("[LS-Trainer Status] Exporting best model to ONNX...".to_string());
+                    let export_req = ExportRequest {
+                        results_dir: train_resp.results_dir.clone(),
+                        imgsz: request.imgsz,
+                        dynamic: false,
+                        simplify: true,
+                    };
+                    match run_export_to_onnx(sink.clone(), export_req).await {
+                        Ok(exp_resp) if exp_resp.success && !exp_resp.onnx_path.is_empty() => {
+                            if let Ok(mut guard) = state.lock() {
+                                guard.onnx_path = Some(exp_resp.onnx_path.clone());
+                            }
+                            let ckpt_disp = best_ckpt.as_deref().unwrap_or(&train_resp.results_dir);
+                            sink.on_log(format!(
+                                "[LS-Trainer] Training complete! Best weights: {} | ONNX: {}",
+                                ckpt_disp, exp_resp.onnx_path
+                            ));
+                        }
+                        Ok(exp_resp) => {
+                            sink.on_log(format!(
+                                "[LS-Trainer Warning] ONNX export did not complete: {}",
+                                exp_resp.message
+                            ));
+                        }
+                        Err(err) => {
+                            sink.on_log(format!("[LS-Trainer Warning] ONNX export failed: {err}"));
+                        }
+                    }
+                }
+
+                if let Ok(mut guard) = state.lock() {
+                    guard.refresh_run_artifacts();
+                    guard.is_running = false;
+                    guard.is_paused = false;
+                    guard.training_ended_at = Some(Instant::now());
+                    if train_resp.success {
+                        guard.exit_code = Some(0);
+                        guard.status_line = if let Some(ref onnx) = guard.onnx_path {
+                            format!("Completed — {onnx}")
+                        } else {
+                            "Completed".to_string()
+                        };
+                    } else if guard.stop_initiated {
+                        if guard.exit_code.is_none() {
+                            guard.exit_code = Some(130);
+                        }
+                        guard.status_line = "Stopped by user".to_string();
+                    } else if guard.exit_code.is_none() {
+                        guard.exit_code = Some(1);
+                        guard.status_line = train_resp.message;
+                    }
+                }
+            }
+            Err(err) => {
+                sink.on_log(format!("[LS-Trainer Error] {err}"));
+                if let Ok(mut guard) = state.lock() {
+                    guard.refresh_run_artifacts();
+                    guard.exit_code = Some(1);
+                    guard.is_running = false;
+                    guard.is_paused = false;
+                    guard.training_ended_at = Some(Instant::now());
+                    guard.status_line = "Training failed".to_string();
+                }
+            }
         }
     });
 }
@@ -2182,6 +2365,244 @@ fn graceful_stop_and_wait(state: &Arc<Mutex<AppState>>) {
     force_kill_active_child();
 }
 
+fn render_splash_screen(frame: &mut Frame, area: Rect) {
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(SPLASH_ASCII_LINES.len() + 5);
+    lines.push(Line::from(""));
+
+    for (idx, art_line) in SPLASH_ASCII_LINES.iter().enumerate() {
+        let color = match idx {
+            0..=2 => TITLE_ACCENT,
+            3..=5 => BAR_GPU_TEAL,
+            _ => BAR_EPOCH_TEAL,
+        };
+        lines.push(Line::from(Span::styled(
+            (*art_line).to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            " ── LS-Trainer TUI ",
+            Style::default()
+                .fg(TITLE_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "· YOLO · RF-DETR · RT-DETR · ONNX ──",
+            Style::default().fg(LABEL_MUTED),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        " Press any key to continue...",
+        Style::default().fg(TABLE_BORDER_SOFT),
+    )));
+
+    let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
+    frame.render_widget(paragraph, area);
+}
+
+/// Show the BTOP++-style splash screen for `duration` or until any key is pressed.
+/// Returns `Ok(true)` if the user pressed `Ctrl+C` to abort immediately.
+fn run_splash_screen<B: Backend>(
+    terminal: &mut Terminal<B>,
+    duration: Duration,
+) -> std::io::Result<bool> {
+    let _ = terminal.clear();
+    let deadline = Instant::now() + duration;
+    let poll_step = Duration::from_millis(50);
+
+    loop {
+        let _ = terminal.draw(|frame| render_splash_screen(frame, frame.area()));
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let wait = (deadline - now).min(poll_step);
+        if event::poll(wait)? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c')
+                    {
+                        return Ok(true);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = terminal.clear();
+    Ok(false)
+}
+
+fn format_exit_summary(state: &AppState) -> String {
+    let best_metrics_str = match (state.best_map50, state.best_map50_95) {
+        (Some(m50), Some(m95)) => format!(
+            "mAP50: {:.4} ({:.1}%)  ·  mAP50-95: {:.4} ({:.1}%)",
+            m50,
+            m50 * 100.0,
+            m95,
+            m95 * 100.0
+        ),
+        (Some(m50), None) => format!("mAP50: {:.4} ({:.1}%)", m50, m50 * 100.0),
+        (None, Some(m95)) => format!("mAP50-95: {:.4} ({:.1}%)", m95, m95 * 100.0),
+        (None, None) => {
+            if state.step_counter > 0 {
+                format!(
+                    "train_loss: {:.4} (epoch {}/{})",
+                    state.latest_metrics.train_loss,
+                    state.latest_metrics.epoch,
+                    state.latest_metrics.total_epochs
+                )
+            } else {
+                "N/A (no epochs completed)".to_string()
+            }
+        }
+    };
+
+    let best_weights_str = state.best_weights_path.as_deref().unwrap_or("Not saved");
+    let onnx_str = state.onnx_path.as_deref().unwrap_or("Not exported");
+    let run_dir_str = state
+        .results_dir
+        .as_deref()
+        .unwrap_or("N/A (no run started)");
+    let elapsed_secs = state.elapsed_seconds();
+    let elapsed_str = if state.training_started_at.is_some() {
+        let hms = format_eta_seconds(elapsed_secs.max(1.0));
+        if hms == "--:--" {
+            format!("{elapsed_secs:.1}s")
+        } else {
+            format!("{hms} ({elapsed_secs:.1}s)")
+        }
+    } else {
+        "00:00".to_string()
+    };
+
+    let rows: [(&str, &str); 5] = [
+        ("Best Metrics", &best_metrics_str),
+        ("Best Weights", best_weights_str),
+        ("ONNX Model", onnx_str),
+        ("Run Directory", run_dir_str),
+        ("Elapsed Time", &elapsed_str),
+    ];
+
+    let title = "─ LS-Trainer — Exit Summary ";
+    let mut inner_width = 72usize;
+    for (_label, val) in &rows {
+        let row_len = 2 + 14 + 3 + val.chars().count() + 2;
+        if row_len > inner_width {
+            inner_width = row_len;
+        }
+    }
+
+    let top_dashes = inner_width.saturating_sub(title.chars().count());
+    let mut out = String::new();
+    out.push_str(&format!("╭{title}{}╮\n", "─".repeat(top_dashes)));
+    out.push_str(&format!("│{}│\n", " ".repeat(inner_width)));
+
+    for (label, val) in &rows {
+        let content = format!("  {label:<14} : {val}");
+        let pad = inner_width.saturating_sub(content.chars().count());
+        out.push_str(&format!("│{content}{}│\n", " ".repeat(pad)));
+    }
+
+    out.push_str(&format!("│{}│\n", " ".repeat(inner_width)));
+    out.push_str(&format!("╰{}╯\n", "─".repeat(inner_width)));
+    out
+}
+
+fn clear_and_print_exit_summary(state: &Arc<Mutex<AppState>>) {
+    let summary = if let Ok(mut guard) = state.lock() {
+        guard.refresh_run_artifacts();
+        format_exit_summary(&guard)
+    } else {
+        return;
+    };
+
+    let mut stdout = std::io::stdout();
+    let _ = execute!(stdout, Clear(ClearType::All), MoveTo(0, 0));
+    let _ = writeln!(stdout, "\x1b[38;2;116;202;218m{summary}\x1b[0m");
+    let _ = stdout.flush();
+}
+
+fn handle_training_key(
+    state: &Arc<Mutex<AppState>>,
+    code: KeyCode,
+    clipboard: &mut Option<Clipboard>,
+) -> bool {
+    match code {
+        KeyCode::Char('q') | KeyCode::Char('Q') => {
+            graceful_stop_and_wait(state);
+            if let Ok(mut guard) = state.lock() {
+                guard.refresh_run_artifacts();
+            }
+            return true;
+        }
+        KeyCode::Char(' ') => {
+            let currently_paused = state.lock().map(|g| g.is_paused).unwrap_or(false);
+            let cmd = if currently_paused {
+                ProcessControlCommand::Resume
+            } else {
+                ProcessControlCommand::Pause
+            };
+            let sent = if let Some(handle) = active_training_control() {
+                handle.send_command(cmd).is_ok()
+            } else {
+                send_training_control(cmd.as_wire_line()).unwrap_or(false)
+            };
+            if let Ok(mut guard) = state.lock() {
+                if sent || guard.is_running {
+                    guard.is_paused = !currently_paused;
+                    guard.status_line = if guard.is_paused {
+                        "Paused".to_string()
+                    } else {
+                        "Training in progress...".to_string()
+                    };
+                }
+            }
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            let sent = if let Some(handle) = active_training_control() {
+                handle
+                    .send_command(ProcessControlCommand::Checkpoint)
+                    .is_ok()
+            } else {
+                send_training_control("CHECKPOINT\n").unwrap_or(false)
+            };
+            if let Ok(mut guard) = state.lock() {
+                if sent {
+                    guard.push_log(
+                        "[LS-Trainer] Requested immediate checkpoint save (CHECKPOINT)."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        KeyCode::Up => {
+            if let Ok(mut guard) = state.lock() {
+                guard.follow_logs = false;
+                guard.log_scroll_offset = guard.log_scroll_offset.saturating_add(1);
+            }
+        }
+        KeyCode::Down => {
+            if let Ok(mut guard) = state.lock() {
+                guard.log_scroll_offset = guard.log_scroll_offset.saturating_sub(1);
+                if guard.log_scroll_offset == 0 {
+                    guard.follow_logs = true;
+                }
+            }
+        }
+        KeyCode::F(12) => {
+            copy_logs_with_feedback(state, clipboard);
+        }
+        _ => {}
+    }
+    false
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(cli_cfg) = (match parse_cli_args() {
         Ok(v) => v,
@@ -2215,13 +2636,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(Mutex::new(AppState::new(cli_cfg)));
     spawn_hardware_polling_tasks(Arc::clone(&state));
 
+    let mut terminal = ratatui::init();
+    let aborted_in_splash = run_splash_screen(&mut terminal, Duration::from_millis(1650))?;
+    if aborted_in_splash {
+        ratatui::restore();
+        return Ok(());
+    }
+
     if let Some(req) = initial_req {
         launch_training_thread(Arc::clone(&state), req);
     }
 
-    let mut terminal = ratatui::init();
     let mut clipboard: Option<Clipboard> = None;
     let tick_rate = Duration::from_millis(80);
+    let mut show_exit_summary = false;
 
     loop {
         if let Ok(mut guard) = state.lock() {
@@ -2245,81 +2673,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mode = state.lock().map(|g| g.mode).unwrap_or(UiMode::Training);
 
                 if mode == UiMode::Setup {
+                    let is_quit_q = matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+                        && state
+                            .lock()
+                            .map(|g| !g.setup.editing_field)
+                            .unwrap_or(false);
+                    if is_quit_q {
+                        show_exit_summary = true;
+                        break;
+                    }
                     if handle_setup_key(&state, key.code) {
                         break;
                     }
                     continue;
                 }
 
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Char('Q') => {
-                        graceful_stop_and_wait(&state);
-                        break;
-                    }
-                    KeyCode::Char(' ') => {
-                        let currently_paused = state.lock().map(|g| g.is_paused).unwrap_or(false);
-                        let cmd = if currently_paused {
-                            ProcessControlCommand::Resume
-                        } else {
-                            ProcessControlCommand::Pause
-                        };
-                        let sent = if let Some(handle) = active_training_control() {
-                            handle.send_command(cmd).is_ok()
-                        } else {
-                            send_training_control(cmd.as_wire_line()).unwrap_or(false)
-                        };
-                        if let Ok(mut guard) = state.lock() {
-                            if sent || guard.is_running {
-                                guard.is_paused = !currently_paused;
-                                guard.status_line = if guard.is_paused {
-                                    "Paused".to_string()
-                                } else {
-                                    "Training in progress...".to_string()
-                                };
-                            }
-                        }
-                    }
-                    KeyCode::Char('c') | KeyCode::Char('C') => {
-                        let sent = if let Some(handle) = active_training_control() {
-                            handle
-                                .send_command(ProcessControlCommand::Checkpoint)
-                                .is_ok()
-                        } else {
-                            send_training_control("CHECKPOINT\n").unwrap_or(false)
-                        };
-                        if let Ok(mut guard) = state.lock() {
-                            if sent {
-                                guard.push_log(
-                                    "[LS-Trainer] Requested immediate checkpoint save (CHECKPOINT)."
-                                        .to_string(),
-                                );
-                            }
-                        }
-                    }
-                    KeyCode::Up => {
-                        if let Ok(mut guard) = state.lock() {
-                            guard.follow_logs = false;
-                            guard.log_scroll_offset = guard.log_scroll_offset.saturating_add(1);
-                        }
-                    }
-                    KeyCode::Down => {
-                        if let Ok(mut guard) = state.lock() {
-                            guard.log_scroll_offset = guard.log_scroll_offset.saturating_sub(1);
-                            if guard.log_scroll_offset == 0 {
-                                guard.follow_logs = true;
-                            }
-                        }
-                    }
-                    KeyCode::F(12) => {
-                        copy_logs_with_feedback(&state, &mut clipboard);
-                    }
-                    _ => {}
+                if handle_training_key(&state, key.code, &mut clipboard) {
+                    show_exit_summary = true;
+                    break;
                 }
             }
         }
     }
 
     ratatui::restore();
+    if show_exit_summary {
+        clear_and_print_exit_summary(&state);
+    }
     Ok(())
 }
 
@@ -2644,9 +3024,60 @@ mod tests {
     }
 
     #[test]
+    fn splash_renders_left_aligned_ascii_then_transitions_to_tui() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| render_splash_screen(frame, frame.area()))
+            .expect("draw splash screen");
+
+        let buf = terminal.backend().buffer();
+        // Verify each of the 8 Big Money-ne ASCII art lines is rendered left-aligned starting at x=0
+        for (idx, expected_line) in SPLASH_ASCII_LINES.iter().enumerate() {
+            let y = (idx + 1) as u16;
+            let mut row_str = String::new();
+            for x in 0..(expected_line.len() as u16) {
+                row_str.push_str(buf[(x, y)].symbol());
+            }
+            assert_eq!(
+                &row_str, expected_line,
+                "Splash ASCII line {idx} must match Big Money-ne art left-aligned at column 0"
+            );
+        }
+
+        // Transition to TUI launcher after splash
+        let _ = terminal.clear();
+        let state = AppState::new(CliConfig::default());
+        terminal
+            .draw(|frame| draw_ui(frame, &state))
+            .expect("draw launcher after splash");
+        let buf_after = terminal.backend().buffer();
+        let mut text_after = String::new();
+        for y in 0..24 {
+            for x in 0..100 {
+                text_after.push_str(buf_after[(x, y)].symbol());
+            }
+            text_after.push('\n');
+        }
+        assert!(text_after.contains("LS-Trainer TUI — Launch Menu"));
+    }
+
+    #[test]
     fn short_real_run_from_launcher_verifies_tui_rendering() {
         let tmp_ds = std::env::temp_dir().join("ls_trainer_tui_tiny_ds");
         let _ = std::fs::remove_dir_all(&tmp_ds);
+        if let Ok(entries) = std::fs::read_dir("runs/detect") {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("tui-short-verify")
+                {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
         let img_dir = tmp_ds.join("images").join("train");
         let lbl_dir = tmp_ds.join("labels").join("train");
         std::fs::create_dir_all(&img_dir).expect("create train images dir");
@@ -2666,7 +3097,16 @@ mod tests {
         );
         std::fs::write(tmp_ds.join("data.yaml"), yaml_content).expect("write data.yaml");
 
-        // 1. Launch with no flags -> starts in Setup (Launcher) mode
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        // 0. Show splash screen first
+        terminal
+            .draw(|frame| render_splash_screen(frame, frame.area()))
+            .expect("draw splash");
+        assert_eq!(terminal.backend().buffer()[(0, 2)].symbol(), "|");
+
+        // 1. Launch with no flags -> transitions from splash to Setup (Launcher) mode
         let empty_args: Vec<&str> = Vec::new();
         let cfg = parse_cli_args_from(empty_args)
             .expect("parse empty args")
@@ -2690,16 +3130,13 @@ mod tests {
             guard.setup.run_name = "tui-short-verify".to_string();
         }
 
-        // Press F2 in launcher -> transitions to UiMode::Training and spawns run_training
+        // Press F2 in launcher -> transitions to UiMode::Training and spawns run_training + ONNX export
         let should_quit = handle_setup_key(&state, KeyCode::F(2));
         assert!(!should_quit);
         assert_eq!(state.lock().unwrap().mode, UiMode::Training);
         assert!(state.lock().unwrap().is_running);
 
-        let backend = TestBackend::new(120, 32);
-        let mut terminal = Terminal::new(backend).expect("create test terminal");
-
-        let deadline = Instant::now() + Duration::from_secs(35);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut saw_live_metrics = false;
         while Instant::now() < deadline {
             let done = {
@@ -2721,51 +3158,98 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
 
+        {
+            let guard = state.lock().unwrap();
+            if guard.exit_code != Some(0) {
+                for l in &guard.logs {
+                    println!("LOG: {l}");
+                }
+                force_kill_active_child();
+            }
+            assert_eq!(
+                guard.exit_code,
+                Some(0),
+                "Expected short training run + ONNX export to exit with code 0; status={}",
+                guard.status_line
+            );
+            assert!(
+                saw_live_metrics,
+                "Expected live @@LS_METRICS@@ updates during run"
+            );
+            assert_eq!(guard.latest_metrics.epoch, 1);
+
+            // Verify both weights (best.pt) and ONNX (best.onnx in run dir) were produced
+            let run_dir = guard.results_dir.as_ref().expect("results_dir recorded");
+            let best_pt = guard
+                .best_weights_path
+                .as_ref()
+                .expect("best_weights_path recorded");
+            let best_onnx = guard.onnx_path.as_ref().expect("onnx_path recorded");
+            assert!(
+                Path::new(best_pt).is_file(),
+                "Expected best.pt weights file to exist at {best_pt}"
+            );
+            assert!(
+                Path::new(best_onnx).is_file(),
+                "Expected exported ONNX file to exist at {best_onnx}"
+            );
+            assert!(
+                Path::new(run_dir).join("best.onnx").is_file(),
+                "Expected best.onnx to be saved in run directory {run_dir}"
+            );
+            assert!(
+                guard
+                    .logs
+                    .iter()
+                    .any(|l| l.contains("Training complete!") && l.contains(best_onnx)),
+                "Expected training complete log message to include ONNX path"
+            );
+
+            terminal
+                .draw(|frame| draw_ui(frame, &guard))
+                .expect("final draw_ui");
+            let buf = terminal.backend().buffer();
+
+            // Confirm epoch bar uses BAR_EPOCH_TEAL and never LightMagenta, and VRAM text is readable
+            let mut saw_epoch_teal = false;
+            let mut saw_vram_bar = false;
+            for y in 0..32 {
+                for x in 0..120 {
+                    let cell = &buf[(x, y)];
+                    assert_ne!(cell.bg, Color::LightMagenta);
+                    if cell.bg == BAR_EPOCH_TEAL {
+                        saw_epoch_teal = true;
+                    }
+                    if y == 1 && cell.bg == BAR_GPU_TEAL && cell.symbol() != " " {
+                        assert_eq!(cell.fg, GAUGE_TEXT_COVERED);
+                        saw_vram_bar = true;
+                    }
+                }
+            }
+            assert!(saw_epoch_teal);
+            assert!(
+                !guard.gpus.is_empty() || saw_vram_bar,
+                "Expected GPU telemetry during training run"
+            );
+        }
+
+        // Press 'q' to quit -> verify exit summary contains border, metrics, weights path, ONNX path, run dir, and elapsed time
+        let mut cb = None;
+        let quit_triggered = handle_training_key(&state, KeyCode::Char('q'), &mut cb);
+        assert!(quit_triggered, "Pressing q must quit training TUI");
+
         let guard = state.lock().unwrap();
-        if guard.exit_code != Some(0) {
-            for l in &guard.logs {
-                println!("LOG: {l}");
-            }
-            force_kill_active_child();
-        }
-        assert_eq!(
-            guard.exit_code,
-            Some(0),
-            "Expected short training run to exit with code 0; status={}",
-            guard.status_line
-        );
-        assert!(
-            saw_live_metrics,
-            "Expected live @@LS_METRICS@@ updates during run"
-        );
-        assert_eq!(guard.latest_metrics.epoch, 1);
+        let summary = format_exit_summary(&guard);
+        println!("EXIT SUMMARY:\n{summary}");
+        assert!(summary.contains("╭─ LS-Trainer — Exit Summary"));
+        assert!(summary.contains("╰"));
+        assert!(summary.contains("mAP50:"));
+        assert!(summary.contains("mAP50-95:"));
+        assert!(summary.contains(guard.best_weights_path.as_deref().unwrap()));
+        assert!(summary.contains(guard.onnx_path.as_deref().unwrap()));
+        assert!(summary.contains(guard.results_dir.as_deref().unwrap()));
+        assert!(summary.contains("Elapsed Time"));
 
-        terminal
-            .draw(|frame| draw_ui(frame, &guard))
-            .expect("final draw_ui");
-        let buf = terminal.backend().buffer();
-
-        // Confirm epoch bar uses BAR_EPOCH_TEAL and never LightMagenta, and VRAM text is readable
-        let mut saw_epoch_teal = false;
-        let mut saw_vram_bar = false;
-        for y in 0..32 {
-            for x in 0..120 {
-                let cell = &buf[(x, y)];
-                assert_ne!(cell.bg, Color::LightMagenta);
-                if cell.bg == BAR_EPOCH_TEAL {
-                    saw_epoch_teal = true;
-                }
-                if y == 1 && cell.bg == BAR_GPU_TEAL && cell.symbol() != " " {
-                    assert_eq!(cell.fg, GAUGE_TEXT_COVERED);
-                    saw_vram_bar = true;
-                }
-            }
-        }
-        assert!(saw_epoch_teal);
-        assert!(
-            !guard.gpus.is_empty() || saw_vram_bar,
-            "Expected GPU telemetry during XPU training run"
-        );
         let _ = std::fs::remove_dir_all(&tmp_ds);
         if let Ok(entries) = std::fs::read_dir("runs/detect") {
             for entry in entries.flatten() {

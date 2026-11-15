@@ -11,12 +11,84 @@ use crate::hardware::{detect_gpu_info, resolve_dataloader_workers};
 use crate::models::{TrainingRequest, TrainingResponse};
 use crate::process::{
     TrainingEventSink, hide_console_window, hide_console_window_tokio, stream_child_output,
-    stream_tokio_child_output, venv_python_path, venv_yolo_path,
+    stream_tokio_child_output, to_display_path, venv_python_path, venv_yolo_path,
 };
 use crate::training::{
     extract_final_metrics_from_results_dir, is_stop_requested, log_final_metrics,
     register_tokio_child_process, save_run_config_metadata, unregister_child_pid,
 };
+
+/// When `<project_runs_dir>/<run_name>` already existed before training started,
+/// Ultralytics increments the output folder (e.g. `run_name2` or `run_name-2`).
+/// Resolve the directory that actually received checkpoints/results during this run.
+fn resolve_actual_yolo_results_dir(
+    project_runs_dir: &Path,
+    run_name: &str,
+    default_dir: &Path,
+    started_at: std::time::SystemTime,
+) -> PathBuf {
+    let threshold = started_at
+        .checked_sub(std::time::Duration::from_secs(2))
+        .unwrap_or(started_at);
+
+    let has_fresh_artifact = |dir: &Path| -> Option<std::time::SystemTime> {
+        let candidates = [
+            dir.join("weights").join("best.pt"),
+            dir.join("weights").join("last.pt"),
+            dir.join("results.csv"),
+        ];
+        let mut newest: Option<std::time::SystemTime> = None;
+        for c in candidates {
+            if let Ok(meta) = std::fs::metadata(&c) {
+                if let Ok(mtime) = meta.modified() {
+                    if mtime >= threshold {
+                        newest = Some(newest.map_or(mtime, |prev| prev.max(mtime)));
+                    }
+                }
+            }
+        }
+        newest
+    };
+
+    if has_fresh_artifact(default_dir).is_some() {
+        return default_dir.to_path_buf();
+    }
+
+    let Ok(entries) = std::fs::read_dir(project_runs_dir) else {
+        return default_dir.to_path_buf();
+    };
+
+    let mut best_match: Option<(PathBuf, std::time::SystemTime)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let fname = entry.file_name().to_string_lossy().to_string();
+        let is_incremented = if let Some(suffix) = fname.strip_prefix(run_name) {
+            suffix.is_empty()
+                || suffix.chars().all(|c| c.is_ascii_digit())
+                || (suffix.starts_with('-') && suffix[1..].chars().all(|c| c.is_ascii_digit()))
+        } else {
+            false
+        };
+        if !is_incremented {
+            continue;
+        }
+        if let Some(mtime) = has_fresh_artifact(&path) {
+            if best_match
+                .as_ref()
+                .is_none_or(|(_, prev_t)| mtime > *prev_t)
+            {
+                best_match = Some((path, mtime));
+            }
+        }
+    }
+
+    best_match
+        .map(|(p, _)| p)
+        .unwrap_or_else(|| default_dir.to_path_buf())
+}
 
 pub(crate) fn resolve_or_download_model_weights(
     project_root: &Path,
@@ -338,7 +410,8 @@ pub(crate) async fn start_yolo_training(
     let joined_train_args = train_args.join(" ");
     let yolo_runner_script = include_str!("../python/yolo_train.py");
 
-    let (mut cmd, exact_command) = if expected_venv_yolo.is_file() || expected_venv_python.is_file() {
+    let (mut cmd, exact_command) = if expected_venv_yolo.is_file() || expected_venv_python.is_file()
+    {
         let display_exe = if expected_venv_yolo.is_file() {
             &expected_venv_yolo
         } else {
@@ -419,6 +492,8 @@ pub(crate) async fn start_yolo_training(
         dataset_working_dir.display()
     ));
 
+    let spawn_started_at = std::time::SystemTime::now();
+
     match cmd.spawn() {
         Ok(mut child) => {
             sink.on_log(format!(
@@ -434,10 +509,19 @@ pub(crate) async fn start_yolo_training(
             })?;
 
             unregister_child_pid();
+
+            let actual_results_dir = resolve_actual_yolo_results_dir(
+                &project_runs_dir,
+                &run_name,
+                &abs_results_dir,
+                spawn_started_at,
+            );
+            let results_dir = to_display_path(&actual_results_dir);
+
             sink.on_exit(status.code());
 
             save_run_config_metadata(
-                &abs_results_dir,
+                &actual_results_dir,
                 &request,
                 &resolved_model,
                 &effective_device,
@@ -446,7 +530,7 @@ pub(crate) async fn start_yolo_training(
                 &sink,
             );
 
-            let (map50, map50_95) = extract_final_metrics_from_results_dir(&abs_results_dir);
+            let (map50, map50_95) = extract_final_metrics_from_results_dir(&actual_results_dir);
 
             if is_stop_requested() {
                 sink.on_log(format!(
