@@ -9,8 +9,10 @@ use arboard::Clipboard;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use crate::app::{
-    launch_training_thread, scan_run_history, AppState, OverlayMode, UiMode, DEVICE_PRESETS,
-    LAUNCHER_FIELD_COUNT, WORKER_PRESETS,
+    launch_training_thread, scan_run_history, AppState, OverlayMode, UiMode, AUG_PRESET_NAMES,
+    BATCH_PRESETS, CLOSE_MOSAIC_PRESETS, DEGREES_PRESETS, DEVICE_PRESETS, EPOCH_PRESETS,
+    FLIPUD_PRESETS, IMGSZ_PRESETS, LAUNCHER_FIELD_COUNT, MIXUP_PRESETS, MOSAIC_PRESETS,
+    SCALE_PRESETS, TRANSLATE_PRESETS, WORKER_PRESETS,
 };
 
 pub enum EventOutcome {
@@ -88,31 +90,70 @@ pub fn cycle_preset(current: &str, presets: &[&str], forward: bool) -> String {
 pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
     let mut launch_req: Option<TrainingRequest> = None;
     if let Ok(mut guard) = state.lock() {
+        if guard.overlay != OverlayMode::None {
+            match code {
+                KeyCode::Esc
+                | KeyCode::F(1)
+                | KeyCode::F(3)
+                | KeyCode::F(4)
+                | KeyCode::Char('?') => {
+                    guard.overlay = OverlayMode::None;
+                }
+                _ => {}
+            }
+            return false;
+        }
+
         let focused = guard.setup.focused_field;
+        let finish_edit = |s: &mut crate::app::CliConfig| {
+            if s.editing_field {
+                if s.focused_field == 1 {
+                    s.model = s.arch.resolve_model_or_scale(&s.model);
+                } else if s.focused_field == 5 {
+                    if let Ok(parsed) = s.imgsz_input.trim().parse::<u32>() {
+                        s.imgsz = parsed.max(32);
+                    } else if s.imgsz_input.trim().is_empty() {
+                        s.imgsz_input = s.imgsz.to_string();
+                    }
+                } else if s.focused_field == 6 && s.workers_input.trim().is_empty() {
+                    s.workers_input = "auto".to_string();
+                }
+                s.editing_field = false;
+            }
+        };
+
         match code {
             KeyCode::Esc => {
                 if guard.setup.editing_field {
-                    guard.setup.editing_field = false;
+                    finish_edit(&mut guard.setup);
                 } else {
                     return true;
                 }
             }
-            KeyCode::F(2) => match guard.setup.to_training_request() {
-                Ok(req) => {
-                    guard.setup.editing_field = false;
-                    guard.setup.error_banner = None;
-                    launch_req = Some(req);
+            KeyCode::F(1) => {
+                guard.overlay = OverlayMode::Help;
+            }
+            KeyCode::F(3) => {
+                guard.overlay = OverlayMode::Config;
+            }
+            KeyCode::F(2) => {
+                finish_edit(&mut guard.setup);
+                match guard.setup.to_training_request() {
+                    Ok(req) => {
+                        guard.setup.error_banner = None;
+                        launch_req = Some(req);
+                    }
+                    Err(err) => {
+                        guard.setup.error_banner = Some(err);
+                    }
                 }
-                Err(err) => {
-                    guard.setup.error_banner = Some(err);
-                }
-            },
+            }
             KeyCode::Tab | KeyCode::Down => {
-                guard.setup.editing_field = false;
+                finish_edit(&mut guard.setup);
                 guard.setup.focused_field = (focused + 1) % LAUNCHER_FIELD_COUNT;
             }
             KeyCode::BackTab | KeyCode::Up => {
-                guard.setup.editing_field = false;
+                finish_edit(&mut guard.setup);
                 guard.setup.focused_field = if focused == 0 {
                     LAUNCHER_FIELD_COUNT - 1
                 } else {
@@ -121,56 +162,165 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
             }
             KeyCode::Left => match focused {
                 0 => {
-                    let prev_default = guard.setup.arch.default_model();
-                    guard.setup.arch = guard.setup.arch.prev();
-                    if guard.setup.model == prev_default {
-                        guard.setup.model = guard.setup.arch.default_model().to_string();
-                    }
+                    let prev_arch = guard.setup.arch.prev();
+                    guard.setup.switch_arch(prev_arch);
+                }
+                1 if !guard.setup.editing_field => {
+                    guard.setup.model = guard.setup.arch.cycle_model(&guard.setup.model, false);
+                }
+                3 if !guard.setup.editing_field => {
+                    guard.setup.epochs = cycle_preset(&guard.setup.epochs, &EPOCH_PRESETS, false);
                 }
                 4 if !guard.setup.editing_field => {
-                    guard.setup.device = cycle_preset(&guard.setup.device, &DEVICE_PRESETS, false);
+                    guard.setup.batch = cycle_preset(&guard.setup.batch, &BATCH_PRESETS, false);
                 }
                 5 if !guard.setup.editing_field => {
+                    guard.setup.imgsz_input =
+                        cycle_preset(&guard.setup.imgsz_input, &IMGSZ_PRESETS, false);
+                    if let Ok(parsed) = guard.setup.imgsz_input.parse::<u32>() {
+                        guard.setup.imgsz = parsed;
+                    }
+                }
+                6 if !guard.setup.editing_field => {
                     guard.setup.workers_input =
                         cycle_preset(&guard.setup.workers_input, &WORKER_PRESETS, false);
+                }
+                7 if !guard.setup.editing_field => {
+                    guard.setup.device = cycle_preset(&guard.setup.device, &DEVICE_PRESETS, false);
+                }
+                8 => {
+                    guard.setup.freeze_backbone = !guard.setup.freeze_backbone;
+                }
+                9 => {
+                    guard.setup.amp = !guard.setup.amp;
+                }
+                11 => {
+                    let cur = guard.setup.active_aug_preset();
+                    let next_p = cycle_preset(cur, &AUG_PRESET_NAMES, false);
+                    guard.setup.apply_aug_preset(&next_p);
+                }
+                12 if !guard.setup.editing_field => {
+                    guard.setup.degrees =
+                        cycle_preset(&guard.setup.degrees, &DEGREES_PRESETS, false);
+                }
+                13 if !guard.setup.editing_field => {
+                    guard.setup.flipud = cycle_preset(&guard.setup.flipud, &FLIPUD_PRESETS, false);
+                }
+                14 if !guard.setup.editing_field => {
+                    guard.setup.scale = cycle_preset(&guard.setup.scale, &SCALE_PRESETS, false);
+                }
+                15 if !guard.setup.editing_field => {
+                    guard.setup.translate =
+                        cycle_preset(&guard.setup.translate, &TRANSLATE_PRESETS, false);
+                }
+                16 if !guard.setup.editing_field => {
+                    guard.setup.mosaic = cycle_preset(&guard.setup.mosaic, &MOSAIC_PRESETS, false);
+                }
+                17 if !guard.setup.editing_field => {
+                    guard.setup.close_mosaic =
+                        cycle_preset(&guard.setup.close_mosaic, &CLOSE_MOSAIC_PRESETS, false);
+                }
+                18 if !guard.setup.editing_field => {
+                    guard.setup.mixup = cycle_preset(&guard.setup.mixup, &MIXUP_PRESETS, false);
+                }
+                19 => {
+                    guard.setup.copy_paste = !guard.setup.copy_paste;
                 }
                 _ => {}
             },
             KeyCode::Right => match focused {
                 0 => {
-                    let prev_default = guard.setup.arch.default_model();
-                    guard.setup.arch = guard.setup.arch.next();
-                    if guard.setup.model == prev_default {
-                        guard.setup.model = guard.setup.arch.default_model().to_string();
-                    }
+                    let next_arch = guard.setup.arch.next();
+                    guard.setup.switch_arch(next_arch);
+                }
+                1 if !guard.setup.editing_field => {
+                    guard.setup.model = guard.setup.arch.cycle_model(&guard.setup.model, true);
+                }
+                3 if !guard.setup.editing_field => {
+                    guard.setup.epochs = cycle_preset(&guard.setup.epochs, &EPOCH_PRESETS, true);
                 }
                 4 if !guard.setup.editing_field => {
-                    guard.setup.device = cycle_preset(&guard.setup.device, &DEVICE_PRESETS, true);
+                    guard.setup.batch = cycle_preset(&guard.setup.batch, &BATCH_PRESETS, true);
                 }
                 5 if !guard.setup.editing_field => {
+                    guard.setup.imgsz_input =
+                        cycle_preset(&guard.setup.imgsz_input, &IMGSZ_PRESETS, true);
+                    if let Ok(parsed) = guard.setup.imgsz_input.parse::<u32>() {
+                        guard.setup.imgsz = parsed;
+                    }
+                }
+                6 if !guard.setup.editing_field => {
                     guard.setup.workers_input =
                         cycle_preset(&guard.setup.workers_input, &WORKER_PRESETS, true);
+                }
+                7 if !guard.setup.editing_field => {
+                    guard.setup.device = cycle_preset(&guard.setup.device, &DEVICE_PRESETS, true);
+                }
+                8 => {
+                    guard.setup.freeze_backbone = !guard.setup.freeze_backbone;
+                }
+                9 => {
+                    guard.setup.amp = !guard.setup.amp;
+                }
+                11 => {
+                    let cur = guard.setup.active_aug_preset();
+                    let next_p = cycle_preset(cur, &AUG_PRESET_NAMES, true);
+                    guard.setup.apply_aug_preset(&next_p);
+                }
+                12 if !guard.setup.editing_field => {
+                    guard.setup.degrees =
+                        cycle_preset(&guard.setup.degrees, &DEGREES_PRESETS, true);
+                }
+                13 if !guard.setup.editing_field => {
+                    guard.setup.flipud = cycle_preset(&guard.setup.flipud, &FLIPUD_PRESETS, true);
+                }
+                14 if !guard.setup.editing_field => {
+                    guard.setup.scale = cycle_preset(&guard.setup.scale, &SCALE_PRESETS, true);
+                }
+                15 if !guard.setup.editing_field => {
+                    guard.setup.translate =
+                        cycle_preset(&guard.setup.translate, &TRANSLATE_PRESETS, true);
+                }
+                16 if !guard.setup.editing_field => {
+                    guard.setup.mosaic = cycle_preset(&guard.setup.mosaic, &MOSAIC_PRESETS, true);
+                }
+                17 if !guard.setup.editing_field => {
+                    guard.setup.close_mosaic =
+                        cycle_preset(&guard.setup.close_mosaic, &CLOSE_MOSAIC_PRESETS, true);
+                }
+                18 if !guard.setup.editing_field => {
+                    guard.setup.mixup = cycle_preset(&guard.setup.mixup, &MIXUP_PRESETS, true);
+                }
+                19 => {
+                    guard.setup.copy_paste = !guard.setup.copy_paste;
                 }
                 _ => {}
             },
             KeyCode::Backspace => match focused {
                 1 => {
                     guard.setup.editing_field = true;
-                    guard.setup.dataset.pop();
+                    guard.setup.model.pop();
                 }
                 2 => {
                     guard.setup.editing_field = true;
-                    guard.setup.epochs.pop();
+                    guard.setup.dataset.pop();
                 }
                 3 => {
                     guard.setup.editing_field = true;
-                    guard.setup.batch.pop();
+                    guard.setup.epochs.pop();
                 }
                 4 => {
                     guard.setup.editing_field = true;
-                    guard.setup.device.pop();
+                    guard.setup.batch.pop();
                 }
                 5 => {
+                    guard.setup.editing_field = true;
+                    guard.setup.imgsz_input.pop();
+                    if let Ok(parsed) = guard.setup.imgsz_input.parse::<u32>() {
+                        guard.setup.imgsz = parsed;
+                    }
+                }
+                6 => {
                     guard.setup.editing_field = true;
                     if guard.setup.workers_input.eq_ignore_ascii_case("auto") {
                         guard.setup.workers_input.clear();
@@ -178,33 +328,73 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
                         guard.setup.workers_input.pop();
                     }
                 }
+                7 => {
+                    guard.setup.editing_field = true;
+                    guard.setup.device.pop();
+                }
+                10 => {
+                    guard.setup.editing_field = true;
+                    guard.setup.run_name.pop();
+                }
+                12 => {
+                    guard.setup.editing_field = true;
+                    guard.setup.degrees.pop();
+                }
+                13 => {
+                    guard.setup.editing_field = true;
+                    guard.setup.flipud.pop();
+                }
+                14 => {
+                    guard.setup.editing_field = true;
+                    guard.setup.scale.pop();
+                }
+                15 => {
+                    guard.setup.editing_field = true;
+                    guard.setup.translate.pop();
+                }
+                16 => {
+                    guard.setup.editing_field = true;
+                    guard.setup.mosaic.pop();
+                }
+                17 => {
+                    guard.setup.editing_field = true;
+                    guard.setup.close_mosaic.pop();
+                }
+                18 => {
+                    guard.setup.editing_field = true;
+                    guard.setup.mixup.pop();
+                }
                 _ => {}
             },
             KeyCode::Char(c) => match focused {
                 0 if c == ' ' => {
-                    let prev_default = guard.setup.arch.default_model();
-                    guard.setup.arch = guard.setup.arch.next();
-                    if guard.setup.model == prev_default {
-                        guard.setup.model = guard.setup.arch.default_model().to_string();
-                    }
+                    let next_arch = guard.setup.arch.next();
+                    guard.setup.switch_arch(next_arch);
                 }
                 1 => {
                     guard.setup.editing_field = true;
-                    guard.setup.dataset.push(c);
+                    guard.setup.model.push(c);
                 }
-                2 if c.is_ascii_digit() => {
+                2 => {
                     guard.setup.editing_field = true;
-                    guard.setup.epochs.push(c);
+                    guard.setup.dataset.push(c);
                 }
                 3 if c.is_ascii_digit() => {
                     guard.setup.editing_field = true;
+                    guard.setup.epochs.push(c);
+                }
+                4 if c.is_ascii_digit() => {
+                    guard.setup.editing_field = true;
                     guard.setup.batch.push(c);
                 }
-                4 => {
+                5 if c.is_ascii_digit() => {
                     guard.setup.editing_field = true;
-                    guard.setup.device.push(c);
+                    guard.setup.imgsz_input.push(c);
+                    if let Ok(parsed) = guard.setup.imgsz_input.parse::<u32>() {
+                        guard.setup.imgsz = parsed;
+                    }
                 }
-                5 => {
+                6 => {
                     guard.setup.editing_field = true;
                     if c.is_ascii_digit() {
                         if guard.setup.workers_input.eq_ignore_ascii_case("auto") {
@@ -215,13 +405,63 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
                         guard.setup.workers_input = "auto".to_string();
                     }
                 }
+                7 => {
+                    guard.setup.editing_field = true;
+                    guard.setup.device.push(c);
+                }
+                8 if c == ' ' => {
+                    guard.setup.freeze_backbone = !guard.setup.freeze_backbone;
+                }
+                9 if c == ' ' => {
+                    guard.setup.amp = !guard.setup.amp;
+                }
+                10 => {
+                    guard.setup.editing_field = true;
+                    guard.setup.run_name.push(c);
+                }
+                11 if c == ' ' => {
+                    let cur = guard.setup.active_aug_preset();
+                    let next_p = cycle_preset(cur, &AUG_PRESET_NAMES, true);
+                    guard.setup.apply_aug_preset(&next_p);
+                }
+                12 if c.is_ascii_digit() || c == '.' => {
+                    guard.setup.editing_field = true;
+                    guard.setup.degrees.push(c);
+                }
+                13 if c.is_ascii_digit() || c == '.' => {
+                    guard.setup.editing_field = true;
+                    guard.setup.flipud.push(c);
+                }
+                14 if c.is_ascii_digit() || c == '.' => {
+                    guard.setup.editing_field = true;
+                    guard.setup.scale.push(c);
+                }
+                15 if c.is_ascii_digit() || c == '.' => {
+                    guard.setup.editing_field = true;
+                    guard.setup.translate.push(c);
+                }
+                16 if c.is_ascii_digit() || c == '.' => {
+                    guard.setup.editing_field = true;
+                    guard.setup.mosaic.push(c);
+                }
+                17 if c.is_ascii_digit() => {
+                    guard.setup.editing_field = true;
+                    guard.setup.close_mosaic.push(c);
+                }
+                18 if c.is_ascii_digit() || c == '.' => {
+                    guard.setup.editing_field = true;
+                    guard.setup.mixup.push(c);
+                }
+                19 if c == ' ' => {
+                    guard.setup.copy_paste = !guard.setup.copy_paste;
+                }
                 _ => {}
             },
             KeyCode::Enter => {
-                if focused == 6 {
+                if focused == 20 {
+                    finish_edit(&mut guard.setup);
                     match guard.setup.to_training_request() {
                         Ok(req) => {
-                            guard.setup.editing_field = false;
                             guard.setup.error_banner = None;
                             launch_req = Some(req);
                         }
@@ -230,19 +470,22 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
                         }
                     }
                 } else if focused == 0 {
-                    let prev_default = guard.setup.arch.default_model();
-                    guard.setup.arch = guard.setup.arch.next();
-                    if guard.setup.model == prev_default {
-                        guard.setup.model = guard.setup.arch.default_model().to_string();
-                    }
+                    let next_arch = guard.setup.arch.next();
+                    guard.setup.switch_arch(next_arch);
+                } else if focused == 8 {
+                    guard.setup.freeze_backbone = !guard.setup.freeze_backbone;
+                } else if focused == 9 {
+                    guard.setup.amp = !guard.setup.amp;
+                } else if focused == 11 {
+                    let cur = guard.setup.active_aug_preset();
+                    let next_p = cycle_preset(cur, &AUG_PRESET_NAMES, true);
+                    guard.setup.apply_aug_preset(&next_p);
+                } else if focused == 19 {
+                    guard.setup.copy_paste = !guard.setup.copy_paste;
+                } else if guard.setup.editing_field {
+                    finish_edit(&mut guard.setup);
                 } else {
-                    if guard.setup.editing_field
-                        && focused == 5
-                        && guard.setup.workers_input.trim().is_empty()
-                    {
-                        guard.setup.workers_input = "auto".to_string();
-                    }
-                    guard.setup.editing_field = !guard.setup.editing_field;
+                    guard.setup.editing_field = true;
                 }
             }
             _ => {}

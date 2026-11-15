@@ -72,24 +72,37 @@ pub fn render_config_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
             )
         } else {
             let s = &state.setup;
-            let task = if s.model.to_ascii_lowercase().contains("-seg") {
+            let resolved_model = s.arch.resolve_model_or_scale(&s.model);
+            let task = if resolved_model.to_ascii_lowercase().contains("-seg") {
                 "segment".to_string()
             } else {
                 "detect".to_string()
             };
+            let aug = format!(
+                "amp={} · freeze_backbone={} · degrees={} · flipud={} · scale={} · translate={} · mosaic={} · close_mosaic={} · mixup={} · copy_paste={}",
+                s.amp,
+                s.freeze_backbone,
+                s.degrees,
+                s.flipud,
+                s.scale,
+                s.translate,
+                s.mosaic,
+                s.close_mosaic,
+                s.mixup,
+                if s.copy_paste { "0.3" } else { "0.0" }
+            );
             (
                 s.arch.as_family_str().to_string(),
                 task,
-                s.model.clone(),
+                resolved_model,
                 s.dataset.clone(),
                 s.epochs.clone(),
                 s.batch.clone(),
-                s.imgsz.to_string(),
+                s.resolve_imgsz().unwrap_or(s.imgsz).to_string(),
                 s.device.clone(),
                 s.workers_input.clone(),
                 s.run_name.clone(),
-                "amp=true · degrees=180 · flipud=0.50 · scale=0.05 · mosaic=0.00 · close_mosaic=10"
-                    .to_string(),
+                aug,
             )
         };
 
