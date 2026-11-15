@@ -200,22 +200,32 @@ def query_gpu_telemetry():
                     pass
                 used_bytes = 0
                 total_bytes = 0
+                if hasattr(torch.xpu, "mem_get_info"):
+                    try:
+                        free_b, dev_total_b = torch.xpu.mem_get_info(idx)
+                        if dev_total_b and dev_total_b > 0:
+                            total_bytes = int(dev_total_b)
+                            used_bytes = max(0, total_bytes - int(free_b))
+                    except Exception:
+                        pass
                 try:
-                    used_bytes = max(
+                    proc_used = max(
                         int(torch.xpu.memory_reserved(idx)),
                         int(torch.xpu.memory_allocated(idx)),
                     )
+                    used_bytes = max(used_bytes, proc_used)
                 except Exception:
                     pass
-                try:
-                    props = torch.xpu.get_device_properties(idx)
-                    total_bytes = int(
-                        getattr(props, "total_memory", 0)
-                        or getattr(props, "max_mem_alloc_size", 0)
-                        or 0
-                    )
-                except Exception:
-                    pass
+                if total_bytes <= 0:
+                    try:
+                        props = torch.xpu.get_device_properties(idx)
+                        total_bytes = int(
+                            getattr(props, "total_memory", 0)
+                            or getattr(props, "max_mem_alloc_size", 0)
+                            or 0
+                        )
+                    except Exception:
+                        pass
                 used_gb = round(used_bytes / (1024.0 ** 3), 3)
                 total_gb = round(total_bytes / (1024.0 ** 3), 3)
                 util = round((used_gb / total_gb) * 100.0, 1) if total_gb > 0 else 0.0
@@ -523,8 +533,8 @@ def on_train_epoch_start(trainer):
     configured_epochs = _RUNTIME.get("configured_epochs", 1)
     state["step"] = 0
     state["last_step_time"] = time.time()
-    epoch = int(getattr(trainer, "epoch", 0)) + 1
-    total_epochs = int(getattr(trainer, "epochs", configured_epochs))
+    total_epochs = max(1, int(getattr(trainer, "epochs", configured_epochs)))
+    epoch = min(total_epochs, int(getattr(trainer, "epoch", 0)) + 1)
     progress_tracker.start_epoch(epoch, total_epochs)
     stop_file = _resolve_stop_file(trainer)
     if ctrl_state is not None:
@@ -561,8 +571,8 @@ def on_train_batch_end(trainer):
         total_steps = step
     total_steps = max(step, int(total_steps))
 
-    epoch = int(getattr(trainer, "epoch", 0)) + 1
-    total_epochs = int(getattr(trainer, "epochs", 1))
+    total_epochs = max(1, int(getattr(trainer, "epochs", 1)))
+    epoch = min(total_epochs, int(getattr(trainer, "epoch", 0)) + 1)
     batch_sz = int(getattr(trainer, "batch_size", configured_batch) or configured_batch)
     sps = batch_sz / dt
     state["last_sps"] = sps
@@ -625,8 +635,8 @@ def on_fit_epoch_end(trainer):
     state, progress_tracker = _ensure_runtime_for_trainer(trainer)
     cli_spinner = _RUNTIME.get("cli_spinner")
 
-    epoch = int(getattr(trainer, "epoch", 0)) + 1
-    total_epochs = int(getattr(trainer, "epochs", 1))
+    total_epochs = max(1, int(getattr(trainer, "epochs", 1)))
+    epoch = min(total_epochs, int(getattr(trainer, "epoch", 0)) + 1)
     train_loader = getattr(trainer, "train_loader", None)
     try:
         total_steps = len(train_loader) if train_loader is not None else state["step"]

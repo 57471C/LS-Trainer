@@ -97,6 +97,31 @@ impl ArchChoice {
     }
 }
 
+const LAUNCHER_FIELD_COUNT: usize = 7;
+const DEVICE_PRESETS: [&str; 6] = ["auto", "xpu", "xpu:0", "xpu:0,1", "cuda", "cpu"];
+const WORKER_PRESETS: [&str; 6] = ["auto", "0", "1", "2", "4", "8"];
+
+fn discover_recent_dataset_path() -> String {
+    let candidates = [
+        "runs/detect/BB-Parts-v3/ls_trainer_config.json",
+        "runs/detect/test/ls_trainer_config.json",
+        "runs/detect/gui-test/ls_trainer_config.json",
+    ];
+    for rel in candidates {
+        if let Ok(raw) = std::fs::read_to_string(rel) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(ds) = val.get("dataset_path").and_then(|v| v.as_str()) {
+                    let trimmed = ds.trim();
+                    if !trimmed.is_empty() && std::path::Path::new(trimmed).exists() {
+                        return trimmed.to_string();
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
 #[derive(Debug, Clone)]
 struct CliConfig {
     interactive: bool,
@@ -108,8 +133,10 @@ struct CliConfig {
     device: String,
     imgsz: u32,
     workers: Option<u32>,
+    workers_input: String,
     run_name: String,
     focused_field: usize,
+    editing_field: bool,
     error_banner: Option<String>,
 }
 
@@ -118,21 +145,34 @@ impl Default for CliConfig {
         Self {
             interactive: true,
             arch: ArchChoice::Yolo,
-            dataset: String::new(),
+            dataset: discover_recent_dataset_path(),
             model: ArchChoice::Yolo.default_model().to_string(),
             epochs: "60".to_string(),
             batch: "4".to_string(),
             device: "auto".to_string(),
             imgsz: 960,
             workers: None,
+            workers_input: "auto".to_string(),
             run_name: "BB-Parts-v3".to_string(),
             focused_field: 0,
+            editing_field: false,
             error_banner: None,
         }
     }
 }
 
 impl CliConfig {
+    fn parse_workers(&self) -> Result<Option<u32>, String> {
+        let raw = self.workers_input.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+            return Ok(self.workers);
+        }
+        let parsed = raw
+            .parse::<u32>()
+            .map_err(|_| format!("Invalid workers value: '{raw}' (use a number or 'auto')"))?;
+        Ok(Some(parsed))
+    }
+
     fn to_training_request(&self) -> Result<TrainingRequest, String> {
         let dataset_trimmed = self.dataset.trim();
         if dataset_trimmed.is_empty() {
@@ -150,6 +190,7 @@ impl CliConfig {
             .parse::<u32>()
             .map_err(|_| format!("Invalid batch value: '{}'", self.batch))?
             .max(1);
+        let workers_val = self.parse_workers()?;
         let model_trimmed = if self.model.trim().is_empty() {
             self.arch.default_model().to_string()
         } else {
@@ -190,7 +231,7 @@ impl CliConfig {
             close_mosaic: 10,
             task,
             model_family: self.arch.as_family_str().to_string(),
-            workers: self.workers,
+            workers: workers_val,
         })
     }
 }
@@ -321,7 +362,13 @@ impl AppState {
         }
     }
 
-    fn apply_metrics(&mut self, metrics: TrainMetrics) {
+    fn apply_metrics(&mut self, mut metrics: TrainMetrics) {
+        if metrics.total_epochs > 0 && metrics.epoch > metrics.total_epochs {
+            metrics.epoch = metrics.total_epochs;
+        }
+        if metrics.total_steps > 0 && metrics.step > metrics.total_steps {
+            metrics.step = metrics.total_steps;
+        }
         self.step_counter += 1;
         let x = self.step_counter as f64;
 
@@ -722,7 +769,11 @@ fn push_softened_box_spans(
         let out_ch = mapped_border.unwrap_or(ch);
 
         if !cur.is_empty() && cur_is_border != is_border {
-            let st = if cur_is_border { border_style } else { text_style };
+            let st = if cur_is_border {
+                border_style
+            } else {
+                text_style
+            };
             spans.push(Span::styled(std::mem::take(&mut cur), st));
         }
         cur_is_border = is_border;
@@ -730,7 +781,11 @@ fn push_softened_box_spans(
     }
 
     if !cur.is_empty() {
-        let st = if cur_is_border { border_style } else { text_style };
+        let st = if cur_is_border {
+            border_style
+        } else {
+            text_style
+        };
         spans.push(Span::styled(cur, st));
     }
 }
@@ -738,13 +793,7 @@ fn push_softened_box_spans(
 /// Render a 1-row (or multi-row) progress bar where label characters covered by the bar
 /// are drawn in dark grey/black (`GAUGE_TEXT_COVERED`) and uncovered characters are drawn
 /// in crisp light text (`GAUGE_TEXT_UNCOVERED`).
-fn render_contrast_gauge(
-    frame: &mut Frame,
-    area: Rect,
-    ratio: f64,
-    label: &str,
-    bar_color: Color,
-) {
+fn render_contrast_gauge(frame: &mut Frame, area: Rect, ratio: f64, label: &str, bar_color: Color) {
     if area.is_empty() {
         return;
     }
@@ -762,10 +811,7 @@ fn render_contrast_gauge(
             } else {
                 GAUGE_TEXT_UNCOVERED
             };
-            buf[(x, y)]
-                .set_symbol(" ")
-                .set_fg(fg)
-                .set_bg(bg);
+            buf[(x, y)].set_symbol(" ").set_fg(fg).set_bg(bg);
         }
     }
 
@@ -1050,10 +1096,7 @@ fn render_center_chart(frame: &mut Frame, area: Rect, state: &AppState) {
     let mut min_y = 0.0_f64;
     let mut max_y = 1.0_f64;
 
-    let all_pts = train_pts
-        .iter()
-        .chain(val_pts.iter())
-        .chain(map_pts.iter());
+    let all_pts = train_pts.iter().chain(val_pts.iter()).chain(map_pts.iter());
 
     let mut first = true;
     for &(x, y) in all_pts {
@@ -1538,100 +1581,260 @@ fn render_bottom_log_and_footer(frame: &mut Frame, area: Rect, state: &AppState)
     );
 }
 
-fn render_setup_modal(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(12),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    render_top_gpu_strip(frame, chunks[0], state);
+
     let block = Block::default()
         .title(Span::styled(
-            " LS-Trainer TUI — Interactive Run Setup ",
+            " LS-Trainer TUI — Launch Menu ",
             Style::default()
-                .fg(Color::LightCyan)
+                .fg(TITLE_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(BORDER_SOFT));
 
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = block.inner(chunks[1]);
+    frame.render_widget(block, chunks[1]);
 
-    let s = &state.setup;
-    let fields: [(&str, String, &str); 7] = [
-        (
-            "Architecture",
-            format!("◀ {} ({}) ▶", s.arch.as_family_str(), s.arch.as_cli_str()),
-            "Use Left/Right arrows to switch yolo | rf-detr | rt-detr",
-        ),
-        (
-            "Dataset Path",
-            s.dataset.clone(),
-            "Path to YOLO dataset folder/archive or COCO export",
-        ),
-        (
-            "Model / Weights",
-            s.model.clone(),
-            "e.g. yolo11s.pt, rf-detr-medium, rtdetr-v2-r18, or checkpoint path",
-        ),
-        ("Epochs", s.epochs.clone(), "Total training epochs"),
-        ("Batch Size", s.batch.clone(), "Batch size per step"),
-        (
-            "Device",
-            s.device.clone(),
-            "auto, xpu, xpu:0, cuda, 0, or cpu",
-        ),
-        (
-            "[ Start Training ]",
-            "Press Enter to launch training".to_string(),
-            "Or press Esc to exit",
-        ),
-    ];
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "Use Up/Down/Tab to select a field, type to edit, and press Enter on [ Start Training ].",
-        Style::default().fg(Color::Gray),
-    )));
-    lines.push(Line::from(""));
-
-    for (idx, (label, val, hint)) in fields.iter().enumerate() {
-        let focused = s.focused_field == idx;
-        let prefix = if focused { " ▶ " } else { "   " };
-        let label_style = if focused {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        let val_style = if focused {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
+    if inner.height > 0 && inner.width > 2 {
+        let padded = Rect {
+            x: inner.x + 2,
+            y: inner.y + 1,
+            width: inner.width.saturating_sub(4),
+            height: inner.height.saturating_sub(1),
         };
 
+        let s = &state.setup;
+        let ds_display = if s.dataset.is_empty() && !s.editing_field {
+            "<enter dataset path>".to_string()
+        } else {
+            s.dataset.clone()
+        };
+        let workers_display = if s.workers_input.trim().is_empty() && !s.editing_field {
+            "auto".to_string()
+        } else {
+            s.workers_input.clone()
+        };
+
+        let fields: [(&str, String, &str, bool); 6] = [
+            (
+                "Architecture",
+                format!(
+                    "◀ {} ({}) · {} ▶",
+                    s.arch.as_family_str(),
+                    s.arch.as_cli_str(),
+                    s.model
+                ),
+                "Left/Right or Enter to switch yolo | rf-detr | rt-detr",
+                false,
+            ),
+            (
+                "Dataset Path",
+                ds_display,
+                "Enter to edit YOLO dataset folder/archive or COCO export path",
+                true,
+            ),
+            (
+                "Epochs",
+                s.epochs.clone(),
+                "Total training epochs (Enter to edit)",
+                true,
+            ),
+            (
+                "Batch Size",
+                s.batch.clone(),
+                "Batch size per training step (Enter to edit)",
+                true,
+            ),
+            (
+                "Device",
+                s.device.clone(),
+                "Left/Right to cycle (auto, xpu, xpu:0,1, cuda, cpu) or Enter to edit",
+                true,
+            ),
+            (
+                "Workers",
+                workers_display,
+                "Left/Right to cycle (auto, 0, 1, 2, 4, 8) or Enter to edit",
+                true,
+            ),
+        ];
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(vec![
-            Span::styled(prefix, label_style),
-            Span::styled(format!("{label:<18}: "), label_style),
-            Span::styled(format!(" {val} "), val_style),
-            Span::styled(format!("   ({hint})"), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Configure your training run below. Press ",
+                Style::default().fg(LABEL_MUTED),
+            ),
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(TITLE_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" to edit a field, or ", Style::default().fg(LABEL_MUTED)),
+            Span::styled(
+                "F2",
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " / Enter on Start to begin.",
+                Style::default().fg(LABEL_MUTED),
+            ),
         ]));
         lines.push(Line::from(""));
-    }
 
-    if let Some(ref err) = s.error_banner {
-        lines.push(Line::from(Span::styled(
-            format!(" ⚠ {err}"),
+        for (idx, (label, val, hint, editable)) in fields.iter().enumerate() {
+            let focused = s.focused_field == idx;
+            let is_editing = focused && s.editing_field && *editable;
+            let prefix = if focused { " ▶ " } else { "   " };
+            let label_style = if focused {
+                Style::default()
+                    .fg(TITLE_ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(LABEL_MUTED)
+            };
+            let val_style = if is_editing {
+                Style::default()
+                    .fg(GAUGE_TEXT_COVERED)
+                    .bg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if focused {
+                Style::default()
+                    .fg(GAUGE_TEXT_COVERED)
+                    .bg(BAR_GPU_TEAL)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White).bg(BAR_TRACK_BG)
+            };
+
+            let cursor = if is_editing { "▏" } else { "" };
+            let edit_tag = if is_editing { " [EDITING]" } else { "" };
+
+            lines.push(Line::from(vec![
+                Span::styled(prefix, label_style),
+                Span::styled(format!("{label:<16} "), label_style),
+                Span::styled(format!(" {val}{cursor} "), val_style),
+                Span::styled(
+                    edit_tag.to_string(),
+                    Style::default()
+                        .fg(Color::LightYellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("   {hint}"), Style::default().fg(TABLE_BORDER_SOFT)),
+            ]));
+            lines.push(Line::from(""));
+        }
+
+        let start_focused = s.focused_field == 6;
+        let start_prefix = if start_focused { " ▶ " } else { "   " };
+        let start_btn_style = if start_focused {
             Style::default()
-                .fg(Color::LightRed)
-                .add_modifier(Modifier::BOLD),
-        )));
+                .fg(GAUGE_TEXT_COVERED)
+                .bg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::LightGreen)
+                .bg(BAR_TRACK_BG)
+                .add_modifier(Modifier::BOLD)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                start_prefix,
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   [ Start Training (Enter / F2) ]   ", start_btn_style),
+            Span::styled(
+                "   Launch training and switch to live TUI",
+                Style::default().fg(LABEL_MUTED),
+            ),
+        ]));
+
+        if let Some(ref err) = s.error_banner {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("   ⚠ {err}"),
+                Style::default()
+                    .fg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+
+        frame.render_widget(Paragraph::new(lines), padded);
     }
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    let footer = Line::from(vec![
+        Span::styled(
+            " [↑/↓/Tab] ",
+            Style::default()
+                .fg(GAUGE_TEXT_COVERED)
+                .bg(BAR_GPU_TEAL)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Select Field  ", Style::default().fg(Color::White)),
+        Span::styled(
+            " [Enter] ",
+            Style::default()
+                .fg(GAUGE_TEXT_COVERED)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Edit / Confirm  ", Style::default().fg(Color::White)),
+        Span::styled(
+            " [←/→] ",
+            Style::default()
+                .fg(GAUGE_TEXT_COVERED)
+                .bg(BAR_STEP_BLUE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Cycle Option  ", Style::default().fg(Color::White)),
+        Span::styled(
+            " [F2] ",
+            Style::default()
+                .fg(GAUGE_TEXT_COVERED)
+                .bg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Start Training  ", Style::default().fg(Color::White)),
+        Span::styled(
+            " [Esc] ",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Quit ", Style::default().fg(Color::White)),
+    ]);
+
+    frame.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        chunks[2],
+    );
 }
 
 fn draw_ui(frame: &mut Frame, state: &AppState) {
+    if state.mode == UiMode::Setup {
+        render_launcher_screen(frame, frame.area(), state);
+        return;
+    }
+
     let root_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1643,29 +1846,34 @@ fn draw_ui(frame: &mut Frame, state: &AppState) {
 
     render_top_gpu_strip(frame, root_chunks[0], state);
 
-    if state.mode == UiMode::Setup {
-        render_setup_modal(frame, root_chunks[1], state);
-    } else {
-        let center_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-            .split(root_chunks[1]);
+    let center_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+        .split(root_chunks[1]);
 
-        render_center_chart(frame, center_chunks[0], state);
-        render_run_summary(frame, center_chunks[1], state);
-    }
+    render_center_chart(frame, center_chunks[0], state);
+    render_run_summary(frame, center_chunks[1], state);
 
     render_bottom_log_and_footer(frame, root_chunks[2], state);
 }
 
 fn parse_cli_args() -> Result<Option<CliConfig>, String> {
-    let args: Vec<String> = env::args().skip(1).collect();
+    parse_cli_args_from(env::args().skip(1))
+}
+
+fn parse_cli_args_from<I, S>(args_iter: I) -> Result<Option<CliConfig>, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let args: Vec<String> = args_iter.into_iter().map(Into::into).collect();
     if args.is_empty() {
         return Ok(Some(CliConfig::default()));
     }
 
     let mut cfg = CliConfig {
         interactive: false,
+        dataset: String::new(),
         ..CliConfig::default()
     };
     let mut explicit_model = false;
@@ -1745,22 +1953,37 @@ fn parse_cli_args() -> Result<Option<CliConfig>, String> {
                     .parse::<u32>()
                     .map_err(|_| format!("Invalid --workers value '{raw}'"))?;
                 cfg.workers = Some(parsed);
+                cfg.workers_input = parsed.to_string();
             }
             "--run-name" => {
                 cfg.run_name = next_val()?;
             }
             other => {
-                return Err(format!("Unknown argument '{other}'. Run with --help for usage."));
+                return Err(format!(
+                    "Unknown argument '{other}'. Run with --help for usage."
+                ));
             }
         }
         i += 1;
     }
 
-    if cfg.dataset.trim().is_empty() {
-        cfg.interactive = true;
-    }
-
     Ok(Some(cfg))
+}
+
+fn cycle_preset(current: &str, presets: &[&str], forward: bool) -> String {
+    let cur_trimmed = current.trim();
+    let idx = presets
+        .iter()
+        .position(|p| p.eq_ignore_ascii_case(cur_trimmed))
+        .unwrap_or(0);
+    let next_idx = if forward {
+        (idx + 1) % presets.len()
+    } else if idx == 0 {
+        presets.len() - 1
+    } else {
+        idx - 1
+    };
+    presets[next_idx].to_string()
 }
 
 fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
@@ -1768,42 +1991,93 @@ fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
     if let Ok(mut guard) = state.lock() {
         let focused = guard.setup.focused_field;
         match code {
-            KeyCode::Esc => return true,
+            KeyCode::Esc => {
+                if guard.setup.editing_field {
+                    guard.setup.editing_field = false;
+                } else {
+                    return true;
+                }
+            }
+            KeyCode::F(2) => match guard.setup.to_training_request() {
+                Ok(req) => {
+                    guard.setup.editing_field = false;
+                    guard.setup.error_banner = None;
+                    launch_req = Some(req);
+                }
+                Err(err) => {
+                    guard.setup.error_banner = Some(err);
+                }
+            },
             KeyCode::Tab | KeyCode::Down => {
-                guard.setup.focused_field = (focused + 1) % 7;
+                guard.setup.editing_field = false;
+                guard.setup.focused_field = (focused + 1) % LAUNCHER_FIELD_COUNT;
             }
             KeyCode::BackTab | KeyCode::Up => {
-                guard.setup.focused_field = if focused == 0 { 6 } else { focused - 1 };
+                guard.setup.editing_field = false;
+                guard.setup.focused_field = if focused == 0 {
+                    LAUNCHER_FIELD_COUNT - 1
+                } else {
+                    focused - 1
+                };
             }
-            KeyCode::Left if focused == 0 => {
-                let prev_default = guard.setup.arch.default_model();
-                guard.setup.arch = guard.setup.arch.prev();
-                if guard.setup.model == prev_default {
-                    guard.setup.model = guard.setup.arch.default_model().to_string();
+            KeyCode::Left => match focused {
+                0 => {
+                    let prev_default = guard.setup.arch.default_model();
+                    guard.setup.arch = guard.setup.arch.prev();
+                    if guard.setup.model == prev_default {
+                        guard.setup.model = guard.setup.arch.default_model().to_string();
+                    }
                 }
-            }
-            KeyCode::Right if focused == 0 => {
-                let prev_default = guard.setup.arch.default_model();
-                guard.setup.arch = guard.setup.arch.next();
-                if guard.setup.model == prev_default {
-                    guard.setup.model = guard.setup.arch.default_model().to_string();
+                4 if !guard.setup.editing_field => {
+                    guard.setup.device = cycle_preset(&guard.setup.device, &DEVICE_PRESETS, false);
                 }
-            }
+                5 if !guard.setup.editing_field => {
+                    guard.setup.workers_input =
+                        cycle_preset(&guard.setup.workers_input, &WORKER_PRESETS, false);
+                }
+                _ => {}
+            },
+            KeyCode::Right => match focused {
+                0 => {
+                    let prev_default = guard.setup.arch.default_model();
+                    guard.setup.arch = guard.setup.arch.next();
+                    if guard.setup.model == prev_default {
+                        guard.setup.model = guard.setup.arch.default_model().to_string();
+                    }
+                }
+                4 if !guard.setup.editing_field => {
+                    guard.setup.device = cycle_preset(&guard.setup.device, &DEVICE_PRESETS, true);
+                }
+                5 if !guard.setup.editing_field => {
+                    guard.setup.workers_input =
+                        cycle_preset(&guard.setup.workers_input, &WORKER_PRESETS, true);
+                }
+                _ => {}
+            },
             KeyCode::Backspace => match focused {
                 1 => {
+                    guard.setup.editing_field = true;
                     guard.setup.dataset.pop();
                 }
                 2 => {
-                    guard.setup.model.pop();
-                }
-                3 => {
+                    guard.setup.editing_field = true;
                     guard.setup.epochs.pop();
                 }
-                4 => {
+                3 => {
+                    guard.setup.editing_field = true;
                     guard.setup.batch.pop();
                 }
-                5 => {
+                4 => {
+                    guard.setup.editing_field = true;
                     guard.setup.device.pop();
+                }
+                5 => {
+                    guard.setup.editing_field = true;
+                    if guard.setup.workers_input.eq_ignore_ascii_case("auto") {
+                        guard.setup.workers_input.clear();
+                    } else {
+                        guard.setup.workers_input.pop();
+                    }
                 }
                 _ => {}
             },
@@ -1815,17 +2089,40 @@ fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
                         guard.setup.model = guard.setup.arch.default_model().to_string();
                     }
                 }
-                1 => guard.setup.dataset.push(c),
-                2 => guard.setup.model.push(c),
-                3 if c.is_ascii_digit() => guard.setup.epochs.push(c),
-                4 if c.is_ascii_digit() => guard.setup.batch.push(c),
-                5 => guard.setup.device.push(c),
+                1 => {
+                    guard.setup.editing_field = true;
+                    guard.setup.dataset.push(c);
+                }
+                2 if c.is_ascii_digit() => {
+                    guard.setup.editing_field = true;
+                    guard.setup.epochs.push(c);
+                }
+                3 if c.is_ascii_digit() => {
+                    guard.setup.editing_field = true;
+                    guard.setup.batch.push(c);
+                }
+                4 => {
+                    guard.setup.editing_field = true;
+                    guard.setup.device.push(c);
+                }
+                5 => {
+                    guard.setup.editing_field = true;
+                    if c.is_ascii_digit() {
+                        if guard.setup.workers_input.eq_ignore_ascii_case("auto") {
+                            guard.setup.workers_input.clear();
+                        }
+                        guard.setup.workers_input.push(c);
+                    } else if c.eq_ignore_ascii_case(&'a') {
+                        guard.setup.workers_input = "auto".to_string();
+                    }
+                }
                 _ => {}
             },
             KeyCode::Enter => {
                 if focused == 6 {
                     match guard.setup.to_training_request() {
                         Ok(req) => {
+                            guard.setup.editing_field = false;
                             guard.setup.error_banner = None;
                             launch_req = Some(req);
                         }
@@ -1833,8 +2130,20 @@ fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
                             guard.setup.error_banner = Some(err);
                         }
                     }
+                } else if focused == 0 {
+                    let prev_default = guard.setup.arch.default_model();
+                    guard.setup.arch = guard.setup.arch.next();
+                    if guard.setup.model == prev_default {
+                        guard.setup.model = guard.setup.arch.default_model().to_string();
+                    }
                 } else {
-                    guard.setup.focused_field = (focused + 1) % 7;
+                    if guard.setup.editing_field
+                        && focused == 5
+                        && guard.setup.workers_input.trim().is_empty()
+                    {
+                        guard.setup.workers_input = "auto".to_string();
+                    }
+                    guard.setup.editing_field = !guard.setup.editing_field;
                 }
             }
             _ => {}
@@ -1933,10 +2242,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
 
-                let mode = state
-                    .lock()
-                    .map(|g| g.mode)
-                    .unwrap_or(UiMode::Training);
+                let mode = state.lock().map(|g| g.mode).unwrap_or(UiMode::Training);
 
                 if mode == UiMode::Setup {
                     if handle_setup_key(&state, key.code) {
@@ -2164,7 +2470,10 @@ mod tests {
                 }
             }
         }
-        assert!(saw_epoch_teal, "Expected Epoch progress bar to use BAR_EPOCH_TEAL");
+        assert!(
+            saw_epoch_teal,
+            "Expected Epoch progress bar to use BAR_EPOCH_TEAL"
+        );
     }
 
     #[test]
@@ -2175,6 +2484,299 @@ mod tests {
         assert_eq!(rendered, "╭──────────────┬───────╮");
         for span in &styled.spans {
             assert_eq!(span.style.fg, Some(TABLE_BORDER_SOFT));
+        }
+    }
+
+    #[test]
+    fn no_flags_opens_fullscreen_launcher_with_all_fields() {
+        let empty_args: Vec<&str> = Vec::new();
+        let cfg = parse_cli_args_from(empty_args)
+            .expect("parse empty args")
+            .expect("some config");
+        assert!(
+            cfg.interactive,
+            "No flags must open the interactive launcher"
+        );
+
+        let state = Arc::new(Mutex::new(AppState::new(cfg)));
+        {
+            let guard = state.lock().unwrap();
+            assert_eq!(guard.mode, UiMode::Setup);
+
+            let backend = TestBackend::new(120, 32);
+            let mut terminal = Terminal::new(backend).expect("create test terminal");
+            terminal
+                .draw(|frame| draw_ui(frame, &guard))
+                .expect("draw launcher");
+
+            let buf = terminal.backend().buffer();
+            let mut screen_text = String::new();
+            for y in 0..32 {
+                for x in 0..120 {
+                    screen_text.push_str(buf[(x, y)].symbol());
+                }
+                screen_text.push('\n');
+            }
+            assert!(screen_text.contains("LS-Trainer TUI — Launch Menu"));
+            assert!(screen_text.contains("Architecture"));
+            assert!(screen_text.contains("Dataset Path"));
+            assert!(screen_text.contains("Epochs"));
+            assert!(screen_text.contains("Batch Size"));
+            assert!(screen_text.contains("Device"));
+            assert!(screen_text.contains("Workers"));
+            assert!(screen_text.contains("[ Start Training (Enter / F2) ]"));
+        }
+
+        // Navigate and edit fields in the launcher:
+        // Field 0: Architecture -> Right arrow switches YOLO -> RF-DETR
+        handle_setup_key(&state, KeyCode::Right);
+        assert_eq!(state.lock().unwrap().setup.arch, ArchChoice::RfDetr);
+        handle_setup_key(&state, KeyCode::Left);
+        assert_eq!(state.lock().unwrap().setup.arch, ArchChoice::Yolo);
+
+        // Down to Field 1 (Dataset Path), Enter to edit, set dataset path, Enter to confirm
+        handle_setup_key(&state, KeyCode::Down);
+        assert_eq!(state.lock().unwrap().setup.focused_field, 1);
+        handle_setup_key(&state, KeyCode::Enter);
+        assert!(state.lock().unwrap().setup.editing_field);
+        state.lock().unwrap().setup.dataset =
+            "C:\\Users\\Terry.minett\\Downloads\\PAK-BB_yolo.tar".to_string();
+        handle_setup_key(&state, KeyCode::Enter);
+        assert!(!state.lock().unwrap().setup.editing_field);
+
+        // Down to Field 2 (Epochs), edit to "1"
+        handle_setup_key(&state, KeyCode::Down);
+        assert_eq!(state.lock().unwrap().setup.focused_field, 2);
+        handle_setup_key(&state, KeyCode::Backspace);
+        handle_setup_key(&state, KeyCode::Backspace);
+        handle_setup_key(&state, KeyCode::Char('1'));
+        handle_setup_key(&state, KeyCode::Enter);
+        assert_eq!(state.lock().unwrap().setup.epochs, "1");
+
+        // Down to Field 3 (Batch Size), Field 4 (Device), Field 5 (Workers)
+        handle_setup_key(&state, KeyCode::Down); // 3: Batch
+        handle_setup_key(&state, KeyCode::Down); // 4: Device
+        handle_setup_key(&state, KeyCode::Right); // auto -> xpu
+        assert_eq!(state.lock().unwrap().setup.device, "xpu");
+
+        handle_setup_key(&state, KeyCode::Down); // 5: Workers
+        handle_setup_key(&state, KeyCode::Right); // auto -> 0
+        assert_eq!(state.lock().unwrap().setup.workers_input, "0");
+
+        let req = state
+            .lock()
+            .unwrap()
+            .setup
+            .to_training_request()
+            .expect("valid training request from launcher");
+        assert_eq!(req.model_family, "YOLO");
+        assert_eq!(req.epochs, 1);
+        assert_eq!(req.batch, 4);
+        assert_eq!(req.device, "xpu");
+        assert_eq!(req.workers, Some(0));
+    }
+
+    #[test]
+    fn with_flags_runs_immediately_without_launcher() {
+        let args = vec![
+            "--arch",
+            "yolo",
+            "--dataset",
+            "C:\\Users\\Terry.minett\\Downloads\\PAK-BB_yolo.tar",
+            "--epochs",
+            "1",
+            "--batch",
+            "4",
+            "--device",
+            "xpu",
+            "--workers",
+            "0",
+        ];
+        let cfg = parse_cli_args_from(args)
+            .expect("parse flags")
+            .expect("some config");
+        assert!(
+            !cfg.interactive,
+            "Providing training flags must start immediately without launcher"
+        );
+        let state = AppState::new(cfg.clone());
+        assert_eq!(state.mode, UiMode::Training);
+        let req = cfg.to_training_request().expect("valid request");
+        assert_eq!(req.epochs, 1);
+        assert_eq!(req.workers, Some(0));
+    }
+
+    fn write_tiny_bmp_64x64(path: &std::path::Path) {
+        let width: u32 = 64;
+        let height: u32 = 64;
+        let row_bytes = width * 3;
+        let pixel_bytes = row_bytes * height;
+        let file_size = 54 + pixel_bytes;
+
+        let mut data = Vec::with_capacity(file_size as usize);
+        // BMP Header (14 bytes)
+        data.extend_from_slice(b"BM");
+        data.extend_from_slice(&file_size.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&54u32.to_le_bytes());
+        // DIB Header (BITMAPINFOHEADER, 40 bytes)
+        data.extend_from_slice(&40u32.to_le_bytes());
+        data.extend_from_slice(&(width as i32).to_le_bytes());
+        data.extend_from_slice(&(height as i32).to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes()); // planes
+        data.extend_from_slice(&24u16.to_le_bytes()); // bpp
+        data.extend_from_slice(&0u32.to_le_bytes()); // compression
+        data.extend_from_slice(&pixel_bytes.to_le_bytes());
+        data.extend_from_slice(&2835u32.to_le_bytes());
+        data.extend_from_slice(&2835u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+
+        for y in 0..height {
+            for x in 0..width {
+                let b = ((x * 4) & 0xFF) as u8;
+                let g = ((y * 4) & 0xFF) as u8;
+                let r = 128u8;
+                data.extend_from_slice(&[b, g, r]);
+            }
+        }
+        std::fs::write(path, data).expect("write tiny bmp");
+    }
+
+    #[test]
+    fn short_real_run_from_launcher_verifies_tui_rendering() {
+        let tmp_ds = std::env::temp_dir().join("ls_trainer_tui_tiny_ds");
+        let _ = std::fs::remove_dir_all(&tmp_ds);
+        let img_dir = tmp_ds.join("images").join("train");
+        let lbl_dir = tmp_ds.join("labels").join("train");
+        std::fs::create_dir_all(&img_dir).expect("create train images dir");
+        std::fs::create_dir_all(&lbl_dir).expect("create train labels dir");
+
+        for i in 0..2 {
+            write_tiny_bmp_64x64(&img_dir.join(format!("sample_{i}.bmp")));
+            std::fs::write(
+                lbl_dir.join(format!("sample_{i}.txt")),
+                "0 0.5 0.5 0.4 0.4\n",
+            )
+            .expect("write label");
+        }
+        let yaml_content = format!(
+            "path: {}\ntrain: images/train\nval: images/train\nnames:\n  0: part\n",
+            tmp_ds.to_string_lossy().replace('\\', "/")
+        );
+        std::fs::write(tmp_ds.join("data.yaml"), yaml_content).expect("write data.yaml");
+
+        // 1. Launch with no flags -> starts in Setup (Launcher) mode
+        let empty_args: Vec<&str> = Vec::new();
+        let cfg = parse_cli_args_from(empty_args)
+            .expect("parse empty args")
+            .expect("some config");
+        assert!(cfg.interactive);
+
+        let state = Arc::new(Mutex::new(AppState::new(cfg)));
+        assert_eq!(state.lock().unwrap().mode, UiMode::Setup);
+
+        // Configure 1-epoch fast run in launcher and press F2 to start
+        {
+            let mut guard = state.lock().unwrap();
+            guard.setup.arch = ArchChoice::Yolo;
+            guard.setup.model = "yolo11n.pt".to_string();
+            guard.setup.dataset = tmp_ds.to_string_lossy().to_string();
+            guard.setup.epochs = "1".to_string();
+            guard.setup.batch = "2".to_string();
+            guard.setup.imgsz = 64;
+            guard.setup.device = "cpu".to_string();
+            guard.setup.workers_input = "0".to_string();
+            guard.setup.run_name = "tui-short-verify".to_string();
+        }
+
+        // Press F2 in launcher -> transitions to UiMode::Training and spawns run_training
+        let should_quit = handle_setup_key(&state, KeyCode::F(2));
+        assert!(!should_quit);
+        assert_eq!(state.lock().unwrap().mode, UiMode::Training);
+        assert!(state.lock().unwrap().is_running);
+
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        let deadline = Instant::now() + Duration::from_secs(35);
+        let mut saw_live_metrics = false;
+        while Instant::now() < deadline {
+            let done = {
+                let mut guard = state.lock().unwrap();
+                if guard.is_running {
+                    guard.spinner_tick = guard.spinner_tick.wrapping_add(1);
+                }
+                terminal
+                    .draw(|frame| draw_ui(frame, &guard))
+                    .expect("draw_ui during live run");
+                if guard.step_counter > 0 {
+                    saw_live_metrics = true;
+                }
+                !guard.is_running && guard.exit_code.is_some()
+            };
+            if done {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let guard = state.lock().unwrap();
+        if guard.exit_code != Some(0) {
+            for l in &guard.logs {
+                println!("LOG: {l}");
+            }
+            force_kill_active_child();
+        }
+        assert_eq!(
+            guard.exit_code,
+            Some(0),
+            "Expected short training run to exit with code 0; status={}",
+            guard.status_line
+        );
+        assert!(
+            saw_live_metrics,
+            "Expected live @@LS_METRICS@@ updates during run"
+        );
+        assert_eq!(guard.latest_metrics.epoch, 1);
+
+        terminal
+            .draw(|frame| draw_ui(frame, &guard))
+            .expect("final draw_ui");
+        let buf = terminal.backend().buffer();
+
+        // Confirm epoch bar uses BAR_EPOCH_TEAL and never LightMagenta, and VRAM text is readable
+        let mut saw_epoch_teal = false;
+        let mut saw_vram_bar = false;
+        for y in 0..32 {
+            for x in 0..120 {
+                let cell = &buf[(x, y)];
+                assert_ne!(cell.bg, Color::LightMagenta);
+                if cell.bg == BAR_EPOCH_TEAL {
+                    saw_epoch_teal = true;
+                }
+                if y == 1 && cell.bg == BAR_GPU_TEAL && cell.symbol() != " " {
+                    assert_eq!(cell.fg, GAUGE_TEXT_COVERED);
+                    saw_vram_bar = true;
+                }
+            }
+        }
+        assert!(saw_epoch_teal);
+        assert!(
+            !guard.gpus.is_empty() || saw_vram_bar,
+            "Expected GPU telemetry during XPU training run"
+        );
+        let _ = std::fs::remove_dir_all(&tmp_ds);
+        if let Ok(entries) = std::fs::read_dir("runs/detect") {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("tui-short-verify")
+                {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
         }
     }
 }
