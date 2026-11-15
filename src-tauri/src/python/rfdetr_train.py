@@ -1159,6 +1159,16 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()
     try:
         main()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
+    except SystemExit as exc:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+        os._exit(code)
     except Exception as exc:
         traceback.print_exc()
-        sys.exit(1)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)

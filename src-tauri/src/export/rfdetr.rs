@@ -3,25 +3,25 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use tauri::ipc::Channel;
 
 use crate::hardware::is_cuda_available;
 use crate::models::{ExportRequest, ExportResponse, default_export_imgsz};
 use crate::process::{
-    TauriChannelSink, TrainingEventSink, get_venv_python, hide_console_window, stream_child_output,
-    to_display_path,
+    TrainingEventSink, get_venv_python, hide_console_window, stream_child_output, to_display_path,
 };
-use crate::rfdetr::{ensure_rfdetr_installed, resolve_rfdetr_class_and_pretrain, snap_rfdetr_resolution};
+use crate::rfdetr::{
+    ensure_rfdetr_installed, resolve_rfdetr_class_and_pretrain, snap_rfdetr_resolution,
+};
+use crate::training::{register_child_pid, unregister_child_pid};
 
 pub(crate) async fn export_rfdetr_to_onnx(
     project_root: &Path,
     results_path: &Path,
     checkpoint_path: &Path,
     request: &ExportRequest,
-    on_log: &Channel<String>,
+    sink: &Arc<dyn TrainingEventSink>,
 ) -> Result<ExportResponse, String> {
-    let sink: Arc<dyn TrainingEventSink> = Arc::new(TauriChannelSink::new(on_log.clone()));
-    ensure_rfdetr_installed(project_root, &sink);
+    ensure_rfdetr_installed(project_root, sink);
 
     let output_dir = if results_path.is_dir() {
         results_path.to_path_buf()
@@ -63,10 +63,10 @@ pub(crate) async fn export_rfdetr_to_onnx(
     };
 
     let ckpt_display = checkpoint_path.to_string_lossy().replace('\\', "/");
-    let _ = on_log.send(format!(
+    sink.on_log(format!(
         "[LS-Trainer] Found RF-DETR checkpoint: {ckpt_display}"
     ));
-    let _ = on_log.send(format!(
+    sink.on_log(format!(
         "[LS-Trainer] Exporting {rfdetr_class} to ONNX (shape=({export_res}, {export_res}), dynamic={}, simplify={})...",
         request.dynamic, request.simplify
     ));
@@ -111,19 +111,26 @@ pub(crate) async fn export_rfdetr_to_onnx(
 
     match cmd.spawn() {
         Ok(mut child) => {
-            stream_child_output(&mut child, &sink);
+            register_child_pid(child.id());
+            let sink_stream = Arc::clone(sink);
+            let wait_res = tauri::async_runtime::spawn_blocking(move || {
+                stream_child_output(&mut child, &sink_stream);
+                child.wait()
+            })
+            .await
+            .map_err(|e| format!("RF-DETR export task join failed: {e}"))?;
+            unregister_child_pid();
 
-            let status = child
-                .wait()
+            let status = wait_res
                 .map_err(|e| format!("Failed while waiting for RF-DETR ONNX export: {e}"))?;
 
             let expected_onnx = output_dir.join("best.onnx");
             let onnx_str = to_display_path(&expected_onnx);
             if status.success() && expected_onnx.is_file() {
-                let _ = on_log.send(format!(
+                sink.on_log(format!(
                     "[LS-Trainer] ONNX export completed successfully! File: {onnx_str}"
                 ));
-                let _ = on_log.send(
+                sink.on_log(
                     "[LS-Trainer] Note: This model is optimized and ready for inference in LS-Vision."
                         .to_string(),
                 );
@@ -137,7 +144,7 @@ pub(crate) async fn export_rfdetr_to_onnx(
                     "RF-DETR ONNX export failed with status code: {:?}",
                     status.code()
                 );
-                let _ = on_log.send(format!("[LS-Trainer Error] {err_msg}"));
+                sink.on_log(format!("[LS-Trainer Error] {err_msg}"));
                 Ok(ExportResponse {
                     success: false,
                     onnx_path: String::new(),

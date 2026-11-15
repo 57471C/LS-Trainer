@@ -3,21 +3,20 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use tauri::ipc::Channel;
 
 use crate::export::embed_onnx_model_type_metadata;
 use crate::models::{ExportRequest, ExportResponse, default_export_imgsz};
 use crate::process::{
-    TauriChannelSink, TrainingEventSink, hide_console_window, stream_child_output, to_display_path,
-    venv_yolo_path,
+    TrainingEventSink, hide_console_window, stream_child_output, to_display_path, venv_yolo_path,
 };
+use crate::training::{register_child_pid, unregister_child_pid};
 
-/// Ultralytics YOLO ONNX export path. Dispatched from `export_to_onnx`.
+/// Ultralytics YOLO ONNX export path. Dispatched from `export_to_onnx` / `run_export_to_onnx`.
 pub(crate) async fn export_yolo_to_onnx(
     project_root: PathBuf,
     results_path: PathBuf,
     request: ExportRequest,
-    on_log: Channel<String>,
+    sink: Arc<dyn TrainingEventSink>,
 ) -> Result<ExportResponse, String> {
     // Look for best.pt in weights/best.pt, best.pt, or recursively
     let candidate_weights = results_path.join("weights").join("best.pt");
@@ -54,14 +53,14 @@ pub(crate) async fn export_yolo_to_onnx(
                     "Checkpoint 'best.pt' not found in '{}' (checked 'weights/best.pt' and direct directory).",
                     results_path.display()
                 );
-                let _ = on_log.send(format!("[LS-Trainer Error] {err_msg}"));
+                sink.on_log(format!("[LS-Trainer Error] {err_msg}"));
                 return Err(err_msg);
             }
         }
     };
 
     let best_pt_str = best_pt.to_string_lossy().replace('\\', "/");
-    let _ = on_log.send(format!("[LS-Trainer] Found checkpoint: {best_pt_str}"));
+    sink.on_log(format!("[LS-Trainer] Found checkpoint: {best_pt_str}"));
 
     let export_imgsz = if request.imgsz == 0 {
         default_export_imgsz()
@@ -70,7 +69,7 @@ pub(crate) async fn export_yolo_to_onnx(
     };
     let dynamic_flag = if request.dynamic { "True" } else { "False" };
     let simplify_flag = if request.simplify { "True" } else { "False" };
-    let _ = on_log.send(format!(
+    sink.on_log(format!(
         "[LS-Trainer] model.export(format=\"onnx\", imgsz={export_imgsz}, dynamic={dynamic_flag}, simplify={simplify_flag})"
     ));
 
@@ -90,7 +89,7 @@ pub(crate) async fn export_yolo_to_onnx(
     ];
 
     let (mut cmd, exact_command) = if expected_venv_yolo.is_file() {
-        let _ = on_log.send(format!(
+        sink.on_log(format!(
             "[LS-Trainer] Using local venv YOLO executable: {}",
             expected_venv_yolo.display()
         ));
@@ -105,7 +104,7 @@ pub(crate) async fn export_yolo_to_onnx(
 
         (c, cmd_str)
     } else {
-        let _ = on_log.send(format!(
+        sink.on_log(format!(
             "[LS-Trainer] Warning: Local .venv executable not found at '{}'. Falling back to system 'yolo'.",
             expected_venv_yolo.display()
         ));
@@ -132,7 +131,7 @@ pub(crate) async fn export_yolo_to_onnx(
         (c, cmd_str)
     };
 
-    let _ = on_log.send(format!("[LS-Trainer] Executing: {exact_command}"));
+    sink.on_log(format!("[LS-Trainer] Executing: {exact_command}"));
 
     let parent_dir = best_pt.parent().unwrap_or(&results_path);
     cmd.current_dir(parent_dir);
@@ -145,15 +144,20 @@ pub(crate) async fn export_yolo_to_onnx(
 
     match cmd.spawn() {
         Ok(mut child) => {
-            let sink: Arc<dyn TrainingEventSink> = Arc::new(TauriChannelSink::new(on_log.clone()));
-            stream_child_output(&mut child, &sink);
+            register_child_pid(child.id());
+            let sink_stream = Arc::clone(&sink);
+            let wait_res = tauri::async_runtime::spawn_blocking(move || {
+                stream_child_output(&mut child, &sink_stream);
+                child.wait()
+            })
+            .await
+            .map_err(|e| format!("Export task join failed: {e}"))?;
+            unregister_child_pid();
 
-            let status = child
-                .wait()
-                .map_err(|e| format!("Failed while waiting for export process: {e}"))?;
+            let status =
+                wait_res.map_err(|e| format!("Failed while waiting for export process: {e}"))?;
 
             let expected_onnx = best_pt.with_extension("onnx");
-            let onnx_str = to_display_path(&expected_onnx);
 
             if status.success() {
                 embed_onnx_model_type_metadata(
@@ -161,12 +165,26 @@ pub(crate) async fn export_yolo_to_onnx(
                     &expected_onnx,
                     "yolo",
                     "YOLO",
-                    &on_log,
+                    &sink,
                 );
-                let _ = on_log.send(format!(
+                let final_onnx = if results_path.is_dir() {
+                    let run_dir_onnx = results_path.join("best.onnx");
+                    if expected_onnx != run_dir_onnx && expected_onnx.is_file() {
+                        let _ = std::fs::copy(&expected_onnx, &run_dir_onnx);
+                    }
+                    if run_dir_onnx.is_file() {
+                        run_dir_onnx
+                    } else {
+                        expected_onnx
+                    }
+                } else {
+                    expected_onnx
+                };
+                let onnx_str = to_display_path(&final_onnx);
+                sink.on_log(format!(
                     "[LS-Trainer] ONNX export completed successfully! File: {onnx_str}"
                 ));
-                let _ = on_log.send(
+                sink.on_log(
                     "[LS-Trainer] Note: This model is optimized and ready for inference in LS-Vision."
                         .to_string(),
                 );
@@ -177,7 +195,7 @@ pub(crate) async fn export_yolo_to_onnx(
                 })
             } else {
                 let err_msg = format!("YOLO export failed with status code: {:?}", status.code());
-                let _ = on_log.send(format!("[LS-Trainer Error] {err_msg}"));
+                sink.on_log(format!("[LS-Trainer Error] {err_msg}"));
                 Ok(ExportResponse {
                     success: false,
                     onnx_path: String::new(),
@@ -186,13 +204,17 @@ pub(crate) async fn export_yolo_to_onnx(
             }
         }
         Err(err) => {
-            let _ = on_log.send(format!(
+            sink.on_log(format!(
                 "[LS-Trainer] Notice: Could not launch YOLO process directly ({err})."
             ));
-            let expected_onnx = best_pt.with_extension("onnx");
+            let expected_onnx = if results_path.is_dir() {
+                results_path.join("best.onnx")
+            } else {
+                best_pt.with_extension("onnx")
+            };
             let onnx_str = to_display_path(&expected_onnx);
-            let _ = on_log.send(format!("[LS-Trainer] Simulated ONNX export: {onnx_str}"));
-            let _ = on_log.send(
+            sink.on_log(format!("[LS-Trainer] Simulated ONNX export: {onnx_str}"));
+            sink.on_log(
                 "[LS-Trainer] Note: This model is optimized and ready for inference in LS-Vision."
                     .to_string(),
             );
