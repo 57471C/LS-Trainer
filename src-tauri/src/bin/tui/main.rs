@@ -478,7 +478,7 @@ mod tests {
         let mut normal_stdout_buf: Vec<u8> = Vec::new();
         write_splash_to(&mut normal_stdout_buf).expect("write splash to stdout");
 
-        let backend = TestBackend::new(120, 32);
+        let backend = TestBackend::new(140, 40);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
 
         // 1. Launch with no flags -> transitions from splash to Setup (Launcher) mode
@@ -491,7 +491,7 @@ mod tests {
         let state = Arc::new(Mutex::new(AppState::new(cfg)));
         assert_eq!(state.lock().unwrap().mode, UiMode::Setup);
 
-        // Configure 1-epoch fast run in launcher and press F2 to start
+        // Configure 1-epoch fast XPU run in launcher and press F2 to start
         {
             let mut guard = state.lock().unwrap();
             guard.setup.arch = ArchChoice::Yolo;
@@ -500,7 +500,7 @@ mod tests {
             guard.setup.epochs = "1".to_string();
             guard.setup.batch = "2".to_string();
             guard.setup.imgsz = 64;
-            guard.setup.device = "cpu".to_string();
+            guard.setup.device = "xpu".to_string();
             guard.setup.workers_input = "0".to_string();
             guard.setup.run_name = "tui-short-verify".to_string();
         }
@@ -584,12 +584,36 @@ mod tests {
                 .draw(|frame| draw_ui(frame, &guard))
                 .expect("final draw_ui");
             let buf = terminal.backend().buffer();
+            let screen = buffer_to_string(buf);
+
+            // Confirm Host / CPU panel is 12 rows tall (y=5..16, +7 rows taller than old 5-row box),
+            // giving 8 vertical rows to the CPU bar chart while keeping Run Summary and Live Training Log balanced.
+            let mut host_title_y = None;
+            let mut run_summary_title_y = None;
+            for (y, line) in screen.lines().enumerate() {
+                if line.contains("Host / CPU") {
+                    host_title_y = Some(y);
+                }
+                if line.contains("Run Summary") {
+                    run_summary_title_y = Some(y);
+                }
+            }
+            let host_h = run_summary_title_y.expect("Run Summary title visible")
+                - host_title_y.expect("Host / CPU title visible");
+            assert!(
+                (11..=13).contains(&host_h),
+                "Expected Host / CPU panel height to be 11..=13 rows (6-8 rows taller than 5), got {host_h}"
+            );
+            assert!(screen.contains("Telemetry Curves"));
+            assert!(screen.contains("ONNX"));
+            assert!(screen.contains("Live Training Log"));
+            assert!(screen.contains("Stop & Quit"));
 
             // Confirm epoch bar uses BAR_EPOCH_TEAL and never LightMagenta, and VRAM text is readable
             let mut saw_epoch_teal = false;
             let mut saw_vram_bar = false;
-            for y in 0..32 {
-                for x in 0..120 {
+            for y in 0..40 {
+                for x in 0..140 {
                     let cell = &buf[(x, y)];
                     assert_ne!(cell.bg, Color::LightMagenta);
                     if cell.bg == BAR_EPOCH_TEAL {

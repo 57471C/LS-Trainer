@@ -19,8 +19,8 @@ pub fn render_training_screen(frame: &mut Frame, area: Rect, state: &AppState) {
     let total_h = area.height;
     let top_h = 5u16;
     let rem_h = total_h.saturating_sub(top_h);
-    let min_center_h = 19u16.min(rem_h.saturating_sub(6));
-    let prop_center_h = ((u32::from(rem_h) * 62) / 100) as u16;
+    let min_center_h = 26u16.min(rem_h.saturating_sub(5));
+    let prop_center_h = ((u32::from(rem_h) * 70) / 100) as u16;
     let center_h = prop_center_h.max(min_center_h);
 
     let root_chunks = Layout::default()
@@ -28,7 +28,7 @@ pub fn render_training_screen(frame: &mut Frame, area: Rect, state: &AppState) {
         .constraints([
             Constraint::Length(top_h),
             Constraint::Length(center_h),
-            Constraint::Min(6),
+            Constraint::Min(5),
         ])
         .split(area);
 

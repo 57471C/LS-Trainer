@@ -15,7 +15,13 @@ use crate::app::{
 use crate::ui::{compact_display_path, format_eta_seconds, render_contrast_gauge};
 
 pub fn render_run_summary(frame: &mut Frame, area: Rect, state: &AppState) {
-    let host_h = if area.height >= 19 { 5 } else { 4 };
+    let host_h = if area.height >= 25 {
+        area.height.saturating_sub(14).clamp(11, 13)
+    } else if area.height >= 19 {
+        area.height.saturating_sub(14).max(7)
+    } else {
+        4
+    };
     let split = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(host_h), Constraint::Min(10)])
