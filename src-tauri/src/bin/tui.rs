@@ -10,24 +10,21 @@ use std::time::{Duration, Instant};
 use app_lib as ls_trainer_lib;
 use arboard::Clipboard;
 use crossterm::{
-    cursor::MoveTo,
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    execute,
-    terminal::{Clear, ClearType},
+    terminal::{disable_raw_mode, enable_raw_mode},
 };
 use ls_trainer_lib::{
-    ExportRequest, GpuTelemetry, ProcessControlCommand, TrainMetrics, TrainingEventSink,
-    TrainingRequest, active_training_control, force_kill_active_child, probe_local_gpu_info,
-    run_export_to_onnx, run_training, send_training_control, stop_training, to_display_path,
+    active_training_control, force_kill_active_child, probe_local_gpu_info, run_export_to_onnx,
+    run_training, send_training_control, stop_training, to_display_path, ExportRequest,
+    GpuTelemetry, ProcessControlCommand, TrainMetrics, TrainingEventSink, TrainingRequest,
 };
 use ratatui::{
-    Frame, Terminal,
-    backend::Backend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
     widgets::{Axis, Block, BorderType, Borders, Chart, Dataset, GraphType, Paragraph, Sparkline},
+    Frame,
 };
 use sysinfo::System;
 
@@ -2365,56 +2362,47 @@ fn graceful_stop_and_wait(state: &Arc<Mutex<AppState>>) {
     force_kill_active_child();
 }
 
-fn render_splash_screen(frame: &mut Frame, area: Rect) {
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(SPLASH_ASCII_LINES.len() + 5);
-    lines.push(Line::from(""));
-
+/// Format the BTOP++-style ASCII splash for the normal terminal buffer (`stdout`).
+/// Written before entering the alternate screen so it remains in terminal scrollback.
+fn format_splash_stdout() -> String {
+    let mut out = String::new();
+    out.push('\n');
     for (idx, art_line) in SPLASH_ASCII_LINES.iter().enumerate() {
-        let color = match idx {
-            0..=2 => TITLE_ACCENT,
-            3..=5 => BAR_GPU_TEAL,
-            _ => BAR_EPOCH_TEAL,
+        let ansi_rgb = match idx {
+            0..=2 => "\x1b[1;38;2;116;202;218m",
+            3..=5 => "\x1b[1;38;2;68;168;186m",
+            _ => "\x1b[1;38;2;62;154;174m",
         };
-        lines.push(Line::from(Span::styled(
-            (*art_line).to_string(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )));
+        out.push_str(ansi_rgb);
+        out.push_str(art_line);
+        out.push_str("\x1b[0m\n");
     }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            " ── LS-Trainer TUI ",
-            Style::default()
-                .fg(TITLE_ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "· YOLO · RF-DETR · RT-DETR · ONNX ──",
-            Style::default().fg(LABEL_MUTED),
-        ),
-    ]));
-    lines.push(Line::from(Span::styled(
-        " Press any key to continue...",
-        Style::default().fg(TABLE_BORDER_SOFT),
-    )));
-
-    let paragraph = Paragraph::new(lines).alignment(Alignment::Left);
-    frame.render_widget(paragraph, area);
+    out.push('\n');
+    out.push_str(
+        " \x1b[1;38;2;116;202;218m── LS-Trainer TUI \x1b[0m\x1b[38;2;138;150;168m· YOLO · RF-DETR · RT-DETR · ONNX ──\x1b[0m\n\n",
+    );
+    out
 }
 
-/// Show the BTOP++-style splash screen for `duration` or until any key is pressed.
+fn write_splash_to<W: Write>(writer: &mut W) -> std::io::Result<()> {
+    let splash = format_splash_stdout();
+    writer.write_all(splash.as_bytes())?;
+    writer.flush()
+}
+
+/// Print the BTOP++-style splash to the normal `stdout` buffer (so it stays in scrollback)
+/// and wait for `duration` (~1.5–2s) or until any key is pressed before entering the TUI.
 /// Returns `Ok(true)` if the user pressed `Ctrl+C` to abort immediately.
-fn run_splash_screen<B: Backend>(
-    terminal: &mut Terminal<B>,
-    duration: Duration,
-) -> std::io::Result<bool> {
-    let _ = terminal.clear();
+fn run_stdout_splash(duration: Duration) -> std::io::Result<bool> {
+    let mut stdout = std::io::stdout();
+    write_splash_to(&mut stdout)?;
+
+    let raw_enabled = enable_raw_mode().is_ok();
     let deadline = Instant::now() + duration;
     let poll_step = Duration::from_millis(50);
+    let mut aborted = false;
 
     loop {
-        let _ = terminal.draw(|frame| render_splash_screen(frame, frame.area()));
         let now = Instant::now();
         if now >= deadline {
             break;
@@ -2426,7 +2414,7 @@ fn run_splash_screen<B: Backend>(
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('c')
                     {
-                        return Ok(true);
+                        aborted = true;
                     }
                     break;
                 }
@@ -2434,8 +2422,10 @@ fn run_splash_screen<B: Backend>(
         }
     }
 
-    let _ = terminal.clear();
-    Ok(false)
+    if raw_enabled {
+        let _ = disable_raw_mode();
+    }
+    Ok(aborted)
 }
 
 fn format_exit_summary(state: &AppState) -> String {
@@ -2514,18 +2504,18 @@ fn format_exit_summary(state: &AppState) -> String {
     out
 }
 
-fn clear_and_print_exit_summary(state: &Arc<Mutex<AppState>>) {
-    let summary = if let Ok(mut guard) = state.lock() {
-        guard.refresh_run_artifacts();
-        format_exit_summary(&guard)
-    } else {
-        return;
-    };
+fn write_exit_summary_to<W: Write>(writer: &mut W, state: &AppState) -> std::io::Result<()> {
+    let summary = format_exit_summary(state);
+    writeln!(writer, "\x1b[38;2;116;202;218m{summary}\x1b[0m")?;
+    writer.flush()
+}
 
-    let mut stdout = std::io::stdout();
-    let _ = execute!(stdout, Clear(ClearType::All), MoveTo(0, 0));
-    let _ = writeln!(stdout, "\x1b[38;2;116;202;218m{summary}\x1b[0m");
-    let _ = stdout.flush();
+fn print_exit_summary(state: &Arc<Mutex<AppState>>) {
+    if let Ok(mut guard) = state.lock() {
+        guard.refresh_run_artifacts();
+        let mut stdout = std::io::stdout();
+        let _ = write_exit_summary_to(&mut stdout, &guard);
+    }
 }
 
 fn handle_training_key(
@@ -2636,12 +2626,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(Mutex::new(AppState::new(cli_cfg)));
     spawn_hardware_polling_tasks(Arc::clone(&state));
 
-    let mut terminal = ratatui::init();
-    let aborted_in_splash = run_splash_screen(&mut terminal, Duration::from_millis(1650))?;
+    // Write splash to normal terminal stdout BEFORE entering alternate screen so it stays in scrollback
+    let aborted_in_splash = run_stdout_splash(Duration::from_millis(1650))?;
     if aborted_in_splash {
-        ratatui::restore();
         return Ok(());
     }
+
+    let mut terminal = ratatui::init();
 
     if let Some(req) = initial_req {
         launch_training_thread(Arc::clone(&state), req);
@@ -2667,6 +2658,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                     graceful_stop_and_wait(&state);
+                    show_exit_summary = true;
                     break;
                 }
 
@@ -2698,7 +2690,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ratatui::restore();
     if show_exit_summary {
-        clear_and_print_exit_summary(&state);
+        print_exit_summary(&state);
     }
     Ok(())
 }
@@ -2751,7 +2743,7 @@ fn copy_text_to_clipboard(clipboard: &mut Option<Clipboard>, text: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{backend::TestBackend, Terminal};
 
     #[test]
     fn epoch_bar_uses_muted_teal_and_vram_text_has_dark_contrast_when_covered() {
@@ -3024,30 +3016,26 @@ mod tests {
     }
 
     #[test]
-    fn splash_renders_left_aligned_ascii_then_transitions_to_tui() {
-        let backend = TestBackend::new(100, 24);
-        let mut terminal = Terminal::new(backend).expect("create test terminal");
+    fn splash_writes_to_normal_scrollback_and_persists_after_quit() {
+        let mut normal_scrollback: Vec<u8> = Vec::new();
+        write_splash_to(&mut normal_scrollback).expect("write splash to normal stdout buffer");
 
-        terminal
-            .draw(|frame| render_splash_screen(frame, frame.area()))
-            .expect("draw splash screen");
-
-        let buf = terminal.backend().buffer();
-        // Verify each of the 8 Big Money-ne ASCII art lines is rendered left-aligned starting at x=0
+        let splash_out = String::from_utf8(normal_scrollback.clone()).expect("utf8 splash");
+        // Verify each of the 8 Big Money-ne ASCII art lines is present left-aligned in normal stdout
         for (idx, expected_line) in SPLASH_ASCII_LINES.iter().enumerate() {
-            let y = (idx + 1) as u16;
-            let mut row_str = String::new();
-            for x in 0..(expected_line.len() as u16) {
-                row_str.push_str(buf[(x, y)].symbol());
-            }
-            assert_eq!(
-                &row_str, expected_line,
-                "Splash ASCII line {idx} must match Big Money-ne art left-aligned at column 0"
+            assert!(
+                splash_out.contains(expected_line),
+                "Splash ASCII line {idx} must be written to normal stdout scrollback"
             );
         }
+        // Must not emit alternate screen or clear-screen escape codes on the normal buffer
+        assert!(!splash_out.contains("\x1b[2J"));
+        assert!(!splash_out.contains("\x1b[3J"));
+        assert!(!splash_out.contains("\x1b[?1049h"));
 
-        // Transition to TUI launcher after splash
-        let _ = terminal.clear();
+        // Transition to TUI launcher on alternate screen
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
         let state = AppState::new(CliConfig::default());
         terminal
             .draw(|frame| draw_ui(frame, &state))
@@ -3061,6 +3049,24 @@ mod tests {
             text_after.push('\n');
         }
         assert!(text_after.contains("LS-Trainer TUI — Launch Menu"));
+
+        // On quit (q or Ctrl+C), exit summary is written to normal stdout without clearing scrollback
+        write_exit_summary_to(&mut normal_scrollback, &state)
+            .expect("write exit summary to normal stdout buffer");
+        let full_scrollback =
+            String::from_utf8(normal_scrollback).expect("utf8 full normal scrollback");
+        assert!(!full_scrollback.contains("\x1b[2J"));
+        assert!(!full_scrollback.contains("\x1b[3J"));
+        for expected_line in SPLASH_ASCII_LINES {
+            assert!(
+                full_scrollback.contains(expected_line),
+                "Splash art must still be present in normal terminal scrollback after quit"
+            );
+        }
+        assert!(
+            full_scrollback.contains("╭─ LS-Trainer — Exit Summary"),
+            "Exit summary must also be present in normal terminal scrollback after quit"
+        );
     }
 
     #[test]
@@ -3097,14 +3103,12 @@ mod tests {
         );
         std::fs::write(tmp_ds.join("data.yaml"), yaml_content).expect("write data.yaml");
 
+        // 0. Print splash to normal terminal stdout buffer before starting TUI
+        let mut normal_stdout_buf: Vec<u8> = Vec::new();
+        write_splash_to(&mut normal_stdout_buf).expect("write splash to stdout");
+
         let backend = TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
-
-        // 0. Show splash screen first
-        terminal
-            .draw(|frame| render_splash_screen(frame, frame.area()))
-            .expect("draw splash");
-        assert_eq!(terminal.backend().buffer()[(0, 2)].symbol(), "|");
 
         // 1. Launch with no flags -> transitions from splash to Setup (Launcher) mode
         let empty_args: Vec<&str> = Vec::new();
@@ -3239,6 +3243,12 @@ mod tests {
         assert!(quit_triggered, "Pressing q must quit training TUI");
 
         let guard = state.lock().unwrap();
+        write_exit_summary_to(&mut normal_stdout_buf, &guard)
+            .expect("write exit summary to normal stdout");
+        let scrollback = String::from_utf8(normal_stdout_buf).expect("valid utf8 scrollback");
+        assert!(scrollback.contains(SPLASH_ASCII_LINES[0]));
+        assert!(scrollback.contains("╭─ LS-Trainer — Exit Summary"));
+
         let summary = format_exit_summary(&guard);
         println!("EXIT SUMMARY:\n{summary}");
         assert!(summary.contains("╭─ LS-Trainer — Exit Summary"));
