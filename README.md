@@ -1,20 +1,20 @@
 # LS-Trainer
 
-Desktop app for training YOLO models on your own labeled datasets and exporting them to ONNX.
+Desktop app and terminal UI (`ls-trainer-tui`) for training YOLO, RF-DETR, and RT-DETR models on your own labeled datasets and exporting them to ONNX.
 
-Built for the Lean Studio / LS-Vision workflow. Point it at a Label Studio (or YOLO-format) export, run a training job, and get a usable model without leaving the app.
+Built for the Lean Studio / LS-Vision workflow. Point it at a Label Studio (YOLO or COCO format) export, run a training job, and get a usable `.onnx` model without leaving the app.
 
 ## Features
 
-- Train YOLO11 and YOLO26 models for object detection or instance segmentation
-- Segmentation weights: `yolo11s-seg.pt`, `yolo11m-seg.pt`, `yolo26s-seg.pt` (`task="segment"`)
-- Bench defaults for a fixed top-down camera: `degrees` 180, `flipud` 0.5, `scale` 0.05, `close_mosaic` 10
-- Image sizes 640, 960, and 1280 px
-- Warns when a segmentation run is pointed at plain bounding-box labels
-- Live training log
-- Auto-export the finished model to ONNX at the selected image size (`dynamic=False`, `simplify=True`)
-- Open the run folder or copy the weights and ONNX paths
-- Runs the local Python environment (Ultralytics) as a sidecar
+- **Architectures**: Train **YOLO** (YOLO11 & YOLO26 detection and `-seg` instance segmentation), **RF-DETR** (detection & segmentation), and **RT-DETR** (`rtdetr-v2-r18`, `rtdetr-l.pt`, `rtdetr-x.pt`)
+- **Segmentation weights**: `yolo11s-seg.pt`, `yolo11m-seg.pt`, `yolo26s-seg.pt`, plus `rf-detr-seg-*` (`task="segment"`)
+- **Bench defaults** for a fixed top-down camera: `degrees` 180, `flipud` 0.5, `scale` 0.05, `close_mosaic` 10, `mosaic` 0
+- **Image sizes**: `640`, `960` (default), and `1280` px
+- **Dataset & GPU checks**: Warns when a segmentation run is pointed at plain bounding-box labels; supports single-GPU and multi-GPU Intel Arc XPU (`xpu:0,1`), NVIDIA CUDA, and CPU
+- **Standalone TUI (`ls-trainer-tui`)**: Launch with no flags for an interactive Launch Menu matching the webview options, or pass CLI flags for headless/scripted launches with live GPU/CPU telemetry, loss/mAP curves, health status, `F1` help, `F3` config snapshot, and `F4` run history
+- **ONNX Auto-export**: Exports the finished `best` weights to `best.onnx` at the selected image size (`dynamic=False`, `simplify=True`)
+- **Run management**: Open the run folder or copy the weights and ONNX paths
+- **Local Python sidecar**: Runs training and export from the project `.venv` (Ultralytics, `rfdetr`, `transformers`)
 
 ## Windows Installer & Post-Install Setup
 
@@ -105,13 +105,17 @@ The app looks for this `.venv` when it runs training and ONNX export.
 ### Run
 
 ```bash
+# Desktop app (Tauri + Svelte)
 npm run tauri dev
+
+# Standalone Terminal UI (no flags opens the interactive Launch Menu)
+cargo run --manifest-path src-tauri/Cargo.toml --bin ls-trainer-tui
 ```
 
-The app expects a YOLO-format dataset archive (`.tar`, `.tar.gz`, or `.tgz`, including a Label Studio export).  
+The app expects a YOLO-format dataset folder/archive (`.tar`, `.tar.gz`, `.tgz`, `.zip`) or a COCO export (for RF-DETR).  
 Detection runs are written under `runs/detect`. Segmentation runs are written under `runs/segment`.  
-When auto-export is on, a successful run writes `best.onnx` next to `best.pt`. Copy that path for LS-Vision.
+When auto-export is on, a successful run writes `best.onnx` in the run directory. Copy that path for LS-Vision.
 
 ## Project status
 
-Version 0.1.6. Usable for local detection and instance-segmentation training, plus ONNX export.
+Version 0.2.0. Supports local detection and instance-segmentation training (YOLO, RF-DETR, RT-DETR), standalone TUI, and ONNX export.

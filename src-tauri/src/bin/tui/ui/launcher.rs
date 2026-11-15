@@ -9,8 +9,8 @@ use ratatui::{
 };
 
 use crate::app::{
-    AppState, BAR_GPU_TEAL, BAR_STEP_BLUE, BAR_TRACK_BG, BORDER_SOFT, GAUGE_TEXT_COVERED,
-    LABEL_MUTED, TABLE_BORDER_SOFT, TITLE_ACCENT,
+    APP_VERSION_LABEL, AppState, BAR_GPU_TEAL, BAR_STEP_BLUE, BAR_TRACK_BG, BORDER_SOFT,
+    GAUGE_TEXT_COVERED, LABEL_MUTED, TABLE_BORDER_SOFT, TITLE_ACCENT,
 };
 use crate::ui::widgets::gpu::render_top_gpu_strip;
 
@@ -593,8 +593,25 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(" Quit ", Style::default().fg(Color::White)),
     ]);
 
+    let footer_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(APP_VERSION_LABEL.len() as u16 + 2),
+            Constraint::Min(10),
+        ])
+        .split(chunks[2]);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!(" {APP_VERSION_LABEL}"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        footer_chunks[0],
+    );
     frame.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
-        chunks[2],
+        footer_chunks[1],
     );
 }

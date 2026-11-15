@@ -8,8 +8,8 @@ use ratatui::{
 
 use super::status::render_health_status_bar;
 use crate::app::{
-    AppState, BAR_GPU_TEAL, BAR_RAM_SLATE, BAR_STEP_BLUE, BORDER_SOFT, GAUGE_TEXT_COVERED,
-    MAX_LOG_LINES, TABLE_BORDER_SOFT, TITLE_ACCENT,
+    APP_VERSION_LABEL, AppState, BAR_GPU_TEAL, BAR_RAM_SLATE, BAR_STEP_BLUE, BORDER_SOFT,
+    GAUGE_TEXT_COVERED, MAX_LOG_LINES, TABLE_BORDER_SOFT, TITLE_ACCENT,
 };
 
 /// Map heavy or double box-drawing characters to softer light/rounded equivalents.
@@ -288,8 +288,25 @@ pub fn render_bottom_log_and_footer(frame: &mut Frame, area: Rect, state: &AppSt
         Span::styled(" Stop & Quit ", Style::default().fg(Color::White)),
     ]);
 
+    let footer_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(APP_VERSION_LABEL.len() as u16 + 2),
+            Constraint::Min(10),
+        ])
+        .split(chunks[2]);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!(" {APP_VERSION_LABEL}"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        footer_chunks[0],
+    );
     frame.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
-        chunks[2],
+        footer_chunks[1],
     );
 }
