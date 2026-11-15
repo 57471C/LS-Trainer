@@ -19,13 +19,25 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
-    widgets::{Axis, Block, BorderType, Borders, Chart, Dataset, Gauge, GraphType, Paragraph, Sparkline},
+    widgets::{Axis, Block, BorderType, Borders, Chart, Dataset, GraphType, Paragraph, Sparkline},
 };
 use sysinfo::System;
 
 const MAX_LOG_LINES: usize = 500;
 const MAX_HISTORY_POINTS: usize = 300;
 const MAX_SPARKLINE_SAMPLES: usize = 60;
+
+const BAR_TRACK_BG: Color = Color::Rgb(26, 32, 44);
+const BAR_GPU_TEAL: Color = Color::Rgb(68, 168, 186);
+const BAR_EPOCH_TEAL: Color = Color::Rgb(62, 154, 174);
+const BAR_STEP_BLUE: Color = Color::Rgb(72, 128, 184);
+const BAR_RAM_SLATE: Color = Color::Rgb(92, 148, 188);
+const GAUGE_TEXT_COVERED: Color = Color::Rgb(16, 20, 26);
+const GAUGE_TEXT_UNCOVERED: Color = Color::Rgb(228, 234, 242);
+const BORDER_SOFT: Color = Color::Rgb(64, 76, 94);
+const TABLE_BORDER_SOFT: Color = Color::Rgb(74, 86, 104);
+const TITLE_ACCENT: Color = Color::Rgb(116, 202, 218);
+const LABEL_MUTED: Color = Color::Rgb(138, 150, 168);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArchChoice {
@@ -664,6 +676,124 @@ fn format_eta_seconds(eta_secs: f64) -> String {
     }
 }
 
+/// Map heavy or double box-drawing characters to softer light/rounded equivalents.
+fn soften_box_char(ch: char) -> Option<char> {
+    match ch {
+        '┏' | '╔' | '┌' | '╭' => Some('╭'),
+        '┓' | '╗' | '┐' | '╮' => Some('╮'),
+        '┗' | '╚' | '└' | '╰' => Some('╰'),
+        '┛' | '╝' | '┘' | '╯' => Some('╯'),
+        '━' | '═' | '─' | '╌' | '╍' => Some('─'),
+        '┃' | '║' | '│' | '╎' | '╏' => Some('│'),
+        '┳' | '┯' | '╦' | '╥' | '╤' | '┬' => Some('┬'),
+        '┻' | '┷' | '╩' | '╨' | '╧' | '┴' => Some('┴'),
+        '┣' | '┡' | '┢' | '┠' | '┝' | '╞' | '╟' | '╠' | '├' => Some('├'),
+        '┫' | '┩' | '┪' | '┨' | '┥' | '╡' | '╢' | '╣' | '┤' => Some('┤'),
+        '╋' | '╇' | '╈' | '╉' | '╊' | '╀' | '╁' | '╂' | '┿' | '┽' | '┾' | '┼' | '╬' | '╪' | '╫' => {
+            Some('┼')
+        }
+        c if ('\u{2500}'..='\u{257F}').contains(&c) => Some(c),
+        _ => None,
+    }
+}
+
+fn push_softened_box_spans(
+    spans: &mut Vec<Span<'static>>,
+    segment: &str,
+    text_style: Style,
+    soft_pipe_separators: bool,
+) {
+    if segment.is_empty() {
+        return;
+    }
+    let border_style = Style::default().fg(TABLE_BORDER_SOFT);
+    let mut cur = String::new();
+    let mut cur_is_border = false;
+
+    for ch in segment.chars() {
+        let mapped_border = soften_box_char(ch).or_else(|| {
+            if soft_pipe_separators && ch == '|' {
+                Some('│')
+            } else {
+                None
+            }
+        });
+        let is_border = mapped_border.is_some();
+        let out_ch = mapped_border.unwrap_or(ch);
+
+        if !cur.is_empty() && cur_is_border != is_border {
+            let st = if cur_is_border { border_style } else { text_style };
+            spans.push(Span::styled(std::mem::take(&mut cur), st));
+        }
+        cur_is_border = is_border;
+        cur.push(out_ch);
+    }
+
+    if !cur.is_empty() {
+        let st = if cur_is_border { border_style } else { text_style };
+        spans.push(Span::styled(cur, st));
+    }
+}
+
+/// Render a 1-row (or multi-row) progress bar where label characters covered by the bar
+/// are drawn in dark grey/black (`GAUGE_TEXT_COVERED`) and uncovered characters are drawn
+/// in crisp light text (`GAUGE_TEXT_UNCOVERED`).
+fn render_contrast_gauge(
+    frame: &mut Frame,
+    area: Rect,
+    ratio: f64,
+    label: &str,
+    bar_color: Color,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let clamped = ratio.clamp(0.0, 1.0);
+    let filled_width = (f64::from(area.width) * clamped).round() as u16;
+    let filled_end = area.left() + filled_width.min(area.width);
+
+    let buf = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let covered = x < filled_end;
+            let bg = if covered { bar_color } else { BAR_TRACK_BG };
+            let fg = if covered {
+                GAUGE_TEXT_COVERED
+            } else {
+                GAUGE_TEXT_UNCOVERED
+            };
+            buf[(x, y)]
+                .set_symbol(" ")
+                .set_fg(fg)
+                .set_bg(bg);
+        }
+    }
+
+    let label_chars: Vec<char> = label.chars().collect();
+    let label_len = (label_chars.len() as u16).min(area.width);
+    let label_col = area.left() + (area.width.saturating_sub(label_len)) / 2;
+    let label_row = area.top() + area.height / 2;
+
+    for (i, ch) in label_chars.into_iter().take(label_len as usize).enumerate() {
+        let x = label_col + i as u16;
+        if x >= area.right() {
+            break;
+        }
+        let covered = x < filled_end;
+        let bg = if covered { bar_color } else { BAR_TRACK_BG };
+        let fg = if covered {
+            GAUGE_TEXT_COVERED
+        } else {
+            GAUGE_TEXT_UNCOVERED
+        };
+        let mut utf8_buf = [0u8; 4];
+        let sym = ch.encode_utf8(&mut utf8_buf);
+        buf[(x, label_row)]
+            .set_symbol(sym)
+            .set_style(Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD));
+    }
+}
+
 /// Parse a log line containing optional ANSI SGR escape sequences (`\x1b[...m`) into colored `Span`s.
 fn parse_ansi_or_styled_log_line(raw: &str) -> Line<'static> {
     if raw.contains('\x1b') {
@@ -675,7 +805,8 @@ fn parse_ansi_or_styled_log_line(raw: &str) -> Line<'static> {
         while let Some(ch) = chars.next() {
             if ch == '\x1b' && chars.peek() == Some(&'[') {
                 if !segment.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut segment), current_style));
+                    let seg = std::mem::take(&mut segment);
+                    push_softened_box_spans(&mut spans, &seg, current_style, false);
                 }
                 chars.next(); // consume '['
                 let mut code_str = String::new();
@@ -694,26 +825,34 @@ fn parse_ansi_or_styled_log_line(raw: &str) -> Line<'static> {
             }
         }
         if !segment.is_empty() {
-            spans.push(Span::styled(segment, current_style));
+            push_softened_box_spans(&mut spans, &segment, current_style, false);
         }
         return Line::from(spans);
     }
 
+    let is_metrics_line = raw.contains("[LS-Trainer Metrics]") || raw.contains("Final Metrics");
     let base_color = if raw.contains("Error]") || raw.contains("Traceback") {
         Color::LightRed
     } else if raw.contains("Warning]") {
         Color::Yellow
-    } else if raw.contains("[LS-Trainer Metrics]") || raw.contains("Final Metrics") {
-        Color::LightGreen
+    } else if is_metrics_line {
+        Color::Rgb(132, 214, 158)
     } else if raw.starts_with("[LS-Trainer") {
-        Color::Cyan
+        TITLE_ACCENT
     } else if raw.starts_with("Epoch ") {
-        Color::LightBlue
+        Color::Rgb(130, 182, 232)
     } else {
-        Color::Gray
+        Color::Rgb(194, 204, 216)
     };
 
-    Line::from(Span::styled(raw.to_string(), Style::default().fg(base_color)))
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    push_softened_box_spans(
+        &mut spans,
+        raw,
+        Style::default().fg(base_color),
+        is_metrics_line || raw.starts_with("Epoch "),
+    );
+    Line::from(spans)
 }
 
 fn apply_sgr_codes(code_str: &str, mut style: Style) -> Style {
@@ -774,12 +913,12 @@ fn render_top_gpu_strip(frame: &mut Frame, area: Rect, state: &AppState) {
             .title(Span::styled(
                 title,
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(TITLE_ACCENT)
                     .add_modifier(Modifier::BOLD),
             ))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(Style::default().fg(BORDER_SOFT));
 
         let inner = block.inner(card_area);
         frame.render_widget(block, card_area);
@@ -788,10 +927,20 @@ fn render_top_gpu_strip(frame: &mut Frame, area: Rect, state: &AppState) {
             continue;
         }
 
+        let padded = Rect {
+            x: inner.x + 1,
+            y: inner.y,
+            width: inner.width.saturating_sub(2),
+            height: inner.height,
+        };
+        if padded.width == 0 {
+            continue;
+        }
+
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(1)])
-            .split(inner);
+            .split(padded);
 
         let vram_ratio = if gpu.vram_total_gb > 0.0 {
             (gpu.vram_used_gb / gpu.vram_total_gb).clamp(0.0, 1.0)
@@ -809,28 +958,15 @@ fn render_top_gpu_strip(frame: &mut Frame, area: Rect, state: &AppState) {
             format!("VRAM {:.2} GiB", gpu.vram_used_gb)
         };
 
-        let gauge = Gauge::default()
-            .gauge_style(
-                Style::default()
-                    .fg(Color::LightCyan)
-                    .bg(Color::Rgb(28, 36, 48)),
-            )
-            .ratio(vram_ratio)
-            .label(Span::styled(
-                vram_label,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(gauge, rows[0]);
+        render_contrast_gauge(frame, rows[0], vram_ratio, &vram_label, BAR_GPU_TEAL);
 
         let spark_cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(14), Constraint::Min(4)])
+            .constraints([Constraint::Length(13), Constraint::Min(4)])
             .split(rows[1]);
 
         let util_text = Paragraph::new(Line::from(vec![
-            Span::styled("Util ", Style::default().fg(Color::Gray)),
+            Span::styled("Util ", Style::default().fg(LABEL_MUTED)),
             Span::styled(
                 format!("{:>5.1}%", gpu.util_percent),
                 Style::default()
@@ -844,7 +980,7 @@ fn render_top_gpu_strip(frame: &mut Frame, area: Rect, state: &AppState) {
         let sparkline = Sparkline::default()
             .data(&samples)
             .max(100)
-            .style(Style::default().fg(Color::LightGreen));
+            .style(Style::default().fg(Color::Rgb(106, 204, 142)));
         frame.render_widget(sparkline, spark_cols[1]);
     }
 }
@@ -858,47 +994,49 @@ fn render_host_card(frame: &mut Frame, area: Rect, state: &AppState) {
         .title(Span::styled(
             title,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(TITLE_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(BORDER_SOFT));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if inner.height == 0 {
+    if inner.height == 0 || inner.width <= 2 {
         return;
     }
+
+    let padded = Rect {
+        x: inner.x + 1,
+        y: inner.y,
+        width: inner.width.saturating_sub(2),
+        height: inner.height,
+    };
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(inner);
+        .split(padded);
 
     let ram_ratio = if state.host_ram_total_gb > 0.0 {
         (state.host_ram_used_gb / state.host_ram_total_gb).clamp(0.0, 1.0)
     } else {
         0.0
     };
-    let gauge = Gauge::default()
-        .gauge_style(
-            Style::default()
-                .fg(Color::LightBlue)
-                .bg(Color::Rgb(28, 36, 48)),
-        )
-        .ratio(ram_ratio)
-        .label(format!(
-            "System RAM {:.1} / {:.1} GiB",
-            state.host_ram_used_gb, state.host_ram_total_gb
-        ));
-    frame.render_widget(gauge, rows[0]);
+    let ram_label = format!(
+        "System RAM {:.1} / {:.1} GiB ({:.0}%)",
+        state.host_ram_used_gb,
+        state.host_ram_total_gb,
+        ram_ratio * 100.0
+    );
+    render_contrast_gauge(frame, rows[0], ram_ratio, &ram_label, BAR_GPU_TEAL);
 
     let samples: Vec<u64> = state.host_cpu_history.iter().copied().collect();
     let spark = Sparkline::default()
         .data(&samples)
         .max(100)
-        .style(Style::default().fg(Color::LightGreen));
+        .style(Style::default().fg(Color::Rgb(106, 204, 142)));
     frame.render_widget(spark, rows[1]);
 }
 
@@ -971,17 +1109,17 @@ fn render_center_chart(frame: &mut Frame, area: Rect, state: &AppState) {
                 .title(Span::styled(
                     " Telemetry Curves (train_loss · val_loss · mAP@50:95) ",
                     Style::default()
-                        .fg(Color::LightCyan)
+                        .fg(TITLE_ACCENT)
                         .add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(BORDER_SOFT)),
         )
         .x_axis(
             Axis::default()
-                .title(Span::styled("Step", Style::default().fg(Color::Gray)))
-                .style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled("Step", Style::default().fg(LABEL_MUTED)))
+                .style(Style::default().fg(BORDER_SOFT))
                 .bounds([min_x, max_x])
                 .labels(vec![
                     Span::raw(format!("{min_x:.0}")),
@@ -991,8 +1129,8 @@ fn render_center_chart(frame: &mut Frame, area: Rect, state: &AppState) {
         )
         .y_axis(
             Axis::default()
-                .title(Span::styled("Value", Style::default().fg(Color::Gray)))
-                .style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled("Value", Style::default().fg(LABEL_MUTED)))
+                .style(Style::default().fg(BORDER_SOFT))
                 .bounds([min_y, max_y])
                 .labels(vec![
                     Span::raw(format!("{min_y:.2}")),
@@ -1019,18 +1157,25 @@ fn render_host_cpu_panel(frame: &mut Frame, area: Rect, state: &AppState) {
         .title(Span::styled(
             " Host / CPU ",
             Style::default()
-                .fg(Color::LightCyan)
+                .fg(TITLE_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(BORDER_SOFT));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if inner.height == 0 || inner.width == 0 {
+    if inner.height == 0 || inner.width <= 2 {
         return;
     }
+
+    let padded = Rect {
+        x: inner.x + 1,
+        y: inner.y,
+        width: inner.width.saturating_sub(2),
+        height: inner.height,
+    };
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -1040,7 +1185,7 @@ fn render_host_cpu_panel(frame: &mut Frame, area: Rect, state: &AppState) {
             Constraint::Length(1),
             Constraint::Min(1),
         ])
-        .split(inner);
+        .split(padded);
 
     let cpu_ratio = (state.host_cpu_percent / 100.0).clamp(0.0, 1.0);
     let cores_label = if state.host_core_count > 0 {
@@ -1048,15 +1193,8 @@ fn render_host_cpu_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         String::new()
     };
-    let cpu_gauge = Gauge::default()
-        .gauge_style(
-            Style::default()
-                .fg(Color::LightCyan)
-                .bg(Color::Rgb(28, 36, 48)),
-        )
-        .ratio(cpu_ratio)
-        .label(format!("CPU {:.1}%{cores_label}", state.host_cpu_percent));
-    frame.render_widget(cpu_gauge, rows[0]);
+    let cpu_label = format!("CPU {:.1}%{cores_label}", state.host_cpu_percent);
+    render_contrast_gauge(frame, rows[0], cpu_ratio, &cpu_label, BAR_GPU_TEAL);
 
     let ram_ratio = if state.host_ram_total_gb > 0.0 {
         (state.host_ram_used_gb / state.host_ram_total_gb).clamp(0.0, 1.0)
@@ -1064,22 +1202,15 @@ fn render_host_cpu_panel(frame: &mut Frame, area: Rect, state: &AppState) {
         0.0
     };
     let ram_pct = ram_ratio * 100.0;
-    let ram_gauge = Gauge::default()
-        .gauge_style(
-            Style::default()
-                .fg(Color::LightYellow)
-                .bg(Color::Rgb(28, 36, 48)),
-        )
-        .ratio(ram_ratio)
-        .label(format!(
-            "RAM {:.1}/{:.1} GiB ({ram_pct:.0}%)",
-            state.host_ram_used_gb, state.host_ram_total_gb
-        ));
-    frame.render_widget(ram_gauge, rows[1]);
+    let ram_label = format!(
+        "RAM {:.1} / {:.1} GiB ({ram_pct:.0}%)",
+        state.host_ram_used_gb, state.host_ram_total_gb
+    );
+    render_contrast_gauge(frame, rows[1], ram_ratio, &ram_label, BAR_RAM_SLATE);
 
     let (l1, l5, l15) = state.host_load_avg;
     let load_line = Line::from(vec![
-        Span::styled("Load: ", Style::default().fg(Color::Gray)),
+        Span::styled("Load     ", Style::default().fg(LABEL_MUTED)),
         Span::styled(
             format!("{l1:.2}  {l5:.2}  {l15:.2}"),
             Style::default().fg(Color::White),
@@ -1091,7 +1222,7 @@ fn render_host_cpu_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     let sparkline = Sparkline::default()
         .data(&cpu_samples)
         .max(100)
-        .style(Style::default().fg(Color::Cyan));
+        .style(Style::default().fg(BAR_GPU_TEAL));
     frame.render_widget(sparkline, rows[3]);
 }
 
@@ -1100,18 +1231,25 @@ fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState) {
         .title(Span::styled(
             " Run Summary ",
             Style::default()
-                .fg(Color::LightCyan)
+                .fg(TITLE_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(BORDER_SOFT));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if inner.height == 0 || inner.width == 0 {
+    if inner.height == 0 || inner.width <= 2 {
         return;
     }
+
+    let padded = Rect {
+        x: inner.x + 1,
+        y: inner.y,
+        width: inner.width.saturating_sub(2),
+        height: inner.height,
+    };
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -1120,7 +1258,7 @@ fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState) {
             Constraint::Length(1),
             Constraint::Min(4),
         ])
-        .split(inner);
+        .split(padded);
 
     let m = &state.latest_metrics;
     let total_ep = m.total_epochs.max(1);
@@ -1129,30 +1267,26 @@ fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         0.0
     };
-    let ep_gauge = Gauge::default()
-        .gauge_style(
-            Style::default()
-                .fg(Color::LightMagenta)
-                .bg(Color::Rgb(28, 36, 48)),
-        )
-        .ratio(ep_ratio)
-        .label(format!("Epoch {} / {}", m.epoch, m.total_epochs));
-    frame.render_widget(ep_gauge, rows[0]);
+    let ep_label = format!(
+        "Epoch {} / {} ({:.0}%)",
+        m.epoch,
+        m.total_epochs,
+        ep_ratio * 100.0
+    );
+    render_contrast_gauge(frame, rows[0], ep_ratio, &ep_label, BAR_EPOCH_TEAL);
 
     let step_ratio = if m.total_steps > 0 {
         (m.step as f64 / m.total_steps as f64).clamp(0.0, 1.0)
     } else {
         0.0
     };
-    let step_gauge = Gauge::default()
-        .gauge_style(
-            Style::default()
-                .fg(Color::LightBlue)
-                .bg(Color::Rgb(28, 36, 48)),
-        )
-        .ratio(step_ratio)
-        .label(format!("Step {} / {}", m.step, m.total_steps));
-    frame.render_widget(step_gauge, rows[1]);
+    let step_label = format!(
+        "Step {} / {} ({:.0}%)",
+        m.step,
+        m.total_steps,
+        step_ratio * 100.0
+    );
+    render_contrast_gauge(frame, rows[1], step_ratio, &step_label, BAR_STEP_BLUE);
 
     let (arch_str, model_str, dataset_str, dev_str) = if let Some(ref req) = state.active_request {
         (
@@ -1175,7 +1309,7 @@ fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     } else if state.is_running {
         Color::LightGreen
     } else {
-        Color::Cyan
+        TITLE_ACCENT
     };
     let spinner_frames = ["|", "/", "-", "\\"];
     let spinner_char = spinner_frames[state.spinner_tick % spinner_frames.len()];
@@ -1188,7 +1322,9 @@ fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let elapsed_str = match (state.training_started_at, state.training_ended_at) {
-        (Some(start), Some(end)) => format_eta_seconds(end.saturating_duration_since(start).as_secs_f64()),
+        (Some(start), Some(end)) => {
+            format_eta_seconds(end.saturating_duration_since(start).as_secs_f64())
+        }
         (Some(start), None) => format_eta_seconds(start.elapsed().as_secs_f64()),
         _ => "--:--".to_string(),
     };
@@ -1202,74 +1338,94 @@ fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState) {
         .map(|v| format!("{:.2}%", v * 100.0))
         .unwrap_or_else(|| "--".to_string());
 
+    let divider_width = padded.width.saturating_sub(14) as usize;
+    let divider_tail = "─".repeat(divider_width.max(4));
+    let sep_span = Span::styled("  │  ", Style::default().fg(TABLE_BORDER_SOFT));
+
     let lines = vec![
         Line::from(vec![
-            Span::styled("State:   ", Style::default().fg(Color::Gray)),
+            Span::styled("State    ", Style::default().fg(LABEL_MUTED)),
             Span::styled(
-                status_badge,
+                format!("{status_badge:<14}"),
                 Style::default()
                     .fg(status_color)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::styled("Dev ", Style::default().fg(LABEL_MUTED)),
+            Span::styled(dev_str.to_string(), Style::default().fg(TITLE_ACCENT)),
         ]),
         Line::from(vec![
-            Span::styled("Arch:    ", Style::default().fg(Color::Gray)),
+            Span::styled("Model    ", Style::default().fg(LABEL_MUTED)),
             Span::styled(
                 format!("{arch_str} ({model_str})"),
                 Style::default().fg(Color::White),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Device:  ", Style::default().fg(Color::Gray)),
-            Span::styled(dev_str.to_string(), Style::default().fg(Color::LightCyan)),
-        ]),
-        Line::from(vec![
-            Span::styled("Dataset: ", Style::default().fg(Color::Gray)),
-            Span::styled(dataset_str.to_string(), Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            Span::styled("Loss:    ", Style::default().fg(Color::Gray)),
+            Span::styled("Dataset  ", Style::default().fg(LABEL_MUTED)),
             Span::styled(
-                format!("{:.4}", m.train_loss),
-                Style::default().fg(Color::Cyan),
+                dataset_str.to_string(),
+                Style::default().fg(Color::Rgb(196, 206, 218)),
             ),
-            Span::styled("  LR: ", Style::default().fg(Color::Gray)),
+        ]),
+        Line::from(Span::styled(
+            format!("── Key Metrics {divider_tail}"),
+            Style::default().fg(TABLE_BORDER_SOFT),
+        )),
+        Line::from(vec![
+            Span::styled("Loss     ", Style::default().fg(LABEL_MUTED)),
+            Span::styled(
+                format!("{:<8.4}", m.train_loss),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            sep_span.clone(),
+            Span::styled("LR ", Style::default().fg(LABEL_MUTED)),
             Span::styled(
                 format!("{:.2e}", m.lr),
-                Style::default().fg(Color::LightYellow),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Speed:   ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{:.1} samples/s", m.samples_per_sec),
-                Style::default().fg(Color::LightGreen),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("ETA:     ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{}  (elapsed {elapsed_str})", format_eta_seconds(m.eta_secs)),
                 Style::default()
-                    .fg(Color::White)
+                    .fg(Color::LightYellow)
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Best mAP:", Style::default().fg(Color::Gray)),
+            Span::styled("Best mAP ", Style::default().fg(LABEL_MUTED)),
+            Span::styled("50 ", Style::default().fg(LABEL_MUTED)),
             Span::styled(
-                format!(" 50={map50_str} │ 50:95={map95_str}"),
-                Style::default().fg(Color::LightGreen),
+                format!("{map50_str:<7}"),
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            sep_span.clone(),
+            Span::styled("50:95 ", Style::default().fg(LABEL_MUTED)),
+            Span::styled(
+                map95_str,
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Host:    ", Style::default().fg(Color::Gray)),
+            Span::styled("Speed    ", Style::default().fg(LABEL_MUTED)),
             Span::styled(
-                format!(
-                    "CPU {:.0}% │ RAM {:.1}/{:.1}G",
-                    state.host_cpu_percent, state.host_ram_used_gb, state.host_ram_total_gb
-                ),
-                Style::default().fg(Color::DarkGray),
+                format!("{:>5.1} samples/s", m.samples_per_sec),
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            sep_span,
+            Span::styled("Elapsed ", Style::default().fg(LABEL_MUTED)),
+            Span::styled(elapsed_str, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("ETA      ", Style::default().fg(LABEL_MUTED)),
+            Span::styled(
+                format_eta_seconds(m.eta_secs),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
     ];
@@ -1291,17 +1447,24 @@ fn render_bottom_log_and_footer(frame: &mut Frame, area: Rect, state: &AppState)
                 MAX_LOG_LINES
             ),
             Style::default()
-                .fg(Color::LightCyan)
+                .fg(TITLE_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(BORDER_SOFT));
 
     let inner = log_block.inner(chunks[0]);
     frame.render_widget(log_block, chunks[0]);
 
-    let visible_height = inner.height as usize;
+    let padded = Rect {
+        x: inner.x + 1,
+        y: inner.y,
+        width: inner.width.saturating_sub(2),
+        height: inner.height,
+    };
+
+    let visible_height = padded.height as usize;
     let total_lines = state.logs.len();
     let max_offset = total_lines.saturating_sub(visible_height);
     let offset_from_bottom = state.log_scroll_offset.min(max_offset);
@@ -1316,7 +1479,7 @@ fn render_bottom_log_and_footer(frame: &mut Frame, area: Rect, state: &AppState)
         .map(|l| parse_ansi_or_styled_log_line(l))
         .collect();
 
-    frame.render_widget(Paragraph::new(visible_lines), inner);
+    frame.render_widget(Paragraph::new(visible_lines), padded);
 
     let pause_label = if state.is_paused {
         "Resume"
@@ -1897,4 +2060,121 @@ fn copy_text_to_clipboard(clipboard: &mut Option<Clipboard>, text: &str) -> Resu
         .as_mut()
         .ok_or_else(|| "clipboard unavailable".to_string())?;
     cb.set_text(text.to_owned()).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn epoch_bar_uses_muted_teal_and_vram_text_has_dark_contrast_when_covered() {
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        let mut cfg = CliConfig::default();
+        cfg.interactive = false;
+        cfg.dataset = "datasets/sample".to_string();
+        let mut state = AppState::new(cfg);
+        state.mode = UiMode::Training;
+        state.is_running = true;
+        state.apply_metrics(TrainMetrics {
+            epoch: 3,
+            total_epochs: 4,
+            step: 8,
+            total_steps: 10,
+            train_loss: 1.2345,
+            val_loss: Some(1.1100),
+            map50: Some(0.812),
+            map50_95: Some(0.584),
+            lr: 1e-4,
+            samples_per_sec: 24.5,
+            eta_secs: 42.0,
+            gpus: vec![GpuTelemetry {
+                index: 0,
+                name: "Intel Arc B580".to_string(),
+                vram_used_gb: 12.0,
+                vram_total_gb: 16.0,
+                util_percent: 75.0,
+            }],
+        });
+
+        terminal
+            .draw(|frame| draw_ui(frame, &state))
+            .expect("draw_ui succeeds");
+
+        let buf = terminal.backend().buffer();
+
+        // 1. Check VRAM gauge row (row y=1 inside top GPU strip):
+        // With 75% fill across width ~116, the centered label "VRAM 12.00 / 16.00 GiB (75%)"
+        // including "(75%)" is covered by the GPU bar and must use GAUGE_TEXT_COVERED (dark/black)
+        // on BAR_GPU_TEAL background.
+        let mut found_vram_pct_covered = false;
+        for x in 1..118 {
+            let cell = &buf[(x, 1)];
+            if cell.symbol() == "%" && cell.bg == BAR_GPU_TEAL {
+                assert_eq!(
+                    cell.fg, GAUGE_TEXT_COVERED,
+                    "VRAM percentage covered by GPU bar must be drawn in dark/black text"
+                );
+                found_vram_pct_covered = true;
+            }
+        }
+        assert!(
+            found_vram_pct_covered,
+            "Expected VRAM percentage character '%' covered by GPU bar in row 1"
+        );
+
+        // 2. Check partial coverage (e.g. 52% where part of the label is covered and part is on track):
+        state.gpus[0].vram_used_gb = 8.32;
+        state.gpus[0].vram_total_gb = 16.0;
+        terminal
+            .draw(|frame| draw_ui(frame, &state))
+            .expect("draw_ui partial vram succeeds");
+        let buf = terminal.backend().buffer();
+        let mut saw_covered_label_char = false;
+        let mut saw_uncovered_label_char = false;
+        for x in 2..118 {
+            let cell = &buf[(x, 1)];
+            if cell.symbol() != " " {
+                if cell.bg == BAR_GPU_TEAL {
+                    assert_eq!(cell.fg, GAUGE_TEXT_COVERED);
+                    saw_covered_label_char = true;
+                } else if cell.bg == BAR_TRACK_BG {
+                    assert_eq!(cell.fg, GAUGE_TEXT_UNCOVERED);
+                    saw_uncovered_label_char = true;
+                }
+            }
+        }
+        assert!(saw_covered_label_char && saw_uncovered_label_char);
+
+        // 3. Confirm no cell in the entire buffer uses loud pink (LightMagenta) for the Epoch bar,
+        // and that BAR_EPOCH_TEAL is used instead.
+        let mut saw_epoch_teal = false;
+        for y in 0..32 {
+            for x in 0..120 {
+                let cell = &buf[(x, y)];
+                assert_ne!(
+                    cell.bg,
+                    Color::LightMagenta,
+                    "Epoch bar must not use loud LightMagenta background"
+                );
+                if cell.bg == BAR_EPOCH_TEAL {
+                    saw_epoch_teal = true;
+                }
+            }
+        }
+        assert!(saw_epoch_teal, "Expected Epoch progress bar to use BAR_EPOCH_TEAL");
+    }
+
+    #[test]
+    fn log_metric_tables_soften_heavy_borders() {
+        let heavy_line = "┏━━━━━━━━━━━━━━┳━━━━━━━┓";
+        let styled = parse_ansi_or_styled_log_line(heavy_line);
+        let rendered: String = styled.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rendered, "╭──────────────┬───────╮");
+        for span in &styled.spans {
+            assert_eq!(span.style.fg, Some(TABLE_BORDER_SOFT));
+        }
+    }
 }
