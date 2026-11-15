@@ -1,4 +1,4 @@
-//! Normal-buffer BTOP++-style ASCII splash and exit summary banner.
+//! Normal-buffer ASCII splash and exit summary banner.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -9,7 +9,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 
-use crate::app::AppState;
+use crate::app::{APP_VERSION_LABEL, AppState};
 use crate::ui::format_eta_seconds;
 
 pub const SPLASH_ASCII_LINES: [&str; 8] = [
@@ -23,7 +23,7 @@ pub const SPLASH_ASCII_LINES: [&str; 8] = [
     r"|________/ \______/         |__/|__/      \_______/|__/|__/  |__/ \_______/|__/      ",
 ];
 
-/// Format the BTOP++-style ASCII splash for the normal terminal buffer (`stdout`).
+/// Format the ASCII splash for the normal terminal buffer (`stdout`).
 /// Written before entering the alternate screen so it remains in terminal scrollback.
 pub fn format_splash_stdout() -> String {
     let mut out = String::new();
@@ -39,9 +39,9 @@ pub fn format_splash_stdout() -> String {
         out.push_str("\x1b[0m\n");
     }
     out.push('\n');
-    out.push_str(
-        " \x1b[1;38;2;116;202;218m── LS-Trainer TUI \x1b[0m\x1b[38;2;138;150;168m· YOLO · RF-DETR · RT-DETR · ONNX ──\x1b[0m\n\n",
-    );
+    out.push_str(&format!(
+        " \x1b[1;33m{APP_VERSION_LABEL}\x1b[0m  \x1b[1;38;2;116;202;218m── LS-Trainer TUI \x1b[0m\x1b[38;2;138;150;168m· YOLO · RF-DETR · RT-DETR · ONNX ──\x1b[0m\n\n"
+    ));
     out
 }
 
@@ -51,7 +51,7 @@ pub fn write_splash_to<W: Write>(writer: &mut W) -> std::io::Result<()> {
     writer.flush()
 }
 
-/// Print the BTOP++-style splash to the normal `stdout` buffer (so it stays in scrollback)
+/// Print the ASCII splash to the normal `stdout` buffer (so it stays in scrollback)
 /// and wait for `duration` (~1.5–2s) or until any key is pressed before entering the TUI.
 /// Returns `Ok(true)` if the user pressed `Ctrl+C` to abort immediately.
 pub fn run_stdout_splash(duration: Duration) -> std::io::Result<bool> {

@@ -335,6 +335,11 @@ mod tests {
             assert!(screen_text.contains("MixUp"));
             assert!(screen_text.contains("Copy-Paste"));
             assert!(screen_text.contains("[ Start Training (Enter / F2) ]"));
+            assert!(screen_text.contains("Version v0.2.0"));
+            // Verify Version v0.2.0 is on the very bottom left in yellow
+            let version_row = 31u16;
+            assert_eq!(buf[(1, version_row)].symbol(), "V");
+            assert_eq!(buf[(1, version_row)].fg, Color::Yellow);
         }
 
         // Navigate and edit fields in the launcher:
@@ -528,6 +533,10 @@ mod tests {
         write_splash_to(&mut normal_scrollback).expect("write splash to normal stdout buffer");
 
         let splash_out = String::from_utf8(normal_scrollback.clone()).expect("utf8 splash");
+        assert!(
+            splash_out.contains("Version v0.2.0"),
+            "Splash must display Version v0.2.0 under the ASCII art"
+        );
         // Verify each of the 8 Big Money-ne ASCII art lines is present left-aligned in normal stdout
         for (idx, expected_line) in SPLASH_ASCII_LINES.iter().enumerate() {
             assert!(
@@ -942,8 +951,12 @@ mod tests {
             assert!(screen.contains("ONNX"));
             assert!(screen.contains("checkpoint_best_total.pth"));
             assert!(screen.contains("best.onnx"));
-            // Healthy status line
+            // Healthy status line and bottom-left yellow version label
             assert!(screen.contains("● Healthy"));
+            assert!(screen.contains("Version v0.2.0"));
+            let bottom_buf = terminal.backend().buffer();
+            assert_eq!(bottom_buf[(1, 33)].symbol(), "V");
+            assert_eq!(bottom_buf[(1, 33)].fg, Color::Yellow);
         }
 
         // 2. Verify noisy warnings (triton, sync_dist) update Status Line to Warning and are suppressed in live log

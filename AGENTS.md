@@ -1,10 +1,10 @@
 # AGENTS.md
 
-Guidance for AI coding agents working on LS-Trainer. Version 0.1.6.
+Guidance for AI coding agents working on LS-Trainer. Version 0.2.0.
 
 ## Project context
 
-LS-Trainer is a Tauri 2 + Svelte desktop app for training Ultralytics YOLO models on local datasets and exporting them to ONNX for LS-Vision. The UI is `src/App.svelte`. Training, export, GPU repair, and dataset checks are Tauri commands in `src-tauri/src/lib.rs`. Python runs from the project `.venv` (`yolo.exe` on Windows).
+LS-Trainer is a Tauri 2 + Svelte desktop app (plus a standalone `ls-trainer-tui` terminal trainer binary) for training Ultralytics YOLO, RF-DETR, and RT-DETR models on local datasets and exporting them to ONNX for LS-Vision. The desktop UI is `src/App.svelte` with components under `src/components/`. Training, export, GPU repair, and dataset checks live in `src-tauri/src/` (`lib.rs`, `training/`, `gpu.rs`, `dataset.rs`, etc.). The TUI lives under `src-tauri/src/bin/tui/`. Python runs from the project `.venv` (`yolo.exe` / `python.exe` on Windows).
 
 ## Training tasks
 
@@ -39,6 +39,7 @@ Keep these in sync when the version changes:
 - `src-tauri/Cargo.lock` package `app` only
 - `src-tauri/tauri.conf.json`
 - the version badge in `src/components/Header.svelte`
+- `APP_VERSION_LABEL` in `src-tauri/src/bin/tui/app.rs`
 
 Do not bump unrelated crate versions in `Cargo.lock`.
 
