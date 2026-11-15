@@ -34,9 +34,196 @@ pub const NEW_BEST_GOLD: Color = Color::Rgb(255, 216, 102);
 pub const NEW_BEST_BADGE_BG: Color = Color::Rgb(42, 92, 66);
 pub const OVERLAY_BG: Color = Color::Rgb(18, 22, 30);
 
-pub const LAUNCHER_FIELD_COUNT: usize = 7;
-pub const DEVICE_PRESETS: [&str; 6] = ["auto", "xpu", "xpu:0", "xpu:0,1", "cuda", "cpu"];
-pub const WORKER_PRESETS: [&str; 6] = ["auto", "0", "1", "2", "4", "8"];
+pub const LAUNCHER_FIELD_COUNT: usize = 21;
+pub const DEVICE_PRESETS: [&str; 7] = ["auto", "xpu", "xpu:0", "xpu:0,1", "0", "cuda", "cpu"];
+pub const WORKER_PRESETS: [&str; 8] = ["auto", "0", "1", "2", "4", "6", "7", "8"];
+pub const IMGSZ_PRESETS: [&str; 3] = ["640", "960", "1280"];
+pub const EPOCH_PRESETS: [&str; 7] = ["1", "10", "30", "60", "100", "150", "200"];
+pub const BATCH_PRESETS: [&str; 6] = ["1", "2", "4", "8", "16", "32"];
+pub const AUG_PRESET_NAMES: [&str; 4] = ["bench", "off", "light", "medium"];
+pub const DEGREES_PRESETS: [&str; 6] = ["0", "10", "15", "45", "90", "180"];
+pub const FLIPUD_PRESETS: [&str; 6] = ["0.0", "0.1", "0.25", "0.5", "0.75", "1.0"];
+pub const SCALE_PRESETS: [&str; 6] = ["0.0", "0.05", "0.1", "0.25", "0.5", "0.9"];
+pub const TRANSLATE_PRESETS: [&str; 5] = ["0.0", "0.05", "0.1", "0.2", "0.5"];
+pub const MOSAIC_PRESETS: [&str; 4] = ["0.0", "0.25", "0.5", "1.0"];
+pub const CLOSE_MOSAIC_PRESETS: [&str; 5] = ["0", "5", "10", "15", "20"];
+pub const MIXUP_PRESETS: [&str; 5] = ["0.0", "0.05", "0.1", "0.2", "0.5"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelScaleOption {
+    pub scale: &'static str,
+    pub id: &'static str,
+    pub label: &'static str,
+    pub desc: &'static str,
+}
+
+/// Webview model options for RF-DETR (`src/models.ts`). Default is `medium` (`rf-detr-medium`).
+pub const RFDETR_MODEL_OPTIONS: [ModelScaleOption; 10] = [
+    ModelScaleOption {
+        scale: "nano",
+        id: "rf-detr-nano",
+        label: "RF-DETR Nano",
+        desc: "30.5M params · Fast real-time transformer detector",
+    },
+    ModelScaleOption {
+        scale: "small",
+        id: "rf-detr-small",
+        label: "RF-DETR Small",
+        desc: "32.1M params · Balanced real-time transformer",
+    },
+    ModelScaleOption {
+        scale: "medium",
+        id: "rf-detr-medium",
+        label: "RF-DETR Medium",
+        desc: "33.7M params · Default high-accuracy RF-DETR",
+    },
+    ModelScaleOption {
+        scale: "large",
+        id: "rf-detr-large",
+        label: "RF-DETR Large",
+        desc: "128M params · Maximum detection accuracy",
+    },
+    ModelScaleOption {
+        scale: "base",
+        id: "rf-detr-base",
+        label: "RF-DETR Base",
+        desc: "29.0M params · Legacy base checkpoint",
+    },
+    ModelScaleOption {
+        scale: "seg-nano",
+        id: "rf-detr-seg-nano",
+        label: "RF-DETR Seg Nano",
+        desc: "33.6M params · Fast instance segmentation",
+    },
+    ModelScaleOption {
+        scale: "seg-small",
+        id: "rf-detr-seg-small",
+        label: "RF-DETR Seg Small",
+        desc: "35.3M params · Balanced instance segmentation",
+    },
+    ModelScaleOption {
+        scale: "seg-medium",
+        id: "rf-detr-seg-medium",
+        label: "RF-DETR Seg Medium",
+        desc: "37.6M params · High-accuracy instance segmentation",
+    },
+    ModelScaleOption {
+        scale: "seg-large",
+        id: "rf-detr-seg-large",
+        label: "RF-DETR Seg Large",
+        desc: "39.5M params · Maximum segmentation accuracy",
+    },
+    ModelScaleOption {
+        scale: "seg-preview",
+        id: "rf-detr-seg-preview",
+        label: "RF-DETR Seg Preview",
+        desc: "33.6M params · Legacy preview segmentation head",
+    },
+];
+
+/// Webview model options for Ultralytics YOLO (`src/models.ts`). Default is `medium` (`yolo11m.pt`).
+pub const YOLO_MODEL_OPTIONS: [ModelScaleOption; 13] = [
+    ModelScaleOption {
+        scale: "nano",
+        id: "yolo11n.pt",
+        label: "YOLO11 Nano",
+        desc: "2.6M params · Fastest inference, lowest VRAM",
+    },
+    ModelScaleOption {
+        scale: "small",
+        id: "yolo11s.pt",
+        label: "YOLO11 Small",
+        desc: "9.4M params · Balanced speed & accuracy",
+    },
+    ModelScaleOption {
+        scale: "medium",
+        id: "yolo11m.pt",
+        label: "YOLO11 Medium",
+        desc: "20.1M params · Default general-purpose detector",
+    },
+    ModelScaleOption {
+        scale: "large",
+        id: "yolo11l.pt",
+        label: "YOLO11 Large",
+        desc: "25.3M params · High accuracy for fine defects",
+    },
+    ModelScaleOption {
+        scale: "xlarge",
+        id: "yolo11x.pt",
+        label: "YOLO11 XLarge",
+        desc: "56.9M params · Maximum accuracy, high compute",
+    },
+    ModelScaleOption {
+        scale: "v26-nano",
+        id: "yolo26n.pt",
+        label: "YOLO26 Nano",
+        desc: "2.5M params · Next-gen ultra-fast edge detector",
+    },
+    ModelScaleOption {
+        scale: "v26-small",
+        id: "yolo26s.pt",
+        label: "YOLO26 Small",
+        desc: "9.0M params · Next-gen balanced detector",
+    },
+    ModelScaleOption {
+        scale: "v26-medium",
+        id: "yolo26m.pt",
+        label: "YOLO26 Medium",
+        desc: "19.5M params · Next-gen high-accuracy detector",
+    },
+    ModelScaleOption {
+        scale: "v26-large",
+        id: "yolo26l.pt",
+        label: "YOLO26 Large",
+        desc: "24.8M params · Next-gen precision detector",
+    },
+    ModelScaleOption {
+        scale: "v26-xlarge",
+        id: "yolo26x.pt",
+        label: "YOLO26 XLarge",
+        desc: "55.0M params · Next-gen maximum capacity",
+    },
+    ModelScaleOption {
+        scale: "seg-small",
+        id: "yolo11s-seg.pt",
+        label: "YOLO11 Small-Seg",
+        desc: "10.1M params · Fast instance segmentation",
+    },
+    ModelScaleOption {
+        scale: "seg-medium",
+        id: "yolo11m-seg.pt",
+        label: "YOLO11 Medium-Seg",
+        desc: "22.4M params · High-accuracy polygon masks",
+    },
+    ModelScaleOption {
+        scale: "v26-seg-small",
+        id: "yolo26s-seg.pt",
+        label: "YOLO26 Small-Seg",
+        desc: "9.8M params · Next-gen instance segmentation",
+    },
+];
+
+/// Webview model options for RT-DETR (`src/models.ts`). Default is `rtdetr-v2-r18`.
+pub const RTDETR_MODEL_OPTIONS: [ModelScaleOption; 3] = [
+    ModelScaleOption {
+        scale: "r18",
+        id: "rtdetr-v2-r18",
+        label: "RT-DETRv2 R18",
+        desc: "20.0M params · Native PyTorch/HF ResNet-18 DETR",
+    },
+    ModelScaleOption {
+        scale: "large",
+        id: "rtdetr-l.pt",
+        label: "RT-DETR Large",
+        desc: "32.0M params · Ultralytics HGNetv2-L DETR",
+    },
+    ModelScaleOption {
+        scale: "xlarge",
+        id: "rtdetr-x.pt",
+        label: "RT-DETR XLarge",
+        desc: "67.0M params · Ultralytics HGNetv2-X DETR",
+    },
+];
 
 /// High-level screen/overlay mode enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,10 +292,87 @@ impl ArchChoice {
 
     pub fn default_model(self) -> &'static str {
         match self {
-            Self::Yolo => "yolo11s.pt",
+            Self::Yolo => "yolo11m.pt",
             Self::RfDetr => "rf-detr-medium",
             Self::RtDetr => "rtdetr-v2-r18",
         }
+    }
+
+    pub fn model_options(self) -> &'static [ModelScaleOption] {
+        match self {
+            Self::Yolo => &YOLO_MODEL_OPTIONS,
+            Self::RfDetr => &RFDETR_MODEL_OPTIONS,
+            Self::RtDetr => &RTDETR_MODEL_OPTIONS,
+        }
+    }
+
+    /// Resolve a user-entered or selected scale shorthand (`nano`, `small`, `medium`, `large`, `base`, etc.)
+    /// or full model ID into the canonical model choice string for this architecture.
+    pub fn resolve_model_or_scale(self, raw: &str) -> String {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return self.default_model().to_string();
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        for opt in self.model_options() {
+            if opt.id.eq_ignore_ascii_case(&lower)
+                || opt.scale.eq_ignore_ascii_case(&lower)
+                || opt.label.eq_ignore_ascii_case(&lower)
+            {
+                return opt.id.to_string();
+            }
+        }
+        // Also support common short aliases
+        match (self, lower.as_str()) {
+            (Self::Yolo, "n") => "yolo11n.pt".to_string(),
+            (Self::Yolo, "s") => "yolo11s.pt".to_string(),
+            (Self::Yolo, "m") => "yolo11m.pt".to_string(),
+            (Self::Yolo, "l") => "yolo11l.pt".to_string(),
+            (Self::Yolo, "x" | "xl") => "yolo11x.pt".to_string(),
+            (Self::RfDetr, "n") => "rf-detr-nano".to_string(),
+            (Self::RfDetr, "s") => "rf-detr-small".to_string(),
+            (Self::RfDetr, "m") => "rf-detr-medium".to_string(),
+            (Self::RfDetr, "l") => "rf-detr-large".to_string(),
+            (Self::RfDetr, "b") => "rf-detr-base".to_string(),
+            (Self::RtDetr, "l") => "rtdetr-l.pt".to_string(),
+            (Self::RtDetr, "x" | "xl") => "rtdetr-x.pt".to_string(),
+            _ => trimmed.to_string(),
+        }
+    }
+
+    pub fn find_option(self, raw: &str) -> Option<&'static ModelScaleOption> {
+        let resolved = self.resolve_model_or_scale(raw);
+        self.model_options()
+            .iter()
+            .find(|o| o.id.eq_ignore_ascii_case(&resolved))
+    }
+
+    pub fn is_preset_model(self, raw: &str) -> bool {
+        let trimmed = raw.trim();
+        self.model_options().iter().any(|o| {
+            o.id.eq_ignore_ascii_case(trimmed) || o.scale.eq_ignore_ascii_case(trimmed)
+        })
+    }
+
+    pub fn cycle_model(self, current: &str, forward: bool) -> String {
+        let opts = self.model_options();
+        let resolved = self.resolve_model_or_scale(current);
+        let idx = opts
+            .iter()
+            .position(|o| o.id.eq_ignore_ascii_case(&resolved))
+            .unwrap_or_else(|| {
+                opts.iter()
+                    .position(|o| o.id == self.default_model())
+                    .unwrap_or(0)
+            });
+        let next_idx = if forward {
+            (idx + 1) % opts.len()
+        } else if idx == 0 {
+            opts.len() - 1
+        } else {
+            idx - 1
+        };
+        opts[next_idx].id.to_string()
     }
 
     pub fn next(self) -> Self {
@@ -159,9 +423,21 @@ pub struct CliConfig {
     pub batch: String,
     pub device: String,
     pub imgsz: u32,
+    pub imgsz_input: String,
     pub workers: Option<u32>,
     pub workers_input: String,
+    pub freeze_backbone: bool,
+    pub freeze_layers: u32,
+    pub amp: bool,
     pub run_name: String,
+    pub degrees: String,
+    pub flipud: String,
+    pub scale: String,
+    pub translate: String,
+    pub mosaic: String,
+    pub close_mosaic: String,
+    pub mixup: String,
+    pub copy_paste: bool,
     pub focused_field: usize,
     pub editing_field: bool,
     pub error_banner: Option<String>,
@@ -178,9 +454,21 @@ impl Default for CliConfig {
             batch: "4".to_string(),
             device: "auto".to_string(),
             imgsz: 960,
+            imgsz_input: "960".to_string(),
             workers: None,
             workers_input: "auto".to_string(),
+            freeze_backbone: false,
+            freeze_layers: 10,
+            amp: true,
             run_name: "BB-Parts-v3".to_string(),
+            degrees: "180".to_string(),
+            flipud: "0.5".to_string(),
+            scale: "0.05".to_string(),
+            translate: "0.1".to_string(),
+            mosaic: "0.0".to_string(),
+            close_mosaic: "10".to_string(),
+            mixup: "0.0".to_string(),
+            copy_paste: false,
             focused_field: 0,
             editing_field: false,
             error_banner: None,
@@ -189,6 +477,131 @@ impl Default for CliConfig {
 }
 
 impl CliConfig {
+    pub fn switch_arch(&mut self, next_arch: ArchChoice) {
+        let old_arch = self.arch;
+        let current_scale = old_arch.find_option(&self.model).map(|o| o.scale);
+        let was_preset = old_arch.is_preset_model(&self.model) || self.model.trim().is_empty();
+        self.arch = next_arch;
+        if was_preset {
+            if let Some(scale_name) = current_scale {
+                if old_arch != ArchChoice::RtDetr && next_arch != ArchChoice::RtDetr {
+                    if let Some(mapped) = next_arch
+                        .model_options()
+                        .iter()
+                        .find(|o| o.scale == scale_name)
+                    {
+                        self.model = mapped.id.to_string();
+                        return;
+                    }
+                }
+            }
+            self.model = next_arch.default_model().to_string();
+        }
+    }
+
+    pub fn active_aug_preset(&self) -> &'static str {
+        let deg = self.degrees.trim().parse::<f64>().unwrap_or(180.0);
+        let flip = self.flipud.trim().parse::<f64>().unwrap_or(0.5);
+        let sc = self.scale.trim().parse::<f64>().unwrap_or(0.05);
+        let tr = self.translate.trim().parse::<f64>().unwrap_or(0.1);
+        let mos = self.mosaic.trim().parse::<f64>().unwrap_or(0.0);
+        let cm = self.close_mosaic.trim().parse::<u32>().unwrap_or(10);
+        let mix = self.mixup.trim().parse::<f64>().unwrap_or(0.0);
+        let cp = self.copy_paste;
+
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-4;
+
+        if approx(mos, 0.0)
+            && approx(mix, 0.0)
+            && !cp
+            && approx(deg, 180.0)
+            && approx(flip, 0.5)
+            && approx(tr, 0.1)
+            && approx(sc, 0.05)
+            && cm == 10
+        {
+            "bench"
+        } else if approx(mos, 0.0)
+            && approx(mix, 0.0)
+            && !cp
+            && approx(deg, 0.0)
+            && approx(flip, 0.0)
+            && approx(tr, 0.0)
+            && approx(sc, 0.0)
+            && cm == 0
+        {
+            "off"
+        } else if approx(mos, 0.5)
+            && approx(mix, 0.0)
+            && !cp
+            && approx(deg, 5.0)
+            && approx(flip, 0.0)
+            && approx(tr, 0.1)
+            && approx(sc, 0.25)
+            && cm == 10
+        {
+            "light"
+        } else if approx(mos, 1.0)
+            && approx(mix, 0.1)
+            && !cp
+            && approx(deg, 10.0)
+            && approx(flip, 0.1)
+            && approx(tr, 0.1)
+            && approx(sc, 0.5)
+            && cm == 10
+        {
+            "medium"
+        } else {
+            "custom"
+        }
+    }
+
+    pub fn apply_aug_preset(&mut self, preset: &str) {
+        match preset.trim().to_ascii_lowercase().as_str() {
+            "bench" => {
+                self.mosaic = "0.0".to_string();
+                self.mixup = "0.0".to_string();
+                self.copy_paste = false;
+                self.degrees = "180".to_string();
+                self.flipud = "0.5".to_string();
+                self.translate = "0.1".to_string();
+                self.scale = "0.05".to_string();
+                self.close_mosaic = "10".to_string();
+            }
+            "off" => {
+                self.mosaic = "0.0".to_string();
+                self.mixup = "0.0".to_string();
+                self.copy_paste = false;
+                self.degrees = "0".to_string();
+                self.flipud = "0.0".to_string();
+                self.translate = "0.0".to_string();
+                self.scale = "0.0".to_string();
+                self.close_mosaic = "0".to_string();
+            }
+            "light" => {
+                self.mosaic = "0.5".to_string();
+                self.mixup = "0.0".to_string();
+                self.copy_paste = false;
+                self.degrees = "5".to_string();
+                self.flipud = "0.0".to_string();
+                self.translate = "0.1".to_string();
+                self.scale = "0.25".to_string();
+                self.close_mosaic = "10".to_string();
+            }
+            "medium" => {
+                self.mosaic = "1.0".to_string();
+                self.mixup = "0.1".to_string();
+                self.copy_paste = false;
+                self.degrees = "10".to_string();
+                self.flipud = "0.1".to_string();
+                self.translate = "0.1".to_string();
+                self.scale = "0.5".to_string();
+                self.close_mosaic = "10".to_string();
+            }
+            _ => {}
+        }
+    }
+
     pub fn parse_workers(&self) -> Result<Option<u32>, String> {
         let raw = self.workers_input.trim();
         if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
@@ -198,6 +611,20 @@ impl CliConfig {
             .parse::<u32>()
             .map_err(|_| format!("Invalid workers value: '{raw}' (use a number or 'auto')"))?;
         Ok(Some(parsed))
+    }
+
+    pub fn resolve_imgsz(&self) -> Result<u32, String> {
+        if self.imgsz != 960 && self.imgsz_input.trim() == "960" {
+            return Ok(self.imgsz.max(32));
+        }
+        let raw = self.imgsz_input.trim();
+        if raw.is_empty() {
+            return Ok(self.imgsz.max(32));
+        }
+        let parsed = raw
+            .parse::<u32>()
+            .map_err(|_| format!("Invalid resolution/imgsz value: '{raw}'"))?;
+        Ok(parsed.max(32))
     }
 
     pub fn to_training_request(&self) -> Result<TrainingRequest, String> {
@@ -217,45 +644,85 @@ impl CliConfig {
             .parse::<u32>()
             .map_err(|_| format!("Invalid batch value: '{}'", self.batch))?
             .max(1);
+        let imgsz_val = self.resolve_imgsz()?;
         let workers_val = self.parse_workers()?;
-        let model_trimmed = if self.model.trim().is_empty() {
-            self.arch.default_model().to_string()
-        } else {
-            self.model.trim().to_string()
-        };
-        let task = if model_trimmed.to_ascii_lowercase().contains("-seg") {
+        let model_resolved = self.arch.resolve_model_or_scale(&self.model);
+        let task = if model_resolved.to_ascii_lowercase().contains("-seg") {
             "segment".to_string()
         } else {
             "detect".to_string()
         };
 
+        let degrees_val = self
+            .degrees
+            .trim()
+            .parse::<f32>()
+            .map_err(|_| format!("Invalid degrees value: '{}'", self.degrees))?
+            .clamp(0.0, 180.0);
+        let flipud_val = self
+            .flipud
+            .trim()
+            .parse::<f32>()
+            .map_err(|_| format!("Invalid flipud value: '{}'", self.flipud))?
+            .clamp(0.0, 1.0);
+        let scale_val = self
+            .scale
+            .trim()
+            .parse::<f32>()
+            .map_err(|_| format!("Invalid scale value: '{}'", self.scale))?
+            .clamp(0.0, 1.0);
+        let translate_val = self
+            .translate
+            .trim()
+            .parse::<f32>()
+            .map_err(|_| format!("Invalid translate value: '{}'", self.translate))?
+            .clamp(0.0, 1.0);
+        let mosaic_val = self
+            .mosaic
+            .trim()
+            .parse::<f32>()
+            .map_err(|_| format!("Invalid mosaic value: '{}'", self.mosaic))?
+            .clamp(0.0, 1.0);
+        let close_mosaic_val = self
+            .close_mosaic
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("Invalid close_mosaic value: '{}'", self.close_mosaic))?;
+        let mixup_val = self
+            .mixup
+            .trim()
+            .parse::<f32>()
+            .map_err(|_| format!("Invalid mixup value: '{}'", self.mixup))?
+            .clamp(0.0, 1.0);
+        let copy_paste_val: f32 = if self.copy_paste { 0.3 } else { 0.0 };
+
         Ok(TrainingRequest {
             dataset_path: dataset_trimmed.to_string(),
-            model_choice: model_trimmed,
+            model_choice: model_resolved,
             run_name: if self.run_name.trim().is_empty() {
                 "BB-Parts-v3".to_string()
             } else {
                 self.run_name.trim().to_string()
             },
             epochs: epochs_val,
-            imgsz: self.imgsz,
+            imgsz: imgsz_val,
             device: if self.device.trim().is_empty() {
                 "auto".to_string()
             } else {
                 self.device.trim().to_string()
             },
             batch: batch_val,
-            amp: true,
-            freeze_backbone: false,
-            freeze_layers: 10,
-            mosaic: 0.0,
-            mixup: 0.0,
-            copy_paste: 0.0,
-            degrees: 180.0,
-            translate: 0.1,
-            scale: 0.05,
-            flipud: 0.5,
-            close_mosaic: 10,
+            amp: self.amp,
+            freeze_backbone: self.freeze_backbone,
+            freeze_layers: self.freeze_layers,
+            mosaic: mosaic_val,
+            mixup: mixup_val,
+            copy_paste: copy_paste_val,
+            degrees: degrees_val,
+            translate: translate_val,
+            scale: scale_val,
+            flipud: flipud_val,
+            close_mosaic: close_mosaic_val,
             task,
             model_family: self.arch.as_family_str().to_string(),
             workers: workers_val,
@@ -1453,13 +1920,17 @@ where
                        ls-trainer-tui [OPTIONS]\n\n\
                      OPTIONS:\n  \
                        --arch <yolo|rf-detr|rt-detr>   Model architecture family\n  \
-                       --dataset <path>                Dataset folder or archive path\n  \
+                       --scale <nano|small|medium|...> Model scale shorthand (default: medium)\n  \
                        --model <path>                  Model ID or weights path\n  \
+                       --dataset <path>                Dataset folder or archive path\n  \
                        --epochs <n>                    Number of training epochs (default: 60)\n  \
                        --batch <n>                     Batch size (default: 4)\n  \
-                       --device <str>                  Device (auto, xpu, cuda, 0, cpu)\n  \
-                       --imgsz <n>                     Image resolution (640, 960, 1280)\n  \
+                       --device <str>                  Device (auto, xpu, xpu:0,1, cuda, 0, cpu)\n  \
+                       --imgsz <n>                     Image resolution (640, 960, 1280; default: 960)\n  \
                        --workers <n>                   DataLoader workers (default: auto; 0 for Windows Arc)\n  \
+                       --freeze-backbone               Freeze backbone layers (freeze=10)\n  \
+                       --no-amp                        Disable mixed precision (use FP32)\n  \
+                       --aug-preset <bench|off|light|medium> Augmentation preset (default: bench)\n  \
                        --run-name <name>               Output run directory name\n"
                 );
                 return Ok(None);
@@ -1471,13 +1942,16 @@ where
                 })?;
                 if !explicit_model {
                     cfg.model = cfg.arch.default_model().to_string();
+                } else {
+                    cfg.model = cfg.arch.resolve_model_or_scale(&cfg.model);
                 }
             }
             "--dataset" => {
                 cfg.dataset = next_val()?;
             }
-            "--model" => {
-                cfg.model = next_val()?;
+            "--model" | "--scale" => {
+                let raw = next_val()?;
+                cfg.model = cfg.arch.resolve_model_or_scale(&raw);
                 explicit_model = true;
             }
             "--epochs" => {
@@ -1489,19 +1963,84 @@ where
             "--device" => {
                 cfg.device = next_val()?;
             }
-            "--imgsz" => {
-                let raw = next_val()?;
-                cfg.imgsz = raw
-                    .parse::<u32>()
-                    .map_err(|_| format!("Invalid --imgsz value '{raw}'"))?;
-            }
-            "--workers" => {
+            "--imgsz" | "--resolution" => {
                 let raw = next_val()?;
                 let parsed = raw
                     .parse::<u32>()
-                    .map_err(|_| format!("Invalid --workers value '{raw}'"))?;
-                cfg.workers = Some(parsed);
-                cfg.workers_input = parsed.to_string();
+                    .map_err(|_| format!("Invalid --imgsz value '{raw}'"))?;
+                cfg.imgsz = parsed;
+                cfg.imgsz_input = parsed.to_string();
+            }
+            "--workers" => {
+                let raw = next_val()?;
+                if raw.eq_ignore_ascii_case("auto") {
+                    cfg.workers = None;
+                    cfg.workers_input = "auto".to_string();
+                } else {
+                    let parsed = raw
+                        .parse::<u32>()
+                        .map_err(|_| format!("Invalid --workers value '{raw}'"))?;
+                    cfg.workers = Some(parsed);
+                    cfg.workers_input = parsed.to_string();
+                }
+            }
+            "--freeze-backbone" => {
+                if let Some(ref v) = inline_val {
+                    cfg.freeze_backbone = matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    );
+                } else {
+                    cfg.freeze_backbone = true;
+                }
+            }
+            "--amp" => {
+                if let Some(ref v) = inline_val {
+                    cfg.amp = !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "0" | "false" | "no" | "off"
+                    );
+                } else {
+                    cfg.amp = true;
+                }
+            }
+            "--no-amp" => {
+                cfg.amp = false;
+            }
+            "--aug-preset" => {
+                let raw = next_val()?;
+                cfg.apply_aug_preset(&raw);
+            }
+            "--degrees" => {
+                cfg.degrees = next_val()?;
+            }
+            "--flipud" => {
+                cfg.flipud = next_val()?;
+            }
+            "--scale-gain" => {
+                cfg.scale = next_val()?;
+            }
+            "--translate" => {
+                cfg.translate = next_val()?;
+            }
+            "--mosaic" => {
+                cfg.mosaic = next_val()?;
+            }
+            "--close-mosaic" => {
+                cfg.close_mosaic = next_val()?;
+            }
+            "--mixup" => {
+                cfg.mixup = next_val()?;
+            }
+            "--copy-paste" => {
+                if let Some(ref v) = inline_val {
+                    cfg.copy_paste = matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on" | "0.3"
+                    );
+                } else {
+                    cfg.copy_paste = true;
+                }
             }
             "--run-name" => {
                 cfg.run_name = next_val()?;

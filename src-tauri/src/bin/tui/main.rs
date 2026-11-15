@@ -238,6 +238,62 @@ mod tests {
             "No flags must open the interactive launcher"
         );
 
+        // Verify webview-parity defaults on no-flag launch:
+        assert_eq!(cfg.arch, ArchChoice::Yolo);
+        assert_eq!(cfg.model, "yolo11m.pt"); // medium default matching webview
+        assert_eq!(cfg.epochs, "60");
+        assert_eq!(cfg.batch, "4");
+        assert_eq!(cfg.imgsz, 960);
+        assert_eq!(cfg.imgsz_input, "960");
+        assert_eq!(cfg.workers, None);
+        assert_eq!(cfg.workers_input, "auto");
+        assert_eq!(cfg.device, "auto");
+        assert!(!cfg.freeze_backbone);
+        assert_eq!(cfg.freeze_layers, 10);
+        assert!(cfg.amp);
+        assert_eq!(cfg.run_name, "BB-Parts-v3");
+        assert_eq!(cfg.active_aug_preset(), "bench");
+        assert_eq!(cfg.degrees, "180");
+        assert_eq!(cfg.flipud, "0.5");
+        assert_eq!(cfg.scale, "0.05");
+        assert_eq!(cfg.translate, "0.1");
+        assert_eq!(cfg.mosaic, "0.0");
+        assert_eq!(cfg.close_mosaic, "10");
+        assert_eq!(cfg.mixup, "0.0");
+        assert!(!cfg.copy_paste);
+
+        // Verify RF-DETR model scale list matches webview (nano, small, medium [default], large, base, seg-*):
+        let rfdetr_scales: Vec<&str> = ArchChoice::RfDetr
+            .model_options()
+            .iter()
+            .map(|o| o.scale)
+            .collect();
+        assert_eq!(
+            rfdetr_scales,
+            vec![
+                "nano",
+                "small",
+                "medium",
+                "large",
+                "base",
+                "seg-nano",
+                "seg-small",
+                "seg-medium",
+                "seg-large",
+                "seg-preview",
+            ]
+        );
+        assert_eq!(ArchChoice::RfDetr.default_model(), "rf-detr-medium");
+
+        // Verify YOLO model scale list matches webview (nano, small, medium [default], large, xlarge, v26-*, seg-*):
+        let yolo_scales: Vec<&str> = ArchChoice::Yolo
+            .model_options()
+            .iter()
+            .map(|o| o.scale)
+            .collect();
+        assert!(yolo_scales.starts_with(&["nano", "small", "medium", "large", "xlarge"]));
+        assert_eq!(ArchChoice::Yolo.default_model(), "yolo11m.pt");
+
         let state = Arc::new(Mutex::new(AppState::new(cfg)));
         {
             let guard = state.lock().unwrap();
@@ -259,24 +315,62 @@ mod tests {
             }
             assert!(screen_text.contains("LS-Trainer TUI — Launch Menu"));
             assert!(screen_text.contains("Architecture"));
+            assert!(screen_text.contains("Model Scale"));
             assert!(screen_text.contains("Dataset Path"));
             assert!(screen_text.contains("Epochs"));
             assert!(screen_text.contains("Batch Size"));
-            assert!(screen_text.contains("Device"));
+            assert!(screen_text.contains("Resolution"));
             assert!(screen_text.contains("Workers"));
+            assert!(screen_text.contains("Device"));
+            assert!(screen_text.contains("Freeze Backbone"));
+            assert!(screen_text.contains("Mixed Prec (AMP)"));
+            assert!(screen_text.contains("Run Name"));
+            assert!(screen_text.contains("Aug Preset"));
+            assert!(screen_text.contains("Degrees"));
+            assert!(screen_text.contains("Flip UD"));
+            assert!(screen_text.contains("Scale"));
+            assert!(screen_text.contains("Translate"));
+            assert!(screen_text.contains("Mosaic"));
+            assert!(screen_text.contains("Close Mosaic"));
+            assert!(screen_text.contains("MixUp"));
+            assert!(screen_text.contains("Copy-Paste"));
             assert!(screen_text.contains("[ Start Training (Enter / F2) ]"));
         }
 
         // Navigate and edit fields in the launcher:
-        // Field 0: Architecture -> Right arrow switches YOLO -> RF-DETR
+        // Field 0: Architecture -> Right arrow switches YOLO (medium) -> RF-DETR (rf-detr-medium)
         handle_setup_key(&state, KeyCode::Right);
         assert_eq!(state.lock().unwrap().setup.arch, ArchChoice::RfDetr);
-        handle_setup_key(&state, KeyCode::Left);
-        assert_eq!(state.lock().unwrap().setup.arch, ArchChoice::Yolo);
+        assert_eq!(state.lock().unwrap().setup.model, "rf-detr-medium");
 
-        // Down to Field 1 (Dataset Path), Enter to edit, set dataset path, Enter to confirm
+        // Down to Field 1 (Model Scale): Left arrow cycles medium -> small (rf-detr-small), Right arrow -> medium -> large
         handle_setup_key(&state, KeyCode::Down);
         assert_eq!(state.lock().unwrap().setup.focused_field, 1);
+        handle_setup_key(&state, KeyCode::Left);
+        assert_eq!(state.lock().unwrap().setup.model, "rf-detr-small");
+        handle_setup_key(&state, KeyCode::Left);
+        assert_eq!(state.lock().unwrap().setup.model, "rf-detr-nano");
+        handle_setup_key(&state, KeyCode::Right);
+        assert_eq!(state.lock().unwrap().setup.model, "rf-detr-small");
+
+        // Switch back to Field 0 (Architecture) -> Left arrow switches RF-DETR (small) -> YOLO (yolo11s.pt)
+        handle_setup_key(&state, KeyCode::Up);
+        assert_eq!(state.lock().unwrap().setup.focused_field, 0);
+        handle_setup_key(&state, KeyCode::Left);
+        assert_eq!(state.lock().unwrap().setup.arch, ArchChoice::Yolo);
+        assert_eq!(state.lock().unwrap().setup.model, "yolo11s.pt");
+
+        // Down to Field 1 (Model Scale), Right arrow cycles small -> medium (yolo11m.pt) -> large (yolo11l.pt)
+        handle_setup_key(&state, KeyCode::Down);
+        assert_eq!(state.lock().unwrap().setup.focused_field, 1);
+        handle_setup_key(&state, KeyCode::Right);
+        assert_eq!(state.lock().unwrap().setup.model, "yolo11m.pt");
+        handle_setup_key(&state, KeyCode::Right);
+        assert_eq!(state.lock().unwrap().setup.model, "yolo11l.pt");
+
+        // Down to Field 2 (Dataset Path), Enter to edit, set dataset path, Enter to confirm
+        handle_setup_key(&state, KeyCode::Down);
+        assert_eq!(state.lock().unwrap().setup.focused_field, 2);
         handle_setup_key(&state, KeyCode::Enter);
         assert!(state.lock().unwrap().setup.editing_field);
         state.lock().unwrap().setup.dataset =
@@ -284,24 +378,58 @@ mod tests {
         handle_setup_key(&state, KeyCode::Enter);
         assert!(!state.lock().unwrap().setup.editing_field);
 
-        // Down to Field 2 (Epochs), edit to "1"
+        // Down to Field 3 (Epochs), edit to "15"
         handle_setup_key(&state, KeyCode::Down);
-        assert_eq!(state.lock().unwrap().setup.focused_field, 2);
+        assert_eq!(state.lock().unwrap().setup.focused_field, 3);
         handle_setup_key(&state, KeyCode::Backspace);
         handle_setup_key(&state, KeyCode::Backspace);
         handle_setup_key(&state, KeyCode::Char('1'));
+        handle_setup_key(&state, KeyCode::Char('5'));
         handle_setup_key(&state, KeyCode::Enter);
-        assert_eq!(state.lock().unwrap().setup.epochs, "1");
+        assert_eq!(state.lock().unwrap().setup.epochs, "15");
 
-        // Down to Field 3 (Batch Size), Field 4 (Device), Field 5 (Workers)
-        handle_setup_key(&state, KeyCode::Down); // 3: Batch
-        handle_setup_key(&state, KeyCode::Down); // 4: Device
-        handle_setup_key(&state, KeyCode::Right); // auto -> xpu
+        // Down to Field 4 (Batch Size), cycle Right 4 -> 8
+        handle_setup_key(&state, KeyCode::Down);
+        assert_eq!(state.lock().unwrap().setup.focused_field, 4);
+        handle_setup_key(&state, KeyCode::Right);
+        assert_eq!(state.lock().unwrap().setup.batch, "8");
+
+        // Down to Field 5 (Resolution / imgsz), cycle Right 960 -> 1280
+        handle_setup_key(&state, KeyCode::Down);
+        assert_eq!(state.lock().unwrap().setup.focused_field, 5);
+        handle_setup_key(&state, KeyCode::Right);
+        assert_eq!(state.lock().unwrap().setup.imgsz_input, "1280");
+        assert_eq!(state.lock().unwrap().setup.imgsz, 1280);
+
+        // Down to Field 6 (Workers), cycle Right auto -> 0
+        handle_setup_key(&state, KeyCode::Down);
+        assert_eq!(state.lock().unwrap().setup.focused_field, 6);
+        handle_setup_key(&state, KeyCode::Right);
+        assert_eq!(state.lock().unwrap().setup.workers_input, "0");
+
+        // Down to Field 7 (Device), cycle Right auto -> xpu
+        handle_setup_key(&state, KeyCode::Down);
+        assert_eq!(state.lock().unwrap().setup.focused_field, 7);
+        handle_setup_key(&state, KeyCode::Right);
         assert_eq!(state.lock().unwrap().setup.device, "xpu");
 
-        handle_setup_key(&state, KeyCode::Down); // 5: Workers
-        handle_setup_key(&state, KeyCode::Right); // auto -> 0
-        assert_eq!(state.lock().unwrap().setup.workers_input, "0");
+        // Down to Field 8 (Freeze Backbone), toggle false -> true
+        handle_setup_key(&state, KeyCode::Down);
+        assert_eq!(state.lock().unwrap().setup.focused_field, 8);
+        handle_setup_key(&state, KeyCode::Right);
+        assert!(state.lock().unwrap().setup.freeze_backbone);
+
+        // Down to Field 9 (AMP), Field 10 (Run Name), Field 11 (Aug Preset): cycle bench -> off -> light
+        handle_setup_key(&state, KeyCode::Down); // 9: AMP
+        handle_setup_key(&state, KeyCode::Down); // 10: Run Name
+        handle_setup_key(&state, KeyCode::Down); // 11: Aug Preset
+        assert_eq!(state.lock().unwrap().setup.focused_field, 11);
+        handle_setup_key(&state, KeyCode::Right); // bench -> off
+        assert_eq!(state.lock().unwrap().setup.active_aug_preset(), "off");
+        assert_eq!(state.lock().unwrap().setup.degrees, "0");
+        handle_setup_key(&state, KeyCode::Left); // off -> bench
+        assert_eq!(state.lock().unwrap().setup.active_aug_preset(), "bench");
+        assert_eq!(state.lock().unwrap().setup.degrees, "180");
 
         let req = state
             .lock()
@@ -310,10 +438,21 @@ mod tests {
             .to_training_request()
             .expect("valid training request from launcher");
         assert_eq!(req.model_family, "YOLO");
-        assert_eq!(req.epochs, 1);
-        assert_eq!(req.batch, 4);
+        assert_eq!(req.model_choice, "yolo11l.pt");
+        assert_eq!(req.epochs, 15);
+        assert_eq!(req.batch, 8);
+        assert_eq!(req.imgsz, 1280);
         assert_eq!(req.device, "xpu");
         assert_eq!(req.workers, Some(0));
+        assert!(req.freeze_backbone);
+        assert_eq!(req.freeze_layers, 10);
+        assert!(req.amp);
+        assert_eq!(req.degrees, 180.0);
+        assert_eq!(req.flipud, 0.5);
+        assert_eq!(req.scale, 0.05);
+        assert_eq!(req.translate, 0.1);
+        assert_eq!(req.mosaic, 0.0);
+        assert_eq!(req.close_mosaic, 10);
     }
 
     #[test]
@@ -491,27 +630,42 @@ mod tests {
         let state = Arc::new(Mutex::new(AppState::new(cfg)));
         assert_eq!(state.lock().unwrap().mode, UiMode::Setup);
 
-        // Configure 1-epoch fast XPU run in launcher and press F2 to start
+        // Configure 1-epoch fast XPU run in launcher by cycling scale (medium -> small -> nano) and changing hyperparameters:
+        handle_setup_key(&state, KeyCode::Down); // 1: Model Scale (currently yolo11m.pt)
+        handle_setup_key(&state, KeyCode::Left); // small (yolo11s.pt)
+        handle_setup_key(&state, KeyCode::Left); // nano (yolo11n.pt)
+        assert_eq!(state.lock().unwrap().setup.model, "yolo11n.pt");
         {
             let mut guard = state.lock().unwrap();
-            guard.setup.arch = ArchChoice::Yolo;
-            guard.setup.model = "yolo11n.pt".to_string();
             guard.setup.dataset = tmp_ds.to_string_lossy().to_string();
             guard.setup.epochs = "1".to_string();
             guard.setup.batch = "2".to_string();
             guard.setup.imgsz = 64;
+            guard.setup.imgsz_input = "64".to_string();
             guard.setup.device = "xpu".to_string();
             guard.setup.workers_input = "0".to_string();
+            guard.setup.degrees = "90".to_string();
             guard.setup.run_name = "tui-short-verify".to_string();
         }
 
         // Press F2 in launcher -> transitions to UiMode::Training and spawns run_training + ONNX export
         let should_quit = handle_setup_key(&state, KeyCode::F(2));
         assert!(!should_quit);
-        assert_eq!(state.lock().unwrap().mode, UiMode::Training);
-        assert!(state.lock().unwrap().is_running);
+        {
+            let guard = state.lock().unwrap();
+            assert_eq!(guard.mode, UiMode::Training);
+            assert!(guard.is_running);
+            let req = guard.active_request.as_ref().expect("active_request set");
+            assert_eq!(req.model_choice, "yolo11n.pt");
+            assert_eq!(req.epochs, 1);
+            assert_eq!(req.batch, 2);
+            assert_eq!(req.imgsz, 64);
+            assert_eq!(req.device, "xpu");
+            assert_eq!(req.workers, Some(0));
+            assert_eq!(req.degrees, 90.0);
+        }
 
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_secs(120);
         let mut saw_live_metrics = false;
         while Instant::now() < deadline {
             let done = {
