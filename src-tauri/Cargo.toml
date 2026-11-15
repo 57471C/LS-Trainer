@@ -8,6 +8,7 @@ repository = ""
 edition = "2024"
 rust-version = "1.90"
 default-run = "app"
+autobins = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -21,7 +22,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "ls-trainer-tui"
-path = "src/bin/tui/main.rs"
+path = "src/bin/ls-trainer-tui/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2.7.3", features = [] }
