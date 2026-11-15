@@ -23,7 +23,9 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
-    widgets::{Axis, Block, BorderType, Borders, Chart, Dataset, GraphType, Paragraph, Sparkline},
+    widgets::{
+        Axis, Block, BorderType, Borders, Chart, Clear, Dataset, GraphType, Paragraph, Sparkline,
+    },
     Frame,
 };
 use sysinfo::System;
@@ -47,6 +49,7 @@ const BAR_TRACK_BG: Color = Color::Rgb(26, 32, 44);
 const BAR_GPU_TEAL: Color = Color::Rgb(68, 168, 186);
 const BAR_EPOCH_TEAL: Color = Color::Rgb(62, 154, 174);
 const BAR_STEP_BLUE: Color = Color::Rgb(72, 128, 184);
+const BAR_OVERALL_CYAN: Color = Color::Rgb(56, 142, 168);
 const BAR_RAM_SLATE: Color = Color::Rgb(92, 148, 188);
 const GAUGE_TEXT_COVERED: Color = Color::Rgb(16, 20, 26);
 const GAUGE_TEXT_UNCOVERED: Color = Color::Rgb(228, 234, 242);
@@ -54,6 +57,9 @@ const BORDER_SOFT: Color = Color::Rgb(64, 76, 94);
 const TABLE_BORDER_SOFT: Color = Color::Rgb(74, 86, 104);
 const TITLE_ACCENT: Color = Color::Rgb(116, 202, 218);
 const LABEL_MUTED: Color = Color::Rgb(138, 150, 168);
+const NEW_BEST_GOLD: Color = Color::Rgb(255, 216, 102);
+const NEW_BEST_BADGE_BG: Color = Color::Rgb(42, 92, 66);
+const OVERLAY_BG: Color = Color::Rgb(18, 22, 30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArchChoice {
@@ -296,8 +302,38 @@ enum UiMode {
     Training,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayMode {
+    None,
+    Help,
+    Config,
+    History,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthLevel {
+    Healthy,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunHistoryEntry {
+    pub run_name: String,
+    pub task: String,
+    pub run_dir: String,
+    pub arch_model: String,
+    pub map50: Option<f64>,
+    pub map50_95: Option<f64>,
+    pub best_weights: Option<String>,
+    pub onnx_path: Option<String>,
+    pub timestamp_label: String,
+    pub modified_epoch_secs: u64,
+}
+
 pub struct AppState {
     mode: UiMode,
+    overlay: OverlayMode,
     setup: CliConfig,
     active_request: Option<TrainingRequest>,
     is_running: bool,
@@ -305,6 +341,11 @@ pub struct AppState {
     stop_initiated: bool,
     exit_code: Option<i32>,
     status_line: String,
+    health_level: HealthLevel,
+    warning_count: usize,
+    suppressed_warning_count: usize,
+    warning_tags: Vec<String>,
+    last_error_msg: Option<String>,
     latest_metrics: TrainMetrics,
     step_counter: u64,
     train_loss_history: VecDeque<(f64, f64)>,
@@ -312,6 +353,10 @@ pub struct AppState {
     map50_95_history: VecDeque<(f64, f64)>,
     best_map50: Option<f64>,
     best_map50_95: Option<f64>,
+    best_loss: Option<f64>,
+    best_ckpt_mtime: Option<std::time::SystemTime>,
+    new_best_until: Option<Instant>,
+    dataset_train_images: Option<u32>,
     gpus: Vec<GpuCardState>,
     host_cpu_percent: f64,
     host_ram_used_gb: f64,
@@ -328,6 +373,59 @@ pub struct AppState {
     results_dir: Option<String>,
     best_weights_path: Option<String>,
     onnx_path: Option<String>,
+    history_entries: Vec<RunHistoryEntry>,
+    history_selected: usize,
+}
+
+fn strip_ansi_codes(s: &str) -> String {
+    if !s.contains('\x1b') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            while let Some(&nc) = chars.peek() {
+                chars.next();
+                if ('@'..='~').contains(&nc) {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Classify noisy non-fatal framework warnings (triton, sync_dist, torch.jit.script, etc.)
+/// that should update the Health/Warning status line while being suppressed from flooding the live log.
+fn classify_noisy_warning(clean_lower: &str) -> Option<&'static str> {
+    if clean_lower.contains("triton not found")
+        || clean_lower.contains("flop counting will not work")
+    {
+        Some("triton")
+    } else if clean_lower.contains("sync_dist") {
+        Some("sync_dist")
+    } else if clean_lower.contains("torch.jit.script") {
+        Some("jit.script")
+    } else if clean_lower.contains("accumulategrad")
+        || clean_lower.contains("grad strides do not match")
+    {
+        Some("grad_stride")
+    } else if clean_lower.contains("leafspec") {
+        Some("LeafSpec")
+    } else if clean_lower.contains("augmentation backend") {
+        Some("aug_backend")
+    } else if clean_lower.contains("possibleuserwarning:")
+        || clean_lower.contains("futurewarning:")
+        || clean_lower.contains("deprecationwarning:")
+    {
+        Some("deprecation")
+    } else {
+        None
+    }
 }
 
 impl AppState {
@@ -341,6 +439,7 @@ impl AppState {
         host_cpu_history.push_back(0);
         Self {
             mode,
+            overlay: OverlayMode::None,
             setup,
             active_request: None,
             is_running: false,
@@ -348,6 +447,11 @@ impl AppState {
             stop_initiated: false,
             exit_code: None,
             status_line: "Ready".to_string(),
+            health_level: HealthLevel::Healthy,
+            warning_count: 0,
+            suppressed_warning_count: 0,
+            warning_tags: Vec::new(),
+            last_error_msg: None,
             latest_metrics: TrainMetrics::default(),
             step_counter: 0,
             train_loss_history: VecDeque::with_capacity(MAX_HISTORY_POINTS),
@@ -355,6 +459,10 @@ impl AppState {
             map50_95_history: VecDeque::with_capacity(MAX_HISTORY_POINTS),
             best_map50: None,
             best_map50_95: None,
+            best_loss: None,
+            best_ckpt_mtime: None,
+            new_best_until: None,
+            dataset_train_images: None,
             gpus: Vec::new(),
             host_cpu_percent: 0.0,
             host_ram_used_gb: 0.0,
@@ -371,6 +479,38 @@ impl AppState {
             results_dir: None,
             best_weights_path: None,
             onnx_path: None,
+            history_entries: Vec::new(),
+            history_selected: 0,
+        }
+    }
+
+    fn trigger_new_best(&mut self) {
+        self.new_best_until = Some(Instant::now() + Duration::from_secs(6));
+    }
+
+    fn is_new_best_active(&self) -> bool {
+        self.new_best_until
+            .map_or(false, |until| Instant::now() < until)
+    }
+
+    fn record_warning_tag(&mut self, tag: &str) {
+        if self.health_level != HealthLevel::Error {
+            self.health_level = HealthLevel::Warning;
+        }
+        self.warning_count = self.warning_count.saturating_add(1);
+        let clean_tag = tag.trim().to_string();
+        if !clean_tag.is_empty() && !self.warning_tags.iter().any(|t| t == &clean_tag) {
+            if self.warning_tags.len() < 4 {
+                self.warning_tags.push(clean_tag);
+            }
+        }
+    }
+
+    fn record_error(&mut self, msg: &str) {
+        self.health_level = HealthLevel::Error;
+        let trimmed = msg.trim();
+        if !trimmed.is_empty() {
+            self.last_error_msg = Some(trimmed.to_string());
         }
     }
 
@@ -385,12 +525,27 @@ impl AppState {
         }
         if let Some(ref dir_str) = self.results_dir {
             let dir_path = PathBuf::from(dir_str);
-            if self.best_weights_path.is_none() {
-                self.best_weights_path =
-                    find_best_checkpoint_in_dir(&dir_path).map(|p| to_display_path(&p));
+            if let Some(best_p) = find_best_checkpoint_in_dir(&dir_path) {
+                let disp = to_display_path(&best_p);
+                let mtime = std::fs::metadata(&best_p)
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                let is_best_named = best_p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_ascii_lowercase().contains("best"))
+                    .unwrap_or(false);
+                if is_best_named {
+                    let changed = self.best_weights_path.as_ref() != Some(&disp)
+                        || (mtime.is_some() && mtime != self.best_ckpt_mtime);
+                    if changed && self.step_counter > 0 {
+                        self.trigger_new_best();
+                    }
+                    self.best_ckpt_mtime = mtime;
+                }
+                self.best_weights_path = Some(disp);
             }
-            if self.onnx_path.is_none() {
-                self.onnx_path = find_onnx_in_dir(&dir_path).map(|p| to_display_path(&p));
+            if let Some(onnx_p) = find_onnx_in_dir(&dir_path) {
+                self.onnx_path = Some(to_display_path(&onnx_p));
             }
         }
     }
@@ -404,6 +559,107 @@ impl AppState {
     }
 
     fn push_log(&mut self, line: String) {
+        let clean = strip_ansi_codes(&line);
+        let clean_trimmed = clean.trim();
+        let clean_lower = clean_trimmed.to_ascii_lowercase();
+
+        // Parse live paths & dataset info from log stream immediately
+        if let Some(rest) = clean_trimmed.strip_prefix("[LS-Trainer] Results directory:") {
+            let d = rest.trim();
+            if !d.is_empty() {
+                self.results_dir = Some(to_display_path(Path::new(d)));
+                self.refresh_run_artifacts();
+            }
+        } else if let Some(idx) = clean_trimmed.find("Logging results to ") {
+            let d = clean_trimmed[idx + "Logging results to ".len()..].trim();
+            if !d.is_empty() && Path::new(d).is_dir() {
+                self.results_dir = Some(to_display_path(Path::new(d)));
+                self.refresh_run_artifacts();
+            }
+        } else if let Some(idx) = clean_trimmed.find("Results saved to: ") {
+            let rest = clean_trimmed[idx + "Results saved to: ".len()..].trim();
+            let d = rest.split(" (run ").next().unwrap_or(rest).trim();
+            if !d.is_empty() && Path::new(d).is_dir() {
+                self.results_dir = Some(to_display_path(Path::new(d)));
+                self.refresh_run_artifacts();
+            }
+        }
+
+        if let Some(idx) = clean_trimmed.find("Immediate checkpoint saved to:") {
+            let p = clean_trimmed[idx + "Immediate checkpoint saved to:".len()..].trim();
+            if !p.is_empty() {
+                self.best_weights_path = Some(to_display_path(Path::new(p)));
+                self.refresh_run_artifacts();
+            }
+        } else if let Some(idx) = clean_trimmed.find("Found RF-DETR checkpoint:") {
+            let p = clean_trimmed[idx + "Found RF-DETR checkpoint:".len()..].trim();
+            if !p.is_empty() {
+                self.best_weights_path = Some(to_display_path(Path::new(p)));
+            }
+        } else if let Some(idx) = clean_trimmed.find("ONNX export completed successfully! File:") {
+            let p = clean_trimmed[idx + "ONNX export completed successfully! File:".len()..].trim();
+            if !p.is_empty() {
+                self.onnx_path = Some(to_display_path(Path::new(p)));
+            }
+        }
+
+        // Parse train image count if logged by COCO / YOLO prep
+        if let Some(idx) = clean_trimmed.find("Prepared RF-DETR COCO splits:") {
+            let tail = &clean_trimmed[idx + "Prepared RF-DETR COCO splits:".len()..];
+            if let Some(num_str) = tail.split_whitespace().next() {
+                if let Ok(n) = num_str.parse::<u32>() {
+                    if n > 0 {
+                        self.dataset_train_images = Some(n);
+                    }
+                }
+            }
+        }
+
+        // 1. Suppress noisy framework warnings (triton, sync_dist, etc.) from flooding the live log
+        if let Some(noisy_tag) = classify_noisy_warning(&clean_lower) {
+            self.suppressed_warning_count = self.suppressed_warning_count.saturating_add(1);
+            self.record_warning_tag(noisy_tag);
+            return;
+        }
+
+        // 2. Track LS-Trainer / runtime warnings and errors in the status line
+        if clean_trimmed.starts_with("[LS-Trainer Error]")
+            || clean_trimmed.starts_with("[LS-Trainer] Error:")
+            || clean_lower.starts_with("runtimeerror:")
+            || clean_lower.contains("outofmemoryerror")
+        {
+            let msg = clean_trimmed
+                .strip_prefix("[LS-Trainer Error]")
+                .or_else(|| clean_trimmed.strip_prefix("[LS-Trainer] Error:"))
+                .unwrap_or(clean_trimmed);
+            self.record_error(msg);
+        } else if clean_trimmed.starts_with("[LS-Trainer Warning]")
+            || clean_trimmed.starts_with("[LS-Trainer] Warning:")
+        {
+            let msg = clean_trimmed
+                .strip_prefix("[LS-Trainer Warning]")
+                .or_else(|| clean_trimmed.strip_prefix("[LS-Trainer] Warning:"))
+                .unwrap_or(clean_trimmed)
+                .trim();
+            let short_tag = if msg.to_ascii_lowercase().contains("xpu index") {
+                "xpu_device"
+            } else if msg.to_ascii_lowercase().contains("onnx") {
+                "onnx_export"
+            } else if msg.to_ascii_lowercase().contains("polygon")
+                || msg.to_ascii_lowercase().contains("segmentation")
+            {
+                "seg_labels"
+            } else {
+                "trainer_warn"
+            };
+            self.record_warning_tag(short_tag);
+            // Collapse consecutive identical warnings in the log
+            if self.logs.back().map(|prev| prev == &line).unwrap_or(false) {
+                self.suppressed_warning_count = self.suppressed_warning_count.saturating_add(1);
+                return;
+            }
+        }
+
         if self.logs.len() >= MAX_LOG_LINES {
             self.logs.pop_front();
         }
@@ -422,8 +678,24 @@ impl AppState {
         }
         self.step_counter += 1;
         let x = self.step_counter as f64;
+        let mut improved = false;
 
-        if metrics.train_loss.is_finite() && metrics.train_loss >= 0.0 {
+        if metrics.train_loss.is_finite() && metrics.train_loss > 0.0 {
+            if self.train_loss_history.len() >= MAX_HISTORY_POINTS {
+                self.train_loss_history.pop_front();
+            }
+            self.train_loss_history.push_back((x, metrics.train_loss));
+            if let Some(prev_loss) = self.best_loss {
+                if metrics.train_loss < prev_loss - 1e-5 {
+                    self.best_loss = Some(metrics.train_loss);
+                    if metrics.total_steps > 0 && metrics.step == metrics.total_steps {
+                        improved = true;
+                    }
+                }
+            } else {
+                self.best_loss = Some(metrics.train_loss);
+            }
+        } else if metrics.train_loss.is_finite() && metrics.train_loss >= 0.0 {
             if self.train_loss_history.len() >= MAX_HISTORY_POINTS {
                 self.train_loss_history.pop_front();
             }
@@ -432,10 +704,18 @@ impl AppState {
 
         if let Some(vl) = metrics.val_loss {
             if vl.is_finite() && vl >= 0.0 {
+                let prev_min_vl = self
+                    .val_loss_history
+                    .iter()
+                    .map(|&(_, y)| y)
+                    .fold(None::<f64>, |acc, y| Some(acc.map_or(y, |m| m.min(y))));
                 if self.val_loss_history.len() >= MAX_HISTORY_POINTS {
                     self.val_loss_history.pop_front();
                 }
                 self.val_loss_history.push_back((x, vl));
+                if prev_min_vl.map_or(true, |prev| vl < prev - 1e-5) {
+                    improved = true;
+                }
             }
         }
 
@@ -445,18 +725,33 @@ impl AppState {
                     self.map50_95_history.pop_front();
                 }
                 self.map50_95_history.push_back((x, m95));
+                let is_better = self
+                    .best_map50_95
+                    .map_or(m95 > 0.0, |prev| m95 > prev + 1e-6);
+                if is_better {
+                    improved = true;
+                }
                 self.best_map50_95 = Some(self.best_map50_95.map_or(m95, |prev| prev.max(m95)));
             }
         }
 
         if let Some(m50) = metrics.map50 {
             if m50.is_finite() && m50 >= 0.0 {
+                let is_better = self.best_map50.map_or(m50 > 0.0, |prev| m50 > prev + 1e-6);
+                if is_better {
+                    improved = true;
+                }
                 self.best_map50 = Some(self.best_map50.map_or(m50, |prev| prev.max(m50)));
             }
         }
 
+        if improved {
+            self.trigger_new_best();
+        }
+
         self.merge_metric_gpus(&metrics.gpus);
         self.latest_metrics = metrics;
+        self.refresh_run_artifacts();
     }
 
     fn merge_metric_gpus(&mut self, incoming: &[GpuTelemetry]) {
@@ -512,6 +807,7 @@ impl TrainingEventSink for TuiEventSink {
 
     fn on_exit(&self, code: Option<i32>) {
         if let Ok(mut guard) = self.state.lock() {
+            guard.refresh_run_artifacts();
             if code == Some(0) && !guard.stop_initiated {
                 // Keep `is_running = true` while the post-training ONNX export executes.
                 guard.status_line = "Training complete — exporting ONNX...".to_string();
@@ -520,6 +816,11 @@ impl TrainingEventSink for TuiEventSink {
                 guard.is_running = false;
                 guard.is_paused = false;
                 guard.training_ended_at = Some(Instant::now());
+                if let Some(c) = code {
+                    if c != 0 && !guard.stop_initiated {
+                        guard.record_error(&format!("Process exited with code {c}"));
+                    }
+                }
                 guard.status_line = match code {
                     Some(0) => "Completed".to_string(),
                     Some(c) if guard.stop_initiated => format!("Stopped (exit {c})"),
@@ -772,17 +1073,233 @@ fn find_onnx_in_dir(run_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+fn count_dataset_train_images(dataset_path: &str) -> Option<u32> {
+    let p = Path::new(dataset_path.trim());
+    if !p.exists() {
+        return None;
+    }
+    let root = if p.is_file() { p.parent()? } else { p };
+
+    // 1. Check COCO annotations JSON
+    for coco_rel in [
+        PathBuf::from("train").join("_annotations.coco.json"),
+        PathBuf::from("annotations").join("instances_train.json"),
+    ] {
+        let coco_file = root.join(coco_rel);
+        if coco_file.is_file() {
+            if let Ok(raw) = std::fs::read_to_string(&coco_file) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(arr) = val.get("images").and_then(|v| v.as_array()) {
+                        if !arr.is_empty() {
+                            return Some(arr.len() as u32);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check YOLO images/train directory
+    for img_rel in [
+        PathBuf::from("images").join("train"),
+        PathBuf::from("train").join("images"),
+    ] {
+        let img_dir = root.join(img_rel);
+        if img_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&img_dir) {
+                let count = entries
+                    .flatten()
+                    .filter(|e| {
+                        e.path()
+                            .extension()
+                            .map(|ext| {
+                                matches!(
+                                    ext.to_string_lossy().to_ascii_lowercase().as_str(),
+                                    "jpg" | "jpeg" | "png" | "bmp" | "webp" | "tif" | "tiff"
+                                )
+                            })
+                            .unwrap_or(false)
+                    })
+                    .count();
+                if count > 0 {
+                    return Some(count as u32);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn format_relative_age(modified: std::time::SystemTime) -> (u64, String) {
+    let epoch_secs = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let age_secs = std::time::SystemTime::now()
+        .duration_since(modified)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let label = if age_secs < 60 {
+        format!("{age_secs}s ago")
+    } else if age_secs < 3600 {
+        format!("{}m ago", age_secs / 60)
+    } else if age_secs < 86_400 {
+        format!("{}h ago", age_secs / 3600)
+    } else {
+        format!("{}d ago", age_secs / 86_400)
+    };
+    (epoch_secs, label)
+}
+
+fn parse_metrics_for_run_dir(run_dir: &Path) -> (Option<f64>, Option<f64>) {
+    let json_path = run_dir.join("ls_trainer_metrics.json");
+    if json_path.is_file() {
+        if let Ok(raw) = std::fs::read_to_string(&json_path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                let m50 = val.get("map50").and_then(|v| v.as_f64());
+                let m95 = val.get("map50_95").and_then(|v| v.as_f64());
+                if m50.is_some() || m95.is_some() {
+                    return (m50, m95);
+                }
+            }
+        }
+    }
+    let csv_path = run_dir.join("results.csv");
+    if csv_path.is_file() {
+        if let Ok(raw) = std::fs::read_to_string(&csv_path) {
+            let mut lines = raw.lines();
+            if let Some(header) = lines.next() {
+                let cols: Vec<&str> = header.split(',').map(|s| s.trim()).collect();
+                let idx_50 = cols.iter().position(|c| c.contains("mAP50("));
+                let idx_95 = cols.iter().position(|c| c.contains("mAP50-95("));
+                let mut best_50: Option<f64> = None;
+                let mut best_95: Option<f64> = None;
+                for row in lines {
+                    let vals: Vec<&str> = row.split(',').map(|s| s.trim()).collect();
+                    if let Some(i50) = idx_50 {
+                        if let Some(v) = vals.get(i50).and_then(|s| s.parse::<f64>().ok()) {
+                            if v.is_finite() {
+                                best_50 = Some(best_50.map_or(v, |p| p.max(v)));
+                            }
+                        }
+                    }
+                    if let Some(i95) = idx_95 {
+                        if let Some(v) = vals.get(i95).and_then(|s| s.parse::<f64>().ok()) {
+                            if v.is_finite() {
+                                best_95 = Some(best_95.map_or(v, |p| p.max(v)));
+                            }
+                        }
+                    }
+                }
+                return (best_50, best_95);
+            }
+        }
+    }
+    (None, None)
+}
+
+fn scan_run_history() -> Vec<RunHistoryEntry> {
+    let mut entries = Vec::new();
+    for task in ["detect", "segment"] {
+        let task_dir = PathBuf::from("runs").join(task);
+        let Ok(read_dir) = std::fs::read_dir(&task_dir) else {
+            continue;
+        };
+        for item in read_dir.flatten() {
+            let path = item.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let run_name = item.file_name().to_string_lossy().to_string();
+            let best_weights = find_best_checkpoint_in_dir(&path).map(|p| to_display_path(&p));
+            let onnx_path = find_onnx_in_dir(&path).map(|p| to_display_path(&p));
+            let (map50, map50_95) = parse_metrics_for_run_dir(&path);
+
+            let mut arch_model = String::new();
+            let cfg_file = path.join("ls_trainer_config.json");
+            if cfg_file.is_file() {
+                if let Ok(raw) = std::fs::read_to_string(&cfg_file) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        let fam = val
+                            .get("model_family")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let mod_c = val
+                            .get("model_choice")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if !fam.is_empty() && !mod_c.is_empty() {
+                            arch_model = format!("{fam} ({mod_c})");
+                        } else if !mod_c.is_empty() {
+                            arch_model = mod_c.to_string();
+                        }
+                    }
+                }
+            }
+            if arch_model.is_empty() {
+                if path.join("ls_trainer_rfdetr_args.json").is_file() {
+                    arch_model = "RF-DETR".to_string();
+                } else if path.join("args.yaml").is_file() {
+                    arch_model = "YOLO".to_string();
+                } else {
+                    arch_model = task.to_string();
+                }
+            }
+
+            let mtime = best_weights
+                .as_ref()
+                .and_then(|w| std::fs::metadata(w).ok())
+                .or_else(|| std::fs::metadata(&cfg_file).ok())
+                .or_else(|| std::fs::metadata(&path).ok())
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let (modified_epoch_secs, timestamp_label) = format_relative_age(mtime);
+
+            entries.push(RunHistoryEntry {
+                run_name,
+                task: task.to_string(),
+                run_dir: to_display_path(&path),
+                arch_model,
+                map50,
+                map50_95,
+                best_weights,
+                onnx_path,
+                timestamp_label,
+                modified_epoch_secs,
+            });
+        }
+    }
+    entries.sort_by(|a, b| b.modified_epoch_secs.cmp(&a.modified_epoch_secs));
+    entries.truncate(20);
+    entries
+}
+
 fn launch_training_thread(state: Arc<Mutex<AppState>>, request: TrainingRequest) {
+    let initial_dir = PathBuf::from("runs")
+        .join(&request.task)
+        .join(&request.run_name);
+    let initial_train_imgs = count_dataset_train_images(&request.dataset_path);
+
     if let Ok(mut guard) = state.lock() {
         guard.mode = UiMode::Training;
+        guard.overlay = OverlayMode::None;
         guard.active_request = Some(request.clone());
         guard.is_running = true;
         guard.is_paused = false;
         guard.stop_initiated = false;
         guard.exit_code = None;
-        guard.results_dir = None;
+        guard.health_level = HealthLevel::Healthy;
+        guard.warning_count = 0;
+        guard.suppressed_warning_count = 0;
+        guard.warning_tags.clear();
+        guard.last_error_msg = None;
+        guard.results_dir = Some(to_display_path(&initial_dir));
         guard.best_weights_path = None;
         guard.onnx_path = None;
+        guard.best_loss = None;
+        guard.best_ckpt_mtime = None;
+        guard.new_best_until = None;
+        guard.dataset_train_images = initial_train_imgs;
         guard.training_started_at = Some(Instant::now());
         guard.training_ended_at = None;
         guard.status_line = "Initializing training...".to_string();
@@ -791,6 +1308,7 @@ fn launch_training_thread(state: Arc<Mutex<AppState>>, request: TrainingRequest)
             total_epochs: request.epochs,
             ..Default::default()
         };
+        guard.refresh_run_artifacts();
     }
 
     let sink: Arc<dyn TrainingEventSink> = Arc::new(TuiEventSink::new(Arc::clone(&state)));
@@ -804,12 +1322,24 @@ fn launch_training_thread(state: Arc<Mutex<AppState>>, request: TrainingRequest)
                 if let Ok(mut guard) = state.lock() {
                     guard.results_dir = Some(train_resp.results_dir.clone());
                     if let Some(ref ckpt) = best_ckpt {
+                        if guard.best_weights_path.as_ref() != Some(ckpt) {
+                            guard.trigger_new_best();
+                        }
                         guard.best_weights_path = Some(ckpt.clone());
                     }
                     if let Some(m50) = train_resp.map50 {
+                        if guard.best_map50.map_or(m50 > 0.0, |prev| m50 > prev + 1e-6) {
+                            guard.trigger_new_best();
+                        }
                         guard.best_map50 = Some(guard.best_map50.map_or(m50, |prev| prev.max(m50)));
                     }
                     if let Some(m95) = train_resp.map50_95 {
+                        if guard
+                            .best_map50_95
+                            .map_or(m95 > 0.0, |prev| m95 > prev + 1e-6)
+                        {
+                            guard.trigger_new_best();
+                        }
                         guard.best_map50_95 =
                             Some(guard.best_map50_95.map_or(m95, |prev| prev.max(m95)));
                     }
@@ -869,6 +1399,7 @@ fn launch_training_thread(state: Arc<Mutex<AppState>>, request: TrainingRequest)
                         guard.status_line = "Stopped by user".to_string();
                     } else if guard.exit_code.is_none() {
                         guard.exit_code = Some(1);
+                        guard.record_error(&train_resp.message);
                         guard.status_line = train_resp.message;
                     }
                 }
@@ -881,6 +1412,7 @@ fn launch_training_thread(state: Arc<Mutex<AppState>>, request: TrainingRequest)
                     guard.is_running = false;
                     guard.is_paused = false;
                     guard.training_ended_at = Some(Instant::now());
+                    guard.record_error(&err);
                     guard.status_line = "Training failed".to_string();
                 }
             }
@@ -1365,10 +1897,40 @@ fn render_center_chart(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(chart, area);
 }
 
+fn compact_display_path(path: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let count = path.chars().count();
+    if count <= max_chars {
+        return path.to_string();
+    }
+    // Prefer preserving from `runs\` or `runs/` onwards if that fits
+    for marker in ["runs\\", "runs/"] {
+        if let Some(pos) = path.find(marker) {
+            let rel = &path[pos..];
+            if rel.chars().count() <= max_chars {
+                return rel.to_string();
+            }
+        }
+    }
+    let keep = max_chars.saturating_sub(1);
+    let tail: String = path
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("…{tail}")
+}
+
 fn render_run_summary(frame: &mut Frame, area: Rect, state: &AppState) {
+    let host_h = if area.height >= 19 { 5 } else { 4 };
     let split = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .constraints([Constraint::Length(host_h), Constraint::Min(10)])
         .split(area);
 
     render_host_cpu_panel(frame, split[0], state);
@@ -1405,7 +1967,6 @@ fn render_host_cpu_panel(frame: &mut Frame, area: Rect, state: &AppState) {
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(1),
             Constraint::Min(1),
         ])
         .split(padded);
@@ -1431,22 +1992,28 @@ fn render_host_cpu_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     );
     render_contrast_gauge(frame, rows[1], ram_ratio, &ram_label, BAR_RAM_SLATE);
 
-    let (l1, l5, l15) = state.host_load_avg;
-    let load_line = Line::from(vec![
-        Span::styled("Load     ", Style::default().fg(LABEL_MUTED)),
-        Span::styled(
-            format!("{l1:.2}  {l5:.2}  {l15:.2}"),
-            Style::default().fg(Color::White),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(load_line), rows[2]);
+    if rows[2].height > 0 {
+        let bottom_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(18), Constraint::Min(4)])
+            .split(rows[2]);
+        let (l1, l5, _l15) = state.host_load_avg;
+        let load_line = Line::from(vec![
+            Span::styled("Load ", Style::default().fg(LABEL_MUTED)),
+            Span::styled(
+                format!("{l1:.1} {l5:.1}"),
+                Style::default().fg(Color::White),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(load_line), bottom_cols[0]);
 
-    let cpu_samples: Vec<u64> = state.host_cpu_history.iter().copied().collect();
-    let sparkline = Sparkline::default()
-        .data(&cpu_samples)
-        .max(100)
-        .style(Style::default().fg(BAR_GPU_TEAL));
-    frame.render_widget(sparkline, rows[3]);
+        let cpu_samples: Vec<u64> = state.host_cpu_history.iter().copied().collect();
+        let sparkline = Sparkline::default()
+            .data(&cpu_samples)
+            .max(100)
+            .style(Style::default().fg(BAR_GPU_TEAL));
+        frame.render_widget(sparkline, bottom_cols[1]);
+    }
 }
 
 fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -1477,6 +2044,7 @@ fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(4),
@@ -1511,21 +2079,77 @@ fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     );
     render_contrast_gauge(frame, rows[1], step_ratio, &step_label, BAR_STEP_BLUE);
 
-    let (arch_str, model_str, dataset_str, dev_str) = if let Some(ref req) = state.active_request {
-        (
-            req.model_family.as_str(),
-            req.model_choice.as_str(),
-            req.dataset_path.as_str(),
-            req.device.as_str(),
-        )
+    let (arch_str, model_str, _dataset_str, dev_str, batch_val) =
+        if let Some(ref req) = state.active_request {
+            (
+                req.model_family.as_str(),
+                req.model_choice.as_str(),
+                req.dataset_path.as_str(),
+                req.device.as_str(),
+                req.batch.max(1),
+            )
+        } else {
+            let b = state.setup.batch.trim().parse::<u32>().unwrap_or(4).max(1);
+            (
+                state.setup.arch.as_family_str(),
+                state.setup.model.as_str(),
+                state.setup.dataset.as_str(),
+                state.setup.device.as_str(),
+                b,
+            )
+        };
+
+    // Overall progress across epochs + steps + samples/images
+    let overall_ratio = if !state.is_running && state.exit_code == Some(0) {
+        1.0
+    } else if m.total_epochs > 0 && m.total_steps > 0 && m.epoch > 0 {
+        let done_steps = m
+            .epoch
+            .saturating_sub(1)
+            .saturating_mul(m.total_steps)
+            .saturating_add(m.step.min(m.total_steps));
+        let all_steps = total_ep.saturating_mul(m.total_steps).max(1);
+        (done_steps as f64 / all_steps as f64).clamp(0.0, 1.0)
     } else {
-        (
-            state.setup.arch.as_family_str(),
-            state.setup.model.as_str(),
-            state.setup.dataset.as_str(),
-            state.setup.device.as_str(),
-        )
+        ep_ratio
     };
+
+    let imgs_per_epoch = state.dataset_train_images.or_else(|| {
+        if m.total_steps > 0 {
+            let dev_mult = state.gpus.len().max(1) as u32;
+            Some(
+                m.total_steps
+                    .saturating_mul(batch_val)
+                    .saturating_mul(dev_mult),
+            )
+        } else {
+            None
+        }
+    });
+    let samples_str = if let Some(per_ep) = imgs_per_epoch {
+        let total_samples = per_ep.saturating_mul(total_ep);
+        let done_samples =
+            ((overall_ratio * f64::from(total_samples)).round() as u32).min(total_samples);
+        format!("{done_samples}/{total_samples} imgs")
+    } else {
+        "-- imgs".to_string()
+    };
+    let overall_label = format!(
+        "Overall {:.0}% · Ep {}/{} · Step {}/{} · {}",
+        overall_ratio * 100.0,
+        m.epoch,
+        m.total_epochs,
+        m.step,
+        m.total_steps,
+        samples_str
+    );
+    render_contrast_gauge(
+        frame,
+        rows[2],
+        overall_ratio,
+        &overall_label,
+        BAR_OVERALL_CYAN,
+    );
 
     let status_color = if state.is_paused {
         Color::Yellow
@@ -1561,8 +2185,65 @@ fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState) {
         .map(|v| format!("{:.2}%", v * 100.0))
         .unwrap_or_else(|| "--".to_string());
 
-    let divider_width = padded.width.saturating_sub(14) as usize;
-    let divider_tail = "─".repeat(divider_width.max(4));
+    let new_best_active = state.is_new_best_active();
+    let best_metric_color = if new_best_active {
+        NEW_BEST_GOLD
+    } else {
+        Color::LightGreen
+    };
+
+    let mut best_map_spans = vec![
+        Span::styled("Best mAP ", Style::default().fg(LABEL_MUTED)),
+        Span::styled("50 ", Style::default().fg(LABEL_MUTED)),
+        Span::styled(
+            format!("{map50_str:<7}"),
+            Style::default()
+                .fg(best_metric_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" │ ", Style::default().fg(TABLE_BORDER_SOFT)),
+        Span::styled("50:95 ", Style::default().fg(LABEL_MUTED)),
+        Span::styled(
+            map95_str,
+            Style::default()
+                .fg(best_metric_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if new_best_active {
+        best_map_spans.push(Span::raw(" "));
+        best_map_spans.push(Span::styled(
+            " ★ New best ",
+            Style::default()
+                .fg(NEW_BEST_GOLD)
+                .bg(NEW_BEST_BADGE_BG)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let path_budget = padded.width.saturating_sub(9) as usize;
+    let run_dir_disp = state
+        .results_dir
+        .as_deref()
+        .map(|p| compact_display_path(p, path_budget))
+        .unwrap_or_else(|| "pending...".to_string());
+    let best_wts_disp = state
+        .best_weights_path
+        .as_deref()
+        .map(|p| compact_display_path(p, path_budget))
+        .unwrap_or_else(|| "pending (saving on epoch)...".to_string());
+    let onnx_disp = state
+        .onnx_path
+        .as_deref()
+        .map(|p| compact_display_path(p, path_budget))
+        .unwrap_or_else(|| {
+            if state.status_line.to_ascii_lowercase().contains("onnx") {
+                "exporting best.onnx...".to_string()
+            } else {
+                "pending (exports on finish)".to_string()
+            }
+        });
+
     let sep_span = Span::styled("  │  ", Style::default().fg(TABLE_BORDER_SOFT));
 
     let lines = vec![
@@ -1585,17 +2266,6 @@ fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("Dataset  ", Style::default().fg(LABEL_MUTED)),
-            Span::styled(
-                dataset_str.to_string(),
-                Style::default().fg(Color::Rgb(196, 206, 218)),
-            ),
-        ]),
-        Line::from(Span::styled(
-            format!("── Key Metrics {divider_tail}"),
-            Style::default().fg(TABLE_BORDER_SOFT),
-        )),
-        Line::from(vec![
             Span::styled("Loss     ", Style::default().fg(LABEL_MUTED)),
             Span::styled(
                 format!("{:<8.4}", m.train_loss),
@@ -1612,24 +2282,7 @@ fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState) {
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(vec![
-            Span::styled("Best mAP ", Style::default().fg(LABEL_MUTED)),
-            Span::styled("50 ", Style::default().fg(LABEL_MUTED)),
-            Span::styled(
-                format!("{map50_str:<7}"),
-                Style::default()
-                    .fg(Color::LightGreen)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            sep_span.clone(),
-            Span::styled("50:95 ", Style::default().fg(LABEL_MUTED)),
-            Span::styled(
-                map95_str,
-                Style::default()
-                    .fg(Color::LightGreen)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
+        Line::from(best_map_spans),
         Line::from(vec![
             Span::styled("Speed    ", Style::default().fg(LABEL_MUTED)),
             Span::styled(
@@ -1638,29 +2291,126 @@ fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState) {
                     .fg(Color::LightGreen)
                     .add_modifier(Modifier::BOLD),
             ),
-            sep_span,
+            sep_span.clone(),
             Span::styled("Elapsed ", Style::default().fg(LABEL_MUTED)),
             Span::styled(elapsed_str, Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
             Span::styled("ETA      ", Style::default().fg(LABEL_MUTED)),
             Span::styled(
-                format_eta_seconds(m.eta_secs),
+                format!("{:<8}", format_eta_seconds(m.eta_secs)),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
+            sep_span,
+            Span::styled("Samples ", Style::default().fg(LABEL_MUTED)),
+            Span::styled(samples_str, Style::default().fg(TITLE_ACCENT)),
+        ]),
+        Line::from(vec![
+            Span::styled("Run Dir  ", Style::default().fg(LABEL_MUTED)),
+            Span::styled(run_dir_disp, Style::default().fg(Color::Rgb(196, 206, 218))),
+        ]),
+        Line::from(vec![
+            Span::styled("Best Wts ", Style::default().fg(LABEL_MUTED)),
+            Span::styled(
+                best_wts_disp,
+                Style::default().fg(if state.best_weights_path.is_some() {
+                    Color::LightGreen
+                } else {
+                    LABEL_MUTED
+                }),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("ONNX     ", Style::default().fg(LABEL_MUTED)),
+            Span::styled(
+                onnx_disp,
+                Style::default().fg(if state.onnx_path.is_some() {
+                    TITLE_ACCENT
+                } else {
+                    LABEL_MUTED
+                }),
+            ),
         ]),
     ];
 
-    frame.render_widget(Paragraph::new(lines), rows[2]);
+    frame.render_widget(Paragraph::new(lines), rows[3]);
+}
+
+fn render_health_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
+    let (badge_text, badge_fg, badge_bg, detail_text, detail_color) = match state.health_level {
+        HealthLevel::Healthy => (
+            " ● Healthy ",
+            GAUGE_TEXT_COVERED,
+            Color::LightGreen,
+            format!(" Training proceeding normally  │  {}", state.status_line),
+            Color::Rgb(176, 214, 188),
+        ),
+        HealthLevel::Warning => {
+            let tags = if state.warning_tags.is_empty() {
+                "non-fatal".to_string()
+            } else {
+                state.warning_tags.join(", ")
+            };
+            let supp = if state.suppressed_warning_count > 0 {
+                format!(", {} suppressed in log", state.suppressed_warning_count)
+            } else {
+                String::new()
+            };
+            (
+                " ▲ Warning ",
+                GAUGE_TEXT_COVERED,
+                Color::Yellow,
+                format!(
+                    " {} non-fatal warning(s) [{}{}]  │  {}",
+                    state.warning_count, tags, supp, state.status_line
+                ),
+                Color::Yellow,
+            )
+        }
+        HealthLevel::Error => {
+            let err_detail = state
+                .last_error_msg
+                .as_deref()
+                .unwrap_or(&state.status_line);
+            (
+                " ✖ Error ",
+                Color::White,
+                Color::Red,
+                format!(" {err_detail}"),
+                Color::LightRed,
+            )
+        }
+    };
+
+    let line = Line::from(vec![
+        Span::styled(
+            badge_text,
+            Style::default()
+                .fg(badge_fg)
+                .bg(badge_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(detail_text, Style::default().fg(detail_color)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(BAR_TRACK_BG)),
+        area,
+    );
 }
 
 fn render_bottom_log_and_footer(frame: &mut Frame, area: Rect, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
         .split(area);
+
+    render_health_status_bar(frame, chunks[0], state);
 
     let log_block = Block::default()
         .title(Span::styled(
@@ -1677,8 +2427,8 @@ fn render_bottom_log_and_footer(frame: &mut Frame, area: Rect, state: &AppState)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(BORDER_SOFT));
 
-    let inner = log_block.inner(chunks[0]);
-    frame.render_widget(log_block, chunks[0]);
+    let inner = log_block.inner(chunks[1]);
+    frame.render_widget(log_block, chunks[1]);
 
     let padded = Rect {
         x: inner.x + 1,
@@ -1704,11 +2454,7 @@ fn render_bottom_log_and_footer(frame: &mut Frame, area: Rect, state: &AppState)
 
     frame.render_widget(Paragraph::new(visible_lines), padded);
 
-    let pause_label = if state.is_paused {
-        "Resume"
-    } else {
-        "Pause / Resume"
-    };
+    let pause_label = if state.is_paused { "Resume" } else { "Pause" };
     let footer = Line::from(vec![
         Span::styled(
             " [Space] ",
@@ -1718,7 +2464,7 @@ fn render_bottom_log_and_footer(frame: &mut Frame, area: Rect, state: &AppState)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!(" {pause_label}  "),
+            format!(" {pause_label} "),
             Style::default().fg(Color::White),
         ),
         Span::styled(
@@ -1728,15 +2474,39 @@ fn render_bottom_log_and_footer(frame: &mut Frame, area: Rect, state: &AppState)
                 .bg(Color::LightGreen)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" Force Checkpoint  ", Style::default().fg(Color::White)),
+        Span::styled(" Checkpoint ", Style::default().fg(Color::White)),
         Span::styled(
-            " [Up/Down] ",
+            " [↑/↓] ",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" Scroll Logs  ", Style::default().fg(Color::White)),
+        Span::styled(" Scroll ", Style::default().fg(Color::White)),
+        Span::styled(
+            " [F1/?] ",
+            Style::default()
+                .fg(GAUGE_TEXT_COVERED)
+                .bg(BAR_GPU_TEAL)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Help ", Style::default().fg(Color::White)),
+        Span::styled(
+            " [F3] ",
+            Style::default()
+                .fg(GAUGE_TEXT_COVERED)
+                .bg(BAR_STEP_BLUE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Config ", Style::default().fg(Color::White)),
+        Span::styled(
+            " [F4/h] ",
+            Style::default()
+                .fg(GAUGE_TEXT_COVERED)
+                .bg(BAR_RAM_SLATE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" History ", Style::default().fg(Color::White)),
         Span::styled(
             " [F12] ",
             Style::default()
@@ -1744,7 +2514,7 @@ fn render_bottom_log_and_footer(frame: &mut Frame, area: Rect, state: &AppState)
                 .bg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" Copy Log  ", Style::default().fg(Color::White)),
+        Span::styled(" Copy Log ", Style::default().fg(Color::White)),
         Span::styled(
             " [q] ",
             Style::default()
@@ -1752,12 +2522,12 @@ fn render_bottom_log_and_footer(frame: &mut Frame, area: Rect, state: &AppState)
                 .bg(Color::Red)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" Graceful Stop & Exit ", Style::default().fg(Color::White)),
+        Span::styled(" Stop & Quit ", Style::default().fg(Color::White)),
     ]);
 
     frame.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
-        chunks[1],
+        chunks[2],
     );
 }
 
@@ -2009,17 +2779,430 @@ fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
     );
 }
 
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup_vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_vert[1])[1]
+}
+
+fn render_help_overlay(frame: &mut Frame, area: Rect) {
+    let modal = centered_rect(72, 74, area);
+    frame.render_widget(Clear, modal);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Keyboard Shortcuts Help (Press Esc, F1, or ? to close) ",
+            Style::default()
+                .fg(TITLE_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(TITLE_ACCENT))
+        .style(Style::default().bg(OVERLAY_BG));
+
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    if inner.height == 0 || inner.width <= 4 {
+        return;
+    }
+
+    let padded = Rect {
+        x: inner.x + 2,
+        y: inner.y + 1,
+        width: inner.width.saturating_sub(4),
+        height: inner.height.saturating_sub(1),
+    };
+
+    let rows: [(&str, &str); 11] = [
+        ("Key", "Action"),
+        ("Space", "Pause / Resume active training process"),
+        ("c", "Request immediate checkpoint save (CHECKPOINT)"),
+        (
+            "Up / Down",
+            "Scroll live training log (scroll to bottom to auto-follow)",
+        ),
+        ("F1 / ?", "Toggle this Keyboard Shortcuts Help overlay"),
+        (
+            "F3",
+            "Toggle Run Configuration Snapshot overlay (read-only)",
+        ),
+        (
+            "F4 / h",
+            "Toggle Recent Runs History overlay (view metrics & paths)",
+        ),
+        ("F12", "Copy live training log lines to system clipboard"),
+        ("q / Ctrl+C", "Graceful stop, print exit summary, and quit"),
+        (
+            "Tab / Arrows",
+            "Navigate fields and cycle presets in Launch Menu",
+        ),
+        ("F2 / Enter", "Start training from Launch Menu"),
+    ];
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "╭──────────────────┬──────────────────────────────────────────────────────────╮",
+        Style::default().fg(TABLE_BORDER_SOFT),
+    )));
+    for (idx, (k, desc)) in rows.iter().enumerate() {
+        let key_style = if idx == 0 {
+            Style::default()
+                .fg(TITLE_ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD)
+        };
+        let desc_style = if idx == 0 {
+            Style::default()
+                .fg(TITLE_ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled("│ ", Style::default().fg(TABLE_BORDER_SOFT)),
+            Span::styled(format!("{k:<16} "), key_style),
+            Span::styled("│ ", Style::default().fg(TABLE_BORDER_SOFT)),
+            Span::styled(format!("{desc:<56} "), desc_style),
+            Span::styled("│", Style::default().fg(TABLE_BORDER_SOFT)),
+        ]));
+        if idx == 0 {
+            lines.push(Line::from(Span::styled(
+                "├──────────────────┼──────────────────────────────────────────────────────────┤",
+                Style::default().fg(TABLE_BORDER_SOFT),
+            )));
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        "╰──────────────────┴──────────────────────────────────────────────────────────╯",
+        Style::default().fg(TABLE_BORDER_SOFT),
+    )));
+
+    frame.render_widget(Paragraph::new(lines), padded);
+}
+
+fn render_config_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
+    let modal = centered_rect(76, 76, area);
+    frame.render_widget(Clear, modal);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Run Configuration Snapshot — Read-Only (Press Esc or F3 to close) ",
+            Style::default()
+                .fg(TITLE_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(TITLE_ACCENT))
+        .style(Style::default().bg(OVERLAY_BG));
+
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    if inner.height == 0 || inner.width <= 4 {
+        return;
+    }
+
+    let padded = Rect {
+        x: inner.x + 2,
+        y: inner.y + 1,
+        width: inner.width.saturating_sub(4),
+        height: inner.height.saturating_sub(1),
+    };
+
+    let (arch, task, model, dataset, epochs, batch, imgsz, device, workers, run_name, aug_summary) =
+        if let Some(ref req) = state.active_request {
+            let w_str = req
+                .workers
+                .map(|w| w.to_string())
+                .unwrap_or_else(|| "auto".to_string());
+            let aug = format!(
+                "amp={} · freeze_backbone={} · degrees={:.0} · flipud={:.2} · scale={:.2} · mosaic={:.2} · close_mosaic={}",
+                req.amp,
+                req.freeze_backbone,
+                req.degrees,
+                req.flipud,
+                req.scale,
+                req.mosaic,
+                req.close_mosaic
+            );
+            (
+                req.model_family.clone(),
+                req.task.clone(),
+                req.model_choice.clone(),
+                req.dataset_path.clone(),
+                req.epochs.to_string(),
+                req.batch.to_string(),
+                req.imgsz.to_string(),
+                req.device.clone(),
+                w_str,
+                req.run_name.clone(),
+                aug,
+            )
+        } else {
+            let s = &state.setup;
+            let task = if s.model.to_ascii_lowercase().contains("-seg") {
+                "segment".to_string()
+            } else {
+                "detect".to_string()
+            };
+            (
+                s.arch.as_family_str().to_string(),
+                task,
+                s.model.clone(),
+                s.dataset.clone(),
+                s.epochs.clone(),
+                s.batch.clone(),
+                s.imgsz.to_string(),
+                s.device.clone(),
+                s.workers_input.clone(),
+                s.run_name.clone(),
+                "amp=true · degrees=180 · flipud=0.50 · scale=0.05 · mosaic=0.00 · close_mosaic=10"
+                    .to_string(),
+            )
+        };
+
+    let run_dir = state
+        .results_dir
+        .clone()
+        .unwrap_or_else(|| format!("runs\\{task}\\{run_name}"));
+    let best_wts = state
+        .best_weights_path
+        .clone()
+        .unwrap_or_else(|| "pending".to_string());
+    let onnx_file = state
+        .onnx_path
+        .clone()
+        .unwrap_or_else(|| "pending (auto-export on completion)".to_string());
+    let train_imgs = state
+        .dataset_train_images
+        .map(|n| format!("{n} images"))
+        .unwrap_or_else(|| "auto-detected".to_string());
+
+    let kv_rows: [(&str, String); 13] = [
+        ("Architecture", arch),
+        ("Task", task),
+        ("Model / Weights", model),
+        ("Dataset Path", dataset),
+        ("Train Split Size", train_imgs),
+        ("Epochs", epochs),
+        ("Batch Size", batch),
+        ("Image Size (imgsz)", imgsz),
+        ("Device", device),
+        ("DataLoader Workers", workers),
+        ("Run Directory", run_dir),
+        ("Best Checkpoint", best_wts),
+        ("ONNX Export", onnx_file),
+    ];
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (k, v) in kv_rows {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{k:<20} │ "),
+                Style::default()
+                    .fg(LABEL_MUTED)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(v, Style::default().fg(Color::White)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{:<20} │ ", "Hyperparameters"),
+            Style::default()
+                .fg(LABEL_MUTED)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(aug_summary, Style::default().fg(TITLE_ACCENT)),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines), padded);
+}
+
+fn render_history_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
+    let modal = centered_rect(82, 78, area);
+    frame.render_widget(Clear, modal);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Recent Training Runs (↑/↓ Select · Enter/y Copy Path · Esc/F4/h Close) ",
+            Style::default()
+                .fg(TITLE_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(TITLE_ACCENT))
+        .style(Style::default().bg(OVERLAY_BG));
+
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    if inner.height == 0 || inner.width <= 4 {
+        return;
+    }
+
+    let padded = Rect {
+        x: inner.x + 2,
+        y: inner.y + 1,
+        width: inner.width.saturating_sub(4),
+        height: inner.height.saturating_sub(1),
+    };
+
+    if state.history_entries.is_empty() {
+        let msg = Paragraph::new("No previous runs found in runs/detect or runs/segment.")
+            .style(Style::default().fg(LABEL_MUTED));
+        frame.render_widget(msg, padded);
+        return;
+    }
+
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(6)])
+        .split(padded);
+
+    let mut list_lines: Vec<Line<'static>> = Vec::new();
+    list_lines.push(Line::from(vec![Span::styled(
+        format!(
+            "   {:<20} {:<24} {:<12} {:<12} {:<10}",
+            "Run Name", "Architecture / Model", "mAP50", "mAP50-95", "Updated"
+        ),
+        Style::default()
+            .fg(TITLE_ACCENT)
+            .add_modifier(Modifier::BOLD),
+    )]));
+
+    let max_rows = split[0].height.saturating_sub(1) as usize;
+    let sel = state
+        .history_selected
+        .min(state.history_entries.len().saturating_sub(1));
+    let start_idx = if sel >= max_rows && max_rows > 0 {
+        sel + 1 - max_rows
+    } else {
+        0
+    };
+
+    for (idx, entry) in state
+        .history_entries
+        .iter()
+        .enumerate()
+        .skip(start_idx)
+        .take(max_rows.max(1))
+    {
+        let is_sel = idx == sel;
+        let marker = if is_sel { " ▶ " } else { "   " };
+        let m50_s = entry
+            .map50
+            .map(|v| format!("{:.2}%", v * 100.0))
+            .unwrap_or_else(|| "--".to_string());
+        let m95_s = entry
+            .map50_95
+            .map(|v| format!("{:.2}%", v * 100.0))
+            .unwrap_or_else(|| "--".to_string());
+        let row_text = format!(
+            "{marker}{:<20} {:<24} {:<12} {:<12} {:<10}",
+            compact_display_path(&entry.run_name, 19),
+            compact_display_path(&entry.arch_model, 23),
+            m50_s,
+            m95_s,
+            entry.timestamp_label
+        );
+        let style = if is_sel {
+            Style::default()
+                .fg(GAUGE_TEXT_COVERED)
+                .bg(BAR_GPU_TEAL)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        list_lines.push(Line::from(Span::styled(row_text, style)));
+    }
+    frame.render_widget(Paragraph::new(list_lines), split[0]);
+
+    if let Some(entry) = state.history_entries.get(sel) {
+        let detail_lines = vec![
+            Line::from(Span::styled(
+                "── Selected Run Summary ──────────────────────────────────────────────────",
+                Style::default().fg(TABLE_BORDER_SOFT),
+            )),
+            Line::from(vec![
+                Span::styled("Run Directory : ", Style::default().fg(LABEL_MUTED)),
+                Span::styled(entry.run_dir.clone(), Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("Best Weights  : ", Style::default().fg(LABEL_MUTED)),
+                Span::styled(
+                    entry
+                        .best_weights
+                        .clone()
+                        .unwrap_or_else(|| "Not saved".to_string()),
+                    Style::default().fg(Color::LightGreen),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("ONNX Model    : ", Style::default().fg(LABEL_MUTED)),
+                Span::styled(
+                    entry
+                        .onnx_path
+                        .clone()
+                        .unwrap_or_else(|| "Not exported".to_string()),
+                    Style::default().fg(TITLE_ACCENT),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Task / Age    : ", Style::default().fg(LABEL_MUTED)),
+                Span::styled(
+                    format!("{} · {}", entry.task, entry.timestamp_label),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(detail_lines), split[1]);
+    }
+}
+
 fn draw_ui(frame: &mut Frame, state: &AppState) {
     if state.mode == UiMode::Setup {
         render_launcher_screen(frame, frame.area(), state);
+        match state.overlay {
+            OverlayMode::Help => render_help_overlay(frame, frame.area()),
+            OverlayMode::Config => render_config_overlay(frame, frame.area(), state),
+            OverlayMode::History => render_history_overlay(frame, frame.area(), state),
+            OverlayMode::None => {}
+        }
         return;
     }
+
+    let total_h = frame.area().height;
+    let top_h = 5u16;
+    let rem_h = total_h.saturating_sub(top_h);
+    let min_center_h = 19u16.min(rem_h.saturating_sub(6));
+    let prop_center_h = ((u32::from(rem_h) * 62) / 100) as u16;
+    let center_h = prop_center_h.max(min_center_h);
 
     let root_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
-            Constraint::Percentage(52),
+            Constraint::Length(top_h),
+            Constraint::Length(center_h),
             Constraint::Min(6),
         ])
         .split(frame.area());
@@ -2028,13 +3211,20 @@ fn draw_ui(frame: &mut Frame, state: &AppState) {
 
     let center_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(root_chunks[1]);
 
     render_center_chart(frame, center_chunks[0], state);
     render_run_summary(frame, center_chunks[1], state);
 
     render_bottom_log_and_footer(frame, root_chunks[2], state);
+
+    match state.overlay {
+        OverlayMode::Help => render_help_overlay(frame, frame.area()),
+        OverlayMode::Config => render_config_overlay(frame, frame.area(), state),
+        OverlayMode::History => render_history_overlay(frame, frame.area(), state),
+        OverlayMode::None => {}
+    }
 }
 
 fn parse_cli_args() -> Result<Option<CliConfig>, String> {
@@ -2523,7 +3713,85 @@ fn handle_training_key(
     code: KeyCode,
     clipboard: &mut Option<Clipboard>,
 ) -> bool {
+    let active_overlay = state.lock().map(|g| g.overlay).unwrap_or(OverlayMode::None);
+    if active_overlay != OverlayMode::None {
+        match active_overlay {
+            OverlayMode::Help => {
+                if matches!(code, KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?')) {
+                    if let Ok(mut guard) = state.lock() {
+                        guard.overlay = OverlayMode::None;
+                    }
+                }
+            }
+            OverlayMode::Config => {
+                if matches!(code, KeyCode::Esc | KeyCode::F(3)) {
+                    if let Ok(mut guard) = state.lock() {
+                        guard.overlay = OverlayMode::None;
+                    }
+                }
+            }
+            OverlayMode::History => match code {
+                KeyCode::Esc | KeyCode::F(4) | KeyCode::Char('h') | KeyCode::Char('H') => {
+                    if let Ok(mut guard) = state.lock() {
+                        guard.overlay = OverlayMode::None;
+                    }
+                }
+                KeyCode::Up => {
+                    if let Ok(mut guard) = state.lock() {
+                        guard.history_selected = guard.history_selected.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down => {
+                    if let Ok(mut guard) = state.lock() {
+                        if !guard.history_entries.is_empty() {
+                            let max_idx = guard.history_entries.len() - 1;
+                            guard.history_selected = (guard.history_selected + 1).min(max_idx);
+                        }
+                    }
+                }
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let selected_path = state.lock().ok().and_then(|g| {
+                        g.history_entries
+                            .get(g.history_selected)
+                            .map(|e| e.run_dir.clone())
+                    });
+                    if let Some(path) = selected_path {
+                        let copied = copy_text_to_clipboard(clipboard, &path).is_ok();
+                        if let Ok(mut guard) = state.lock() {
+                            guard.status_line = if copied {
+                                format!("Copied run path to clipboard: {path}")
+                            } else {
+                                format!("Selected run path: {path}")
+                            };
+                        }
+                    }
+                }
+                _ => {}
+            },
+            OverlayMode::None => {}
+        }
+        return false;
+    }
+
     match code {
+        KeyCode::F(1) | KeyCode::Char('?') => {
+            if let Ok(mut guard) = state.lock() {
+                guard.overlay = OverlayMode::Help;
+            }
+        }
+        KeyCode::F(3) => {
+            if let Ok(mut guard) = state.lock() {
+                guard.overlay = OverlayMode::Config;
+            }
+        }
+        KeyCode::F(4) | KeyCode::Char('h') | KeyCode::Char('H') => {
+            let entries = scan_run_history();
+            if let Ok(mut guard) = state.lock() {
+                guard.history_entries = entries;
+                guard.history_selected = 0;
+                guard.overlay = OverlayMode::History;
+            }
+        }
         KeyCode::Char('q') | KeyCode::Char('Q') => {
             graceful_stop_and_wait(state);
             if let Ok(mut guard) = state.lock() {
@@ -2646,6 +3914,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(mut guard) = state.lock() {
             if guard.is_running && !guard.is_paused {
                 guard.spinner_tick = guard.spinner_tick.wrapping_add(1);
+                if guard.spinner_tick % 10 == 0 {
+                    guard.refresh_run_artifacts();
+                }
             }
             let _ = terminal.draw(|frame| draw_ui(frame, &guard));
         }
@@ -3069,8 +4340,11 @@ mod tests {
         );
     }
 
+    static REAL_RUN_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn short_real_run_from_launcher_verifies_tui_rendering() {
+        let _run_guard = REAL_RUN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp_ds = std::env::temp_dir().join("ls_trainer_tui_tiny_ds");
         let _ = std::fs::remove_dir_all(&tmp_ds);
         if let Ok(entries) = std::fs::read_dir("runs/detect") {
@@ -3272,5 +4546,376 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area;
+        let mut out = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn dual_xpu_ui_paths_overall_progress_new_best_health_and_overlays() {
+        let backend = TestBackend::new(140, 34);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        let args = vec![
+            "--arch",
+            "rf-detr",
+            "--dataset",
+            "datasets/coco_parts",
+            "--epochs",
+            "4",
+            "--batch",
+            "4",
+            "--device",
+            "xpu:0,1",
+            "--workers",
+            "0",
+            "--run-name",
+            "rfdetr-dual-xpu-test",
+        ];
+        let cfg = parse_cli_args_from(args)
+            .expect("parse flags")
+            .expect("some config");
+        let req = cfg.to_training_request().expect("valid request");
+
+        let state = Arc::new(Mutex::new(AppState::new(cfg)));
+        {
+            let mut guard = state.lock().unwrap();
+            guard.mode = UiMode::Training;
+            guard.active_request = Some(req);
+            guard.is_running = true;
+            guard.dataset_train_images = Some(80);
+            guard.results_dir =
+                Some(r"c:\Scripts\LS-Trainer\runs\detect\rfdetr-dual-xpu-test".to_string());
+        }
+
+        // 1. Verify Healthy status initially & dual-XPU telemetry + Overall progress + New-best indicator
+        {
+            let mut guard = state.lock().unwrap();
+            guard.apply_metrics(TrainMetrics {
+                epoch: 2,
+                total_epochs: 4,
+                step: 5,
+                total_steps: 10,
+                train_loss: 1.85,
+                val_loss: Some(1.62),
+                map50: Some(0.645),
+                map50_95: Some(0.412),
+                lr: 1e-4,
+                samples_per_sec: 18.4,
+                eta_secs: 35.0,
+                gpus: vec![
+                    GpuTelemetry {
+                        index: 0,
+                        name: "Intel Arc B580".to_string(),
+                        vram_used_gb: 9.2,
+                        vram_total_gb: 12.0,
+                        util_percent: 82.0,
+                    },
+                    GpuTelemetry {
+                        index: 1,
+                        name: "Intel Arc B580".to_string(),
+                        vram_used_gb: 8.9,
+                        vram_total_gb: 12.0,
+                        util_percent: 79.0,
+                    },
+                ],
+            });
+            guard.best_weights_path = Some(
+                r"c:\Scripts\LS-Trainer\runs\detect\rfdetr-dual-xpu-test\checkpoint_best_total.pth"
+                    .to_string(),
+            );
+            guard.onnx_path = Some(
+                r"c:\Scripts\LS-Trainer\runs\detect\rfdetr-dual-xpu-test\best.onnx".to_string(),
+            );
+
+            assert!(
+                guard.is_new_best_active(),
+                "New-best indicator must fire when mAP/loss improves"
+            );
+            assert_eq!(guard.health_level, HealthLevel::Healthy);
+
+            terminal
+                .draw(|frame| draw_ui(frame, &guard))
+                .expect("draw dual-xpu training ui");
+            let screen = buffer_to_string(terminal.backend().buffer());
+
+            // Dual-XPU cards rendered side-by-side
+            assert!(screen.contains("GPU 0: Intel Arc B580"));
+            assert!(screen.contains("GPU 1: Intel Arc B580"));
+            // Overall progress bar with combined epoch + step + images
+            assert!(
+                screen.contains("Overall 38% · Ep 2/4 · Step 5/10 · 120/320 imgs"),
+                "Expected Overall progress indicator in screen:\n{screen}"
+            );
+            // New-best indicator badge next to Best mAP
+            assert!(
+                screen.contains("★ New best"),
+                "Expected New best marker in Run Summary:\n{screen}"
+            );
+            // Model output paths in Run Summary during the run
+            assert!(screen.contains("Run Dir"));
+            assert!(screen.contains("Best Wts"));
+            assert!(screen.contains("ONNX"));
+            assert!(screen.contains("checkpoint_best_total.pth"));
+            assert!(screen.contains("best.onnx"));
+            // Healthy status line
+            assert!(screen.contains("● Healthy"));
+        }
+
+        // 2. Verify noisy warnings (triton, sync_dist) update Status Line to Warning and are suppressed in live log
+        {
+            let mut guard = state.lock().unwrap();
+            let log_len_before = guard.logs.len();
+            guard.push_log(
+                "W1115 16:00:00.000000 1234 torch/utils/flop_counter.py:45] triton not found; flop counting will not work"
+                    .to_string(),
+            );
+            guard.push_log(
+                "PossibleUserWarning: It is recommended to use `self.log('val/loss', ..., sync_dist=True)`"
+                    .to_string(),
+            );
+            assert_eq!(
+                guard.logs.len(),
+                log_len_before,
+                "Noisy triton and sync_dist warnings must be suppressed from flooding live logs"
+            );
+            assert_eq!(guard.health_level, HealthLevel::Warning);
+            assert_eq!(guard.suppressed_warning_count, 2);
+
+            terminal
+                .draw(|frame| draw_ui(frame, &guard))
+                .expect("draw warning state");
+            let screen = buffer_to_string(terminal.backend().buffer());
+            assert!(screen.contains("▲ Warning"));
+            assert!(screen.contains("triton, sync_dist"));
+            assert!(screen.contains("2 suppressed in log"));
+        }
+
+        // 3. Verify F1 / ? Keyboard Shortcuts Help overlay and F3 Config Snapshot overlay and F4 History overlay
+        let mut cb = None;
+        handle_training_key(&state, KeyCode::Char('?'), &mut cb);
+        assert_eq!(state.lock().unwrap().overlay, OverlayMode::Help);
+        {
+            let guard = state.lock().unwrap();
+            terminal
+                .draw(|frame| draw_ui(frame, &guard))
+                .expect("draw help overlay");
+            let screen = buffer_to_string(terminal.backend().buffer());
+            assert!(screen.contains("Keyboard Shortcuts Help"));
+            assert!(screen.contains("Toggle Run Configuration Snapshot overlay"));
+        }
+        handle_training_key(&state, KeyCode::Esc, &mut cb);
+        assert_eq!(state.lock().unwrap().overlay, OverlayMode::None);
+
+        handle_training_key(&state, KeyCode::F(3), &mut cb);
+        assert_eq!(state.lock().unwrap().overlay, OverlayMode::Config);
+        {
+            let guard = state.lock().unwrap();
+            terminal
+                .draw(|frame| draw_ui(frame, &guard))
+                .expect("draw config overlay");
+            let screen = buffer_to_string(terminal.backend().buffer());
+            assert!(screen.contains("Run Configuration Snapshot"));
+            assert!(screen.contains("RF-DETR"));
+            assert!(screen.contains("xpu:0,1"));
+            assert!(screen.contains("datasets/coco_parts"));
+        }
+        handle_training_key(&state, KeyCode::F(3), &mut cb);
+        assert_eq!(state.lock().unwrap().overlay, OverlayMode::None);
+
+        handle_training_key(&state, KeyCode::F(4), &mut cb);
+        assert_eq!(state.lock().unwrap().overlay, OverlayMode::History);
+        {
+            let guard = state.lock().unwrap();
+            terminal
+                .draw(|frame| draw_ui(frame, &guard))
+                .expect("draw history overlay");
+            let screen = buffer_to_string(terminal.backend().buffer());
+            assert!(screen.contains("Recent Training Runs"));
+        }
+        handle_training_key(&state, KeyCode::Esc, &mut cb);
+        assert_eq!(state.lock().unwrap().overlay, OverlayMode::None);
+    }
+
+    #[test]
+    fn short_dual_xpu_rfdetr_real_run_verifies_live_ui_and_onnx() {
+        let _run_guard = REAL_RUN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp_coco = std::env::temp_dir().join("ls_trainer_tui_rfdetr_coco_ds");
+        let _ = std::fs::remove_dir_all(&tmp_coco);
+        let run_name = "tui-rfdetr-dual-xpu-verify";
+        let _ = std::fs::remove_dir_all(PathBuf::from("runs/detect").join(run_name));
+
+        for split in ["train", "valid", "test"] {
+            let split_dir = tmp_coco.join(split);
+            std::fs::create_dir_all(&split_dir).expect("create coco split dir");
+            for i in 0..2 {
+                write_tiny_bmp_64x64(&split_dir.join(format!("img_{i}.bmp")));
+            }
+            let coco_json = serde_json::json!({
+                "info": { "description": "tiny rfdetr verify", "version": "1.0" },
+                "licenses": [],
+                "categories": [
+                    { "id": 0, "name": "part", "supercategory": "defect" }
+                ],
+                "images": [
+                    { "id": 1, "file_name": "img_0.bmp", "width": 64, "height": 64 },
+                    { "id": 2, "file_name": "img_1.bmp", "width": 64, "height": 64 }
+                ],
+                "annotations": [
+                    { "id": 1, "image_id": 1, "category_id": 0, "bbox": [12.0, 12.0, 32.0, 32.0], "area": 1024.0, "iscrowd": 0 },
+                    { "id": 2, "image_id": 2, "category_id": 0, "bbox": [10.0, 10.0, 36.0, 36.0], "area": 1296.0, "iscrowd": 0 }
+                ]
+            });
+            std::fs::write(
+                split_dir.join("_annotations.coco.json"),
+                serde_json::to_string_pretty(&coco_json).unwrap(),
+            )
+            .expect("write _annotations.coco.json");
+        }
+
+        let args = vec![
+            "--arch".to_string(),
+            "rf-detr".to_string(),
+            "--dataset".to_string(),
+            tmp_coco.to_string_lossy().to_string(),
+            "--epochs".to_string(),
+            "1".to_string(),
+            "--batch".to_string(),
+            "2".to_string(),
+            "--imgsz".to_string(),
+            "224".to_string(),
+            "--device".to_string(),
+            "xpu:0,1".to_string(),
+            "--workers".to_string(),
+            "0".to_string(),
+            "--run-name".to_string(),
+            run_name.to_string(),
+        ];
+        let cfg = parse_cli_args_from(args)
+            .expect("parse rf-detr flags")
+            .expect("some config");
+        let req = cfg.to_training_request().expect("valid rf-detr request");
+
+        let state = Arc::new(Mutex::new(AppState::new(cfg)));
+        let backend = TestBackend::new(140, 34);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        launch_training_thread(Arc::clone(&state), req);
+
+        // Verify Run Dir path is immediately visible in UI while run is starting
+        {
+            let guard = state.lock().unwrap();
+            assert!(guard.results_dir.is_some());
+            assert_eq!(guard.dataset_train_images, Some(2));
+            terminal
+                .draw(|frame| draw_ui(frame, &guard))
+                .expect("initial draw");
+            let screen = buffer_to_string(terminal.backend().buffer());
+            assert!(screen.contains("Run Dir"));
+            assert!(screen.contains(run_name));
+            assert!(screen.contains("Overall"));
+        }
+
+        // Toggle F1 (?) and F3 (Config Snapshot) during live run
+        let mut cb = None;
+        handle_training_key(&state, KeyCode::F(1), &mut cb);
+        assert_eq!(state.lock().unwrap().overlay, OverlayMode::Help);
+        handle_training_key(&state, KeyCode::F(1), &mut cb);
+        assert_eq!(state.lock().unwrap().overlay, OverlayMode::None);
+
+        handle_training_key(&state, KeyCode::F(3), &mut cb);
+        assert_eq!(state.lock().unwrap().overlay, OverlayMode::Config);
+        handle_training_key(&state, KeyCode::Esc, &mut cb);
+        assert_eq!(state.lock().unwrap().overlay, OverlayMode::None);
+
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let mut saw_live_weights_during_run = false;
+        let mut saw_new_best_during_run = false;
+        while Instant::now() < deadline {
+            let done = {
+                let mut guard = state.lock().unwrap();
+                if guard.is_running {
+                    guard.spinner_tick = guard.spinner_tick.wrapping_add(1);
+                    guard.refresh_run_artifacts();
+                    if guard.best_weights_path.is_some() {
+                        saw_live_weights_during_run = true;
+                    }
+                    if guard.is_new_best_active() {
+                        saw_new_best_during_run = true;
+                    }
+                }
+                terminal
+                    .draw(|frame| draw_ui(frame, &guard))
+                    .expect("draw_ui during rf-detr run");
+                !guard.is_running && guard.exit_code.is_some()
+            };
+            if done {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(120));
+        }
+
+        {
+            let guard = state.lock().unwrap();
+            if guard.exit_code != Some(0) {
+                for l in &guard.logs {
+                    println!("RFDETR LOG: {l}");
+                }
+                force_kill_active_child();
+            }
+            assert_eq!(
+                guard.exit_code,
+                Some(0),
+                "Expected short RF-DETR run + ONNX export to succeed; status={}",
+                guard.status_line
+            );
+            assert!(
+                saw_live_weights_during_run || guard.best_weights_path.is_some(),
+                "Expected best weights path to be populated"
+            );
+            assert!(
+                saw_new_best_during_run || guard.new_best_until.is_some(),
+                "Expected new-best indicator to fire during RF-DETR run"
+            );
+            let best_ckpt = guard
+                .best_weights_path
+                .as_ref()
+                .expect("RF-DETR best checkpoint recorded");
+            let best_onnx = guard
+                .onnx_path
+                .as_ref()
+                .expect("RF-DETR ONNX path recorded");
+            assert!(
+                Path::new(best_ckpt).is_file(),
+                "RF-DETR checkpoint file must exist at {best_ckpt}"
+            );
+            assert!(
+                Path::new(best_onnx).is_file(),
+                "RF-DETR exported ONNX file must exist at {best_onnx}"
+            );
+
+            terminal
+                .draw(|frame| draw_ui(frame, &guard))
+                .expect("final draw_ui after rf-detr run");
+            let final_screen = buffer_to_string(terminal.backend().buffer());
+            assert!(final_screen.contains("Overall 100%"));
+            assert!(final_screen.contains("best.onnx"));
+            assert!(
+                final_screen.contains("● Healthy") || final_screen.contains("▲ Warning"),
+                "Status line must reflect Healthy or Warning state"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_coco);
+        let _ = std::fs::remove_dir_all(PathBuf::from("runs/detect").join(run_name));
     }
 }
