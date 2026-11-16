@@ -55,7 +55,7 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
             "F4 / h",
             "Toggle Recent Runs History overlay (view metrics & paths)",
         ),
-        ("F12", "Copy live training log lines to system clipboard"),
+        ("F12", "Copy log to clipboard or /tmp/ls-trainer-log.txt"),
         ("q / Ctrl+C", "Graceful stop, print exit summary, and quit"),
         (
             "Tab / Arrows",

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,6 +16,23 @@ use crate::app::{
     FLIPUD_PRESETS, IMGSZ_PRESETS, LAUNCHER_FIELD_COUNT, MIXUP_PRESETS, MOSAIC_PRESETS,
     SCALE_PRESETS, TRANSLATE_PRESETS, WORKER_PRESETS,
 };
+
+static CLIPBOARD_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+static CLIPBOARD_FALLBACK_ANNOUNCED: AtomicBool = AtomicBool::new(false);
+
+/// Headless machines have no X11 clipboard. F12 writes the same text here instead.
+pub fn clipboard_fallback_path() -> PathBuf {
+    if cfg!(unix) {
+        PathBuf::from("/tmp/ls-trainer-log.txt")
+    } else {
+        std::env::temp_dir().join("ls-trainer-log.txt")
+    }
+}
+
+enum CopiedTo {
+    Clipboard,
+    File(PathBuf),
+}
 
 pub enum EventOutcome {
     Continue,
@@ -572,13 +591,27 @@ pub fn handle_training_key(
                             .map(|e| e.run_dir.clone())
                     });
                     if let Some(path) = selected_path {
-                        let copied = copy_text_to_clipboard(clipboard, &path).is_ok();
-                        if let Ok(mut guard) = state.lock() {
-                            guard.status_line = if copied {
-                                format!("Copied run path to clipboard: {path}")
-                            } else {
-                                format!("Selected run path: {path}")
-                            };
+                        match copy_text_with_fallback(clipboard, &path) {
+                            Ok(CopiedTo::Clipboard) => {
+                                if let Ok(mut guard) = state.lock() {
+                                    guard.status_line =
+                                        format!("Copied run path to clipboard: {path}");
+                                }
+                            }
+                            Ok(CopiedTo::File(file_path)) => {
+                                let shown = file_path.display().to_string();
+                                announce_clipboard_fallback(state, &shown);
+                                if let Ok(mut guard) = state.lock() {
+                                    guard.status_line = format!(
+                                        "Clipboard unavailable; wrote selection to {shown}"
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                if let Ok(mut guard) = state.lock() {
+                                    guard.status_line = format!("Clipboard copy failed: {err}");
+                                }
+                            }
                         }
                     }
                 }
@@ -694,8 +727,8 @@ pub fn copy_logs_with_feedback(state: &Arc<Mutex<AppState>>, clipboard: &mut Opt
         return;
     }
 
-    match copy_text_to_clipboard(clipboard, &logs_text) {
-        Ok(()) => {
+    match copy_text_with_fallback(clipboard, &logs_text) {
+        Ok(CopiedTo::Clipboard) => {
             if let Ok(mut guard) = state.lock() {
                 guard.status_line = format!("Copied {line_count} log lines to clipboard (F12)");
                 guard.push_log(format!(
@@ -703,21 +736,131 @@ pub fn copy_logs_with_feedback(state: &Arc<Mutex<AppState>>, clipboard: &mut Opt
                 ));
             }
         }
+        Ok(CopiedTo::File(path)) => {
+            let shown = path.display().to_string();
+            if let Ok(mut guard) = state.lock() {
+                guard.status_line =
+                    format!("Clipboard unavailable; wrote {line_count} log lines to {shown}");
+            }
+            announce_clipboard_fallback(state, &shown);
+        }
         Err(err) => {
             if let Ok(mut guard) = state.lock() {
                 guard.status_line = format!("Clipboard copy failed: {err}");
-                guard.push_log(format!("[LS-Trainer Warning] Clipboard copy failed: {err}"));
             }
         }
     }
 }
 
+fn announce_clipboard_fallback(state: &Arc<Mutex<AppState>>, path: &str) {
+    if CLIPBOARD_FALLBACK_ANNOUNCED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(mut guard) = state.lock() {
+        guard.push_log(format!(
+            "[LS-Trainer] Clipboard unavailable. Saving a copy to {path}."
+        ));
+    }
+}
+
+fn copy_text_with_fallback(
+    clipboard: &mut Option<Clipboard>,
+    text: &str,
+) -> Result<CopiedTo, String> {
+    match copy_text_to_clipboard(clipboard, text) {
+        Ok(()) => Ok(CopiedTo::Clipboard),
+        Err(err) => {
+            let path = clipboard_fallback_path();
+            std::fs::write(&path, text).map_err(|io_err| {
+                format!("{err}; also failed to write {}: {io_err}", path.display())
+            })?;
+            Ok(CopiedTo::File(path))
+        }
+    }
+}
+
 pub fn copy_text_to_clipboard(clipboard: &mut Option<Clipboard>, text: &str) -> Result<(), String> {
+    if CLIPBOARD_UNAVAILABLE.load(Ordering::Relaxed) {
+        return Err("clipboard unavailable".to_string());
+    }
     if clipboard.is_none() {
-        *clipboard = Some(Clipboard::new().map_err(|e| e.to_string())?);
+        match Clipboard::new() {
+            Ok(cb) => *clipboard = Some(cb),
+            Err(err) => {
+                CLIPBOARD_UNAVAILABLE.store(true, Ordering::Relaxed);
+                return Err(err.to_string());
+            }
+        }
     }
     let cb = clipboard
         .as_mut()
         .ok_or_else(|| "clipboard unavailable".to_string())?;
-    cb.set_text(text.to_owned()).map_err(|e| e.to_string())
+    match cb.set_text(text.to_owned()) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            CLIPBOARD_UNAVAILABLE.store(true, Ordering::Relaxed);
+            *clipboard = None;
+            Err(err.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CLIPBOARD_FALLBACK_ANNOUNCED, CLIPBOARD_UNAVAILABLE, clipboard_fallback_path,
+        handle_training_key,
+    };
+    use crate::app::{AppState, UiMode, parse_cli_args_from};
+    use crossterm::event::KeyCode;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn f12_on_headless_writes_log_file_and_does_not_repeat_the_notice() {
+        CLIPBOARD_UNAVAILABLE.store(false, Ordering::Relaxed);
+        CLIPBOARD_FALLBACK_ANNOUNCED.store(false, Ordering::Relaxed);
+        let path = clipboard_fallback_path();
+        let _ = std::fs::remove_file(&path);
+
+        let cfg = parse_cli_args_from(Vec::<String>::new())
+            .expect("parse")
+            .expect("cfg");
+        let state = Arc::new(Mutex::new(AppState::new(cfg)));
+        {
+            let mut guard = state.lock().expect("state");
+            guard.mode = UiMode::Training;
+            guard.logs.push_back("alpha log line".to_string());
+            guard.logs.push_back("beta log line".to_string());
+        }
+
+        let mut clipboard = None;
+        handle_training_key(&state, KeyCode::F(12), &mut clipboard);
+
+        let status = state.lock().expect("state").status_line.clone();
+        let shown = path.display().to_string();
+        assert!(
+            status.contains(&shown),
+            "status should name the fallback file, got {status}"
+        );
+        let body = std::fs::read_to_string(&path).expect("fallback file written");
+        assert_eq!(body, "alpha log line\nbeta log line");
+
+        let notices = |logs: &std::collections::VecDeque<String>| {
+            logs.iter()
+                .filter(|line| line.contains("Clipboard unavailable"))
+                .count()
+        };
+        assert_eq!(notices(&state.lock().expect("state").logs), 1);
+
+        handle_training_key(&state, KeyCode::F(12), &mut clipboard);
+        let guard = state.lock().expect("state");
+        assert_eq!(
+            notices(&guard.logs),
+            1,
+            "clipboard fallback must not warn on every F12"
+        );
+        assert!(guard.status_line.contains(&shown));
+        assert!(!guard.status_line.to_ascii_lowercase().contains("failed"));
+    }
 }
