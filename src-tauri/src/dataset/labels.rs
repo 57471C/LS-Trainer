@@ -340,7 +340,8 @@ pub(crate) fn inspect_dataset_path(path: &Path) -> Result<LabelCheckResult, Stri
 
 #[tauri::command]
 pub async fn inspect_dataset_labels(dataset_path: String) -> Result<LabelCheckResult, String> {
-    tauri::async_runtime::spawn_blocking(move || inspect_dataset_path(Path::new(&dataset_path)))
+    let expanded = crate::dataset::expand_dataset_path(&dataset_path);
+    tauri::async_runtime::spawn_blocking(move || inspect_dataset_path(&expanded))
         .await
         .map_err(|e| format!("Label check failed: {e}"))?
 }

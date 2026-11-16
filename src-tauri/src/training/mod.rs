@@ -231,7 +231,7 @@ pub async fn run_training(
         }
     }
 
-    let dataset_input = PathBuf::from(&request.dataset_path);
+    let dataset_input = crate::dataset::expand_dataset_path(&request.dataset_path);
     if !dataset_input.exists() {
         let msg = format!("Dataset path does not exist: {}", request.dataset_path);
         sink.on_log(format!("[LS-Trainer] Error: {msg}"));

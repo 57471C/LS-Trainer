@@ -1528,11 +1528,11 @@ pub fn find_onnx_in_dir(run_dir: &Path) -> Option<PathBuf> {
 }
 
 pub fn count_dataset_train_images(dataset_path: &str) -> Option<u32> {
-    let p = Path::new(dataset_path.trim());
+    let p = app_lib::expand_dataset_path(dataset_path);
     if !p.exists() {
         return None;
     }
-    let root = if p.is_file() { p.parent()? } else { p };
+    let root = if p.is_file() { p.parent()? } else { p.as_path() };
 
     for coco_rel in [
         PathBuf::from("train").join("_annotations.coco.json"),

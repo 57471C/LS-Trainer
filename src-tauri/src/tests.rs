@@ -732,3 +732,53 @@ fn delete_unpacked_dataset_refuses_paths_outside_store() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn expand_dataset_path_expands_tilde_and_home_env_vars() {
+    use std::path::PathBuf;
+    use crate::dataset::expand_dataset_path_with_home;
+
+    let home = Some("C:\\Users\\Terry");
+    assert_eq!(
+        expand_dataset_path_with_home("~", home),
+        PathBuf::from("C:\\Users\\Terry")
+    );
+    assert_eq!(
+        expand_dataset_path_with_home("~/Exports/PAK-BB-coco.tar", home),
+        PathBuf::from("C:\\Users\\Terry").join("Exports/PAK-BB-coco.tar")
+    );
+    assert_eq!(
+        expand_dataset_path_with_home("~\\Exports\\PAK-BB-coco.tar", home),
+        PathBuf::from("C:\\Users\\Terry").join("Exports\\PAK-BB-coco.tar")
+    );
+    assert_eq!(
+        expand_dataset_path_with_home("$HOME", home),
+        PathBuf::from("C:\\Users\\Terry")
+    );
+    assert_eq!(
+        expand_dataset_path_with_home("$HOME/Exports/PAK-BB-coco.tar", home),
+        PathBuf::from("C:\\Users\\Terry").join("Exports/PAK-BB-coco.tar")
+    );
+    assert_eq!(
+        expand_dataset_path_with_home("%USERPROFILE%", home),
+        PathBuf::from("C:\\Users\\Terry")
+    );
+    assert_eq!(
+        expand_dataset_path_with_home("%userprofile%\\Exports\\PAK-BB-coco.tar", home),
+        PathBuf::from("C:\\Users\\Terry").join("Exports\\PAK-BB-coco.tar")
+    );
+
+    // Absolute and relative paths without ~ or env var prefix stay unchanged
+    assert_eq!(
+        expand_dataset_path_with_home("C:\\Datasets\\coco.tar", home),
+        PathBuf::from("C:\\Datasets\\coco.tar")
+    );
+    assert_eq!(
+        expand_dataset_path_with_home("datasets/coco", home),
+        PathBuf::from("datasets/coco")
+    );
+    assert_eq!(
+        expand_dataset_path_with_home("~other/file.tar", home),
+        PathBuf::from("~other/file.tar")
+    );
+}
