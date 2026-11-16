@@ -1,9 +1,13 @@
 from collections import deque
+import ast
 import json
 import math
 import multiprocessing
 import os
+import signal
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -711,8 +715,286 @@ def normalize_device(device_str, arch="yolo"):
     return device_str
 
 
+_STRING_TRAIN_KEYS = frozenset({
+    "data", "project", "name", "model", "task", "cfg", "pretrained", "optimizer",
+})
+
+# Set from the main thread's signal handler. A plain flag avoids taking the
+# stdin-control lock inside the handler.
+_STOP_REQUESTED = {"flag": False}
+
+
+def _is_xpu_device_token(token):
+    text = str(token).strip().lower()
+    return text == "xpu" or text.startswith("xpu:")
+
+
+def _parse_device_list_literal(text):
+    stripped = str(text).strip()
+    if not (stripped.startswith("[") and stripped.endswith("]")):
+        return None
+    try:
+        value = ast.literal_eval(stripped)
+    except (SyntaxError, ValueError):
+        return None
+    if isinstance(value, (list, tuple)) and value and all(isinstance(item, str) for item in value):
+        return [str(item) for item in value]
+    return None
+
+
+def yolo_multi_xpu_devices(device_str, arch="yolo"):
+    """Return a multi-XPU device list for YOLO, or None when the normal launcher should run.
+
+    RF-DETR and RT-DETR keep the original device string. A single XPU, CUDA list, or CPU
+    request also stays on the in-process Ultralytics entrypoint.
+    """
+    if arch != "yolo" or device_str is None:
+        return None
+    text = str(device_str).strip()
+    if not text:
+        return None
+    if text.startswith("["):
+        devices = _parse_device_list_literal(text)
+    else:
+        normalized = normalize_device(text, arch)
+        devices = normalized if isinstance(normalized, list) else None
+    if not devices or len(devices) < 2:
+        return None
+    if not all(_is_xpu_device_token(device) for device in devices):
+        return None
+    return devices
+
+
+def standalone_multi_xpu_devices_from_args(cli_args, arch="yolo"):
+    device_arg = _parse_arg_value(cli_args, "device=") or ""
+    return yolo_multi_xpu_devices(device_arg, arch)
+
+
+def _coerce_cli_value(key, raw):
+    text = str(raw).strip()
+    if key in _STRING_TRAIN_KEYS:
+        return text
+    lower = text.lower()
+    if lower == "true":
+        return True
+    if lower == "false":
+        return False
+    if lower in ("none", "null"):
+        return None
+    if text.isdigit() or (text[:1] in "+-" and text[1:].isdigit()):
+        return int(text)
+    try:
+        return float(text)
+    except ValueError:
+        return text
+
+
+def _train_kwargs_from_cli(cli_args, device_list):
+    kwargs = {}
+    for arg in cli_args:
+        if "=" not in arg:
+            continue
+        key, raw = arg.split("=", 1)
+        if key in ("model", "device"):
+            continue
+        kwargs[key] = _coerce_cli_value(key, raw)
+    kwargs["device"] = [str(device) for device in device_list]
+    return kwargs
+
+
+def build_standalone_yolo_script(cli_args, device_list):
+    """Short fresh-process trainer. It must not import this module or touch its locks."""
+    model = _parse_arg_value(cli_args, "model=") or ""
+    train_kwargs = _train_kwargs_from_cli(cli_args, device_list)
+    return (
+        "import os\n"
+        "import signal\n"
+        "\n"
+        "# Die with the parent if the TUI is killed before it can signal this process.\n"
+        "if os.name == 'posix':\n"
+        "    try:\n"
+        "        import ctypes\n"
+        "        ctypes.CDLL(None).prctl(1, int(signal.SIGTERM))\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "\n"
+        "from ultralytics import YOLO\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        f"    model = YOLO({model!r})\n"
+        f"    model.train(**{train_kwargs!r})\n"
+    )
+
+
+def _terminate_process_group(proc):
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def _stop_child_process(proc):
+    _terminate_process_group(proc)
+    try:
+        proc.wait(timeout=8)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _install_stop_signals():
+    def _handle(_signum, _frame):
+        _STOP_REQUESTED["flag"] = True
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handle)
+        except Exception:
+            pass
+
+
+def launch_standalone_yolo_multi_xpu(cli_args, device_list):
+    """Run model.train in a new interpreter so Ultralytics DDP does not pickle this process.
+
+    The TUI parents this module with a piped stdin and a control thread. Those locks are not
+    picklable, and Ultralytics `generate_ddp_file` cloudpickles the trainer from whichever
+    process calls `model.train`. The child starts with stdin closed and no inherited control state.
+    """
+    _STOP_REQUESTED["flag"] = False
+    script = build_standalone_yolo_script(cli_args, device_list)
+    script_fd, script_path = tempfile.mkstemp(prefix="ls-trainer-yolo-xpu-", suffix=".py")
+    os.close(script_fd)
+    proc = None
+    reader = None
+    try:
+        with open(script_path, "w", encoding="utf-8") as handle:
+            handle.write(script)
+        print(
+            "[LS-Trainer] Multi-XPU YOLO standalone script "
+            f"{script_path} device={device_list}",
+            flush=True,
+        )
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        proc = subprocess.Popen(
+            [sys.executable, "-u", script_path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+
+        ctrl_state = TrainingControlState()
+        start_stdin_control_listener(ctrl_state)
+        _install_stop_signals()
+        project_dir = _parse_arg_value(cli_args, "project=")
+        run_name = _parse_arg_value(cli_args, "name=")
+        stop_file = (
+            os.path.join(project_dir, run_name, ".stop_requested")
+            if (project_dir and run_name)
+            else None
+        )
+
+        def _reader():
+            try:
+                if proc.stdout is None:
+                    return
+                for line in proc.stdout:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+            except Exception:
+                pass
+
+        reader = threading.Thread(target=_reader, name="ls-trainer-xpu-stdout", daemon=True)
+        reader.start()
+
+        announced_stop = False
+        while proc.poll() is None:
+            stop_now = _STOP_REQUESTED["flag"] or ctrl_state.is_stop_requested(stop_file)
+            if stop_now:
+                if not announced_stop:
+                    announced_stop = True
+                    print(
+                        "[LS-Trainer] Stop requested; terminating multi-XPU training.",
+                        flush=True,
+                    )
+                _stop_child_process(proc)
+                break
+            try:
+                time.sleep(0.2)
+            except InterruptedError:
+                _STOP_REQUESTED["flag"] = True
+
+        code = proc.wait()
+        return 1 if code is None else code
+    finally:
+        if proc is not None and proc.poll() is None:
+            _stop_child_process(proc)
+        if reader is not None:
+            reader.join(timeout=2)
+        if proc is not None and proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+        try:
+            os.remove(script_path)
+        except OSError:
+            pass
+
+
 def main():
     cli_args = sys.argv[1:]
+    multi_xpu = standalone_multi_xpu_devices_from_args(cli_args, arch="yolo")
+    if multi_xpu:
+        device_arg = _parse_arg_value(cli_args, "device=") or ""
+        print(
+            f"[LS-Trainer] Multi-GPU: {device_arg} ({len(multi_xpu)} devices)",
+            flush=True,
+        )
+        code = launch_standalone_yolo_multi_xpu(cli_args, multi_xpu)
+        if code:
+            sys.exit(code if code > 0 else 128 + abs(code))
+        return
+
     ctrl_state = TrainingControlState()
     start_stdin_control_listener(ctrl_state)
 
@@ -808,10 +1090,65 @@ def main():
         cli_spinner.stop()
 
 
+def run_self_checks():
+    assert yolo_multi_xpu_devices("xpu:0,1", "yolo") == ["xpu:0", "xpu:1"]
+    assert yolo_multi_xpu_devices("xpu:0, xpu:1", "yolo") == ["xpu:0", "xpu:1"]
+    assert yolo_multi_xpu_devices("['xpu:0','xpu:1']", "yolo") == ["xpu:0", "xpu:1"]
+    assert yolo_multi_xpu_devices("xpu", "yolo") is None
+    assert yolo_multi_xpu_devices("xpu:0", "yolo") is None
+    assert yolo_multi_xpu_devices("0,1", "yolo") is None
+    assert yolo_multi_xpu_devices("cuda", "yolo") is None
+    assert yolo_multi_xpu_devices("cpu", "yolo") is None
+    assert yolo_multi_xpu_devices("xpu:0,1", "rf-detr") is None
+    assert yolo_multi_xpu_devices("xpu:0,1", "rt-detr") is None
+    assert standalone_multi_xpu_devices_from_args(["device=xpu:0"], "yolo") is None
+    assert standalone_multi_xpu_devices_from_args(["device=xpu:0,1"], "yolo") == ["xpu:0", "xpu:1"]
+    assert standalone_multi_xpu_devices_from_args(
+        ["device=['xpu:0','xpu:1']"], "yolo"
+    ) == ["xpu:0", "xpu:1"]
+
+    script = build_standalone_yolo_script(
+        [
+            "detect",
+            "train",
+            "task=detect",
+            "data=/tmp/data.yaml",
+            "model=/tmp/yolo11n.pt",
+            "epochs=1",
+            "batch=2",
+            "imgsz=64",
+            "workers=0",
+            "device=['xpu:0','xpu:1']",
+            "amp=False",
+            "mosaic=0",
+            "scale=0.05",
+            "degrees=180",
+            "name=run",
+            "project=/tmp/runs",
+        ],
+        ["xpu:0", "xpu:1"],
+    )
+    compile(script, "<standalone>", "exec")
+    assert "model.train(**" in script
+    assert "['xpu:0', 'xpu:1']" in script
+    assert "YOLO('/tmp/yolo11n.pt')" in script
+    assert "'epochs': 1" in script
+    assert "'amp': False" in script
+    assert "'scale': 0.05" in script
+    assert "'degrees': 180" in script
+    assert "TrainingControlState" not in script
+    assert "threading" not in script
+    assert "stdin" not in script
+    print("yolo multi-xpu self-checks ok")
+
+
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    try:
-        main()
-    except Exception:
-        traceback.print_exc()
-        sys.exit(1)
+    if os.environ.get("LS_TRAINER_YOLO_SELFTEST") == "1":
+        run_self_checks()
+    else:
+        try:
+            main()
+        except Exception:
+            traceback.print_exc()
+            sys.exit(1)
