@@ -1927,7 +1927,7 @@ where
                        --dataset <path>                Dataset folder or archive path\n  \
                        --epochs <n>                    Number of training epochs (default: 60)\n  \
                        --batch <n>                     Batch size (default: 4)\n  \
-                       --device <str>                  Device (auto, xpu, xpu:0,1, cuda, 0, cpu)\n  \
+                       --device <str>                  Device (auto, xpu, xpu:0, xpu:0,1 for YOLO, cuda, 0, cpu)\n  \
                        --imgsz <n>                     Image resolution (640, 960, 1280; default: 960)\n  \
                        --workers <n>                   DataLoader workers (default: auto; 0 for Windows Arc)\n  \
                        --freeze-backbone               Freeze backbone layers (freeze=10)\n  \

@@ -369,7 +369,7 @@ pub(crate) async fn start_yolo_training(
         device_input.to_string()
     };
 
-    let device_arg = format!("device={effective_device}");
+    let device_arg = format!("device={}", normalize_yolo_device(&effective_device));
 
     let expected_venv_yolo = venv_yolo_path(&project_root);
     let expected_venv_python = venv_python_path(&project_root);
@@ -600,5 +600,56 @@ pub(crate) async fn start_yolo_training(
                 map50_95: None,
             })
         }
+    }
+}
+
+/// Normalize multi-XPU device strings into an Ultralytics Python list literal (e.g. `['xpu:0','xpu:1']`).
+///
+/// This list conversion is YOLO/Ultralytics-specific: Ultralytics on Intel Arc XPU requires a
+/// Python list for multi-GPU to avoid a CUDA-style DDP pickle error, whereas RF-DETR and RT-DETR
+/// continue to receive the original device string.
+pub(crate) fn normalize_yolo_device(device_str: &str) -> String {
+    let trimmed = device_str.trim();
+    if trimmed.is_empty() || trimmed.starts_with('[') {
+        return trimmed.to_string();
+    }
+    if trimmed.contains("xpu") && trimmed.contains(',') {
+        let parts: Vec<String> = trimmed
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                if p.chars().all(|c| c.is_ascii_digit()) {
+                    format!("'xpu:{p}'")
+                } else {
+                    format!("'{p}'")
+                }
+            })
+            .collect();
+        if !parts.is_empty() {
+            return format!("[{}]", parts.join(","));
+        }
+    }
+    trimmed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_yolo_device;
+
+    #[test]
+    fn normalizes_yolo_multi_xpu_to_list_literal() {
+        assert_eq!(normalize_yolo_device("xpu:0,1"), "['xpu:0','xpu:1']");
+        assert_eq!(normalize_yolo_device("xpu:0, xpu:1"), "['xpu:0','xpu:1']");
+    }
+
+    #[test]
+    fn leaves_single_xpu_cuda_and_cpu_unchanged() {
+        assert_eq!(normalize_yolo_device("xpu"), "xpu");
+        assert_eq!(normalize_yolo_device("xpu:0"), "xpu:0");
+        assert_eq!(normalize_yolo_device("0,1"), "0,1");
+        assert_eq!(normalize_yolo_device("cuda"), "cuda");
+        assert_eq!(normalize_yolo_device("cpu"), "cpu");
+        assert_eq!(normalize_yolo_device("['xpu:0','xpu:1']"), "['xpu:0','xpu:1']");
     }
 }

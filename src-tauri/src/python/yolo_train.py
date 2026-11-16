@@ -695,6 +695,22 @@ def on_fit_epoch_end(trainer):
         print(msg, flush=True)
 
 
+def normalize_device(device_str, arch="yolo"):
+    if not device_str:
+        return None
+    # This list conversion is YOLO/Ultralytics-specific; RF-DETR and RT-DETR keep the original string.
+    if arch == "yolo" and not device_str.strip().startswith("[") and "xpu" in device_str and "," in device_str:
+        parts = [p.strip() for p in device_str.split(",") if p.strip()]
+        normalized = []
+        for p in parts:
+            if p.isdigit():
+                normalized.append(f"xpu:{p}")
+            else:
+                normalized.append(p)
+        return normalized
+    return device_str
+
+
 def main():
     cli_args = sys.argv[1:]
     ctrl_state = TrainingControlState()
@@ -767,7 +783,20 @@ def main():
     except Exception:
         pass
 
-    sys.argv = ["yolo"] + cli_args
+    normalized_cli_args = []
+    for arg in cli_args:
+        if arg.startswith("device="):
+            raw_dev = arg[len("device="):]
+            norm_dev = normalize_device(raw_dev, "yolo")
+            if isinstance(norm_dev, list):
+                dev_literal = "[" + ",".join(f"'{d}'" for d in norm_dev) + "]"
+                normalized_cli_args.append(f"device={dev_literal}")
+            elif norm_dev is not None:
+                normalized_cli_args.append(f"device={norm_dev}")
+        else:
+            normalized_cli_args.append(arg)
+
+    sys.argv = ["yolo"] + normalized_cli_args
     cli_spinner.start()
     try:
         from ultralytics.cfg import entrypoint
