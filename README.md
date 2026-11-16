@@ -4,6 +4,17 @@ Desktop app and terminal UI (`ls-trainer-tui`) for training YOLO, RF-DETR, and R
 
 Built for the [LS-Marker](https://github.com/57471C/LS-Marker) &rarr; LS-Trainer &rarr; LS-Vision workflow. Point it at an LS-Marker (YOLO or COCO format) export, run a training job, and get a usable `.onnx` model without leaving the app.
 
+## Screenshots
+
+### Desktop App
+![LS-Trainer Desktop GUI](docs/images/screenshot-gui.png)
+
+### Terminal UI (`ls-trainer-tui`) — Live Training
+![LS-Trainer TUI Live Training](docs/images/screenshot-training.png)
+
+### Terminal UI (`ls-trainer-tui`) — Exit Summary
+![LS-Trainer TUI Exit Summary](docs/images/screenshot-finish.png)
+
 ## Features
 
 - **Architectures**: Train **YOLO** (YOLO11 & YOLO26 detection and `-seg` instance segmentation), **RF-DETR** (detection & segmentation), and **RT-DETR** (`rtdetr-v2-r18`, `rtdetr-l.pt`, `rtdetr-x.pt`)
