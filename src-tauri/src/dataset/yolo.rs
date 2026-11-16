@@ -8,7 +8,8 @@ use std::sync::Arc;
 use crate::process::TrainingEventSink;
 
 pub(crate) fn unpack_archive(archive_path: &Path, target_dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(target_dir).map_err(|e| format!("Failed to create temp dir: {e}"))?;
+    std::fs::create_dir_all(target_dir)
+        .map_err(|e| format!("Failed to create unpack directory: {e}"))?;
 
     let file = File::open(archive_path).map_err(|e| format!("Failed to open archive: {e}"))?;
     let path_str = archive_path.to_string_lossy().to_lowercase();

@@ -238,6 +238,7 @@ pub async fn run_training(
         return Err(msg);
     }
 
+    crate::dataset::store::clear_last_unpacked_dir();
     register_active_training(abs_results_dir.clone());
 
     let response = if is_rtdetr_request(&request) {

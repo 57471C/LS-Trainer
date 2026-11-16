@@ -65,6 +65,8 @@ pub fn run() {
             dialogs::pick_dataset_folder,
             dialogs::pick_model_file,
             dataset::labels::inspect_dataset_labels,
+            dataset::store::take_last_unpacked_dataset,
+            dataset::store::delete_unpacked_dataset,
             training::start_training,
             training::stop_training,
             dialogs::open_folder,

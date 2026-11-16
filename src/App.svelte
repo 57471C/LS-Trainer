@@ -10,6 +10,7 @@ import OutputSection from "./components/OutputSection.svelte";
 import ParametersSection from "./components/ParametersSection.svelte";
 import SettingsModal from "./components/SettingsModal.svelte";
 import TrainingAction from "./components/TrainingAction.svelte";
+import UnpackedDatasetModal from "./components/UnpackedDatasetModal.svelte";
 import {
 	freshModelOptions,
 	loadSavedFamily,
@@ -30,6 +31,7 @@ import type {
 	ModelMode,
 	TrainingResponse,
 	TrainTask,
+	UnpackedDatasetInfo,
 } from "./types";
 import {
 	formatDurationHm,
@@ -740,6 +742,17 @@ async function handleStartTraining() {
 			trainingEndTime = Date.now();
 			isTraining = false;
 			isStoppingTraining = false;
+			try {
+				const info = await invoke<UnpackedDatasetInfo | null>(
+					"take_last_unpacked_dataset",
+				);
+				if (info) {
+					deleteUnpackedError = null;
+					unpackedDatasetPrompt = info;
+				}
+			} catch (e) {
+				console.error("Failed to inspect unpacked dataset:", e);
+			}
 		}
 	} else {
 		// Browser development preview simulation
@@ -780,6 +793,41 @@ async function handleStartTraining() {
 		trainingEndTime = Date.now();
 		isTraining = false;
 	}
+}
+
+let unpackedDatasetPrompt = $state<UnpackedDatasetInfo | null>(null);
+let isDeletingUnpacked = $state(false);
+let deleteUnpackedError = $state<string | null>(null);
+
+async function handleDeleteUnpackedDataset() {
+	if (!unpackedDatasetPrompt || isDeletingUnpacked) return;
+	const targetPath = unpackedDatasetPrompt.path;
+	isDeletingUnpacked = true;
+	deleteUnpackedError = null;
+	try {
+		if (isTauri()) {
+			await invoke("delete_unpacked_dataset", { path: targetPath });
+		}
+		logs = [
+			...logs,
+			`[LS-Trainer] Deleted unpacked dataset: ${normalizePath(targetPath)}`,
+		];
+		unpackedDatasetPrompt = null;
+	} catch (err) {
+		deleteUnpackedError = err instanceof Error ? err.message : String(err);
+	} finally {
+		isDeletingUnpacked = false;
+	}
+}
+
+function handleKeepUnpackedDataset() {
+	if (!unpackedDatasetPrompt || isDeletingUnpacked) return;
+	logs = [
+		...logs,
+		`[LS-Trainer] Kept unpacked dataset: ${normalizePath(unpackedDatasetPrompt.path)}`,
+	];
+	unpackedDatasetPrompt = null;
+	deleteUnpackedError = null;
 }
 
 async function handleExportToOnnx() {
@@ -999,6 +1047,14 @@ async function handleExportToOnnx() {
 		onClose={() => { settingsOpen = false; }}
 		{dataDirectory}
 		onSaved={(path) => { dataDirectory = path; }}
+	/>
+
+	<UnpackedDatasetModal
+		info={unpackedDatasetPrompt}
+		deleting={isDeletingUnpacked}
+		error={deleteUnpackedError}
+		onDelete={handleDeleteUnpackedDataset}
+		onKeep={handleKeepUnpackedDataset}
 	/>
 </div>
 

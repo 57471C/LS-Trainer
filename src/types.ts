@@ -97,3 +97,9 @@ export interface FinalMetrics {
 	map50?: number | null;
 	map50_95?: number | null;
 }
+
+export interface UnpackedDatasetInfo {
+	path: string;
+	image_count: number;
+	size_bytes: number;
+}

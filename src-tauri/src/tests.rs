@@ -628,3 +628,107 @@ fn xpu_async_train_smoke() {
     assert!(!sink.metrics.lock().unwrap().is_empty());
     assert_eq!(sink.exits.lock().unwrap().as_slice(), &[Some(0)]);
 }
+
+#[test]
+fn unpacked_store_root_uses_app_data_not_temp() {
+    let root = crate::dataset::store::unpacked_store_root().expect("store root");
+    assert_eq!(
+        root.file_name().and_then(|n| n.to_str()),
+        Some("unpacked")
+    );
+    assert_eq!(
+        root.parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str()),
+        Some("LS-Trainer")
+    );
+    assert!(
+        !root.starts_with(std::env::temp_dir()),
+        "Store root {:?} must not be under system temp dir",
+        root
+    );
+}
+
+#[test]
+fn short_safe_dataset_name_sanitizes_archives() {
+    use std::path::Path;
+    use crate::dataset::store::short_safe_dataset_name;
+    assert_eq!(
+        short_safe_dataset_name(Path::new("C:/data/BB Parts (v3).tar.gz")),
+        "BB_Parts_v3"
+    );
+    assert_eq!(
+        short_safe_dataset_name(Path::new("coco_export.TGZ")),
+        "coco_export"
+    );
+    assert_eq!(
+        short_safe_dataset_name(Path::new("...tar")),
+        "dataset"
+    );
+}
+
+#[test]
+fn create_unpacked_run_dir_avoids_collisions_and_inspects_stats() {
+    use std::path::Path;
+    use crate::dataset::store::{create_unpacked_run_dir_in, inspect_unpacked_dir};
+
+    let test_root = std::env::temp_dir().join(format!(
+        "ls_trainer_store_test_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&test_root);
+    let archive = Path::new("my_dataset.tar.gz");
+
+    let first = create_unpacked_run_dir_in(&test_root, archive).expect("first dir");
+    let second = create_unpacked_run_dir_in(&test_root, archive).expect("second dir");
+    assert_ne!(first, second);
+    assert!(first.is_dir());
+    assert!(second.is_dir());
+    assert_eq!(first.parent(), Some(test_root.as_path()));
+    let first_name = first.file_name().unwrap().to_str().unwrap();
+    assert!(first_name.contains("_my_dataset"), "Got {first_name}");
+
+    std::fs::create_dir_all(first.join("images")).unwrap();
+    std::fs::write(first.join("images").join("a.jpg"), vec![1u8; 120]).unwrap();
+    std::fs::write(first.join("images").join("b.PNG"), vec![2u8; 80]).unwrap();
+    std::fs::write(first.join("data.yaml"), b"nc: 1\n").unwrap();
+
+    let info = inspect_unpacked_dir(&first);
+    assert_eq!(info.image_count, 2);
+    assert_eq!(info.size_bytes, 206);
+
+    let _ = std::fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn delete_unpacked_dataset_refuses_paths_outside_store() {
+    use std::path::Path;
+    use crate::dataset::store::{create_unpacked_run_dir_in, delete_unpacked_dataset_in};
+
+    let base = std::env::temp_dir().join(format!(
+        "ls_trainer_delete_guard_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    let store_root = base.join("unpacked");
+    let outside_dir = base.join("outside");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    std::fs::write(outside_dir.join("keep.txt"), b"important").unwrap();
+
+    let run_dir = create_unpacked_run_dir_in(&store_root, Path::new("ds.tar")).unwrap();
+    std::fs::write(run_dir.join("img.jpg"), b"123").unwrap();
+
+    // Must refuse deleting store_root itself, parent, or outside_dir
+    assert!(delete_unpacked_dataset_in(&store_root, &store_root).is_err());
+    assert!(delete_unpacked_dataset_in(&store_root, &base).is_err());
+    assert!(delete_unpacked_dataset_in(&store_root, &outside_dir).is_err());
+    assert!(outside_dir.join("keep.txt").is_file());
+
+    // Must succeed on the direct child run_dir
+    delete_unpacked_dataset_in(&store_root, &run_dir).expect("delete run_dir");
+    assert!(!run_dir.exists());
+    assert!(store_root.is_dir());
+    assert!(outside_dir.join("keep.txt").is_file());
+
+    let _ = std::fs::remove_dir_all(&base);
+}

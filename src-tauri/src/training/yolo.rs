@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::process::Command as TokioCommand;
 
 use crate::dataset::labels::inspect_label_tree;
+use crate::dataset::store::{create_unpacked_run_dir, record_last_unpacked_dir};
 use crate::dataset::yolo::{find_data_yaml, resolve_and_fix_data_yaml, unpack_archive};
 use crate::hardware::{detect_gpu_info, resolve_dataloader_workers};
 use crate::models::{TrainingRequest, TrainingResponse};
@@ -200,25 +201,22 @@ pub(crate) async fn start_yolo_training(
 
     // Determine data.yaml path: unpack if archive, or find inside directory
     let raw_data_yaml_path = if dataset_input.is_file() {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let temp_dir = std::env::temp_dir().join(format!("ls_trainer_{timestamp}"));
+        let unpacked_dir = create_unpacked_run_dir(&dataset_input)?;
+        record_last_unpacked_dir(&unpacked_dir);
 
         sink.on_log(format!(
             "[LS-Trainer] Unpacking archive '{}' to '{}'...",
             dataset_input.display(),
-            temp_dir.display()
+            unpacked_dir.display()
         ));
 
-        unpack_archive(&dataset_input, &temp_dir)?;
+        unpack_archive(&dataset_input, &unpacked_dir)?;
         sink.on_log("[LS-Trainer] Unpacked dataset successfully.".to_string());
 
-        let yaml = find_data_yaml(&temp_dir).ok_or_else(|| {
+        let yaml = find_data_yaml(&unpacked_dir).ok_or_else(|| {
             let err = format!(
                 "data.yaml not found in unpacked archive directory: {}",
-                temp_dir.display()
+                unpacked_dir.display()
             );
             sink.on_log(format!("[LS-Trainer] Error: {err}"));
             err
