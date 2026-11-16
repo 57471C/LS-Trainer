@@ -6,6 +6,7 @@ pub struct TrainingRequest {
     pub model_choice: String,
     pub run_name: String,
     pub epochs: u32,
+    #[serde(default)]
     pub imgsz: u32,
     pub device: String,
     #[serde(default = "default_batch")]

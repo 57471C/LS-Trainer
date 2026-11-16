@@ -40,6 +40,41 @@ pub(crate) fn resolve_rfdetr_class_and_pretrain(
     }
 }
 
+pub(crate) fn rfdetr_default_resolution(rfdetr_class: &str) -> u32 {
+    match rfdetr_class {
+        "RFDETRNano" => 384,
+        "RFDETRSmall" => 512,
+        "RFDETRMedium" => 576,
+        "RFDETRBase" => 560,
+        "RFDETRLarge" => 704,
+        "RFDETRSegNano" => 312,
+        "RFDETRSegSmall" => 384,
+        "RFDETRSegMedium" => 432,
+        "RFDETRSegLarge" => 504,
+        "RFDETRSegPreview" => 432,
+        _ => 576,
+    }
+}
+
+pub(crate) fn resolve_rfdetr_resolution(
+    imgsz: u32,
+    rfdetr_class: &str,
+    block_size: u32,
+) -> Result<u32, String> {
+    let resolution = if imgsz > 0 {
+        imgsz
+    } else {
+        rfdetr_default_resolution(rfdetr_class)
+    };
+    let b = block_size.max(1);
+    if resolution % b != 0 {
+        return Err(format!(
+            "Invalid RF-DETR resolution {resolution} for {rfdetr_class}: must be divisible by block size {b}."
+        ));
+    }
+    Ok(resolution)
+}
+
 pub(crate) fn snap_rfdetr_resolution(imgsz: u32, block_size: u32) -> u32 {
     let b = block_size.max(1);
     let rounded = ((imgsz + b / 2) / b) * b;

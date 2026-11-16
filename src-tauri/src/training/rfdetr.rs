@@ -13,7 +13,7 @@ use crate::process::{
     TrainingEventSink, get_venv_python, hide_console_window_tokio, stream_tokio_child_output,
 };
 use crate::rfdetr::{
-    ensure_rfdetr_installed, resolve_rfdetr_class_and_pretrain, snap_rfdetr_resolution,
+    ensure_rfdetr_installed, resolve_rfdetr_class_and_pretrain, resolve_rfdetr_resolution,
     verify_rfdetr_dependencies,
 };
 use crate::training::{
@@ -31,6 +31,19 @@ pub(crate) async fn start_rfdetr_training(
     request: TrainingRequest,
     sink: Arc<dyn TrainingEventSink>,
 ) -> Result<TrainingResponse, String> {
+    let (rfdetr_class, default_weights_name, block_size) =
+        resolve_rfdetr_class_and_pretrain(&request.model_choice, &yolo_task);
+    let resolution = match resolve_rfdetr_resolution(request.imgsz, rfdetr_class, block_size) {
+        Ok(res) => {
+            sink.on_log(format!("[LS-Trainer] RF-DETR resolution: {res}"));
+            res
+        }
+        Err(err_msg) => {
+            sink.on_log(format!("[LS-Trainer Error] {err_msg}"));
+            return Err(err_msg);
+        }
+    };
+
     let coco_root = prepare_rfdetr_coco_dataset(&dataset_input, &sink)?;
 
     if yolo_task == "segment" {
@@ -49,16 +62,6 @@ pub(crate) async fn start_rfdetr_training(
     if let Err(err_msg) = verify_rfdetr_dependencies(&project_root) {
         sink.on_log(format!("[LS-Trainer Error] {err_msg}"));
         return Err(err_msg);
-    }
-
-    let (rfdetr_class, default_weights_name, block_size) =
-        resolve_rfdetr_class_and_pretrain(&request.model_choice, &yolo_task);
-    let snapped_res = snap_rfdetr_resolution(request.imgsz, block_size);
-    if snapped_res != request.imgsz {
-        sink.on_log(format!(
-            "[LS-Trainer] Adjusted RF-DETR resolution from {} to {} (nearest multiple of block_size={block_size}).",
-            request.imgsz, snapped_res
-        ));
     }
 
     let models_dir = project_root.join("models");
@@ -129,7 +132,7 @@ pub(crate) async fn start_rfdetr_training(
         "output_dir": abs_results_dir.to_string_lossy(),
         "epochs": request.epochs,
         "batch_size": request.batch,
-        "resolution": snapped_res,
+        "resolution": resolution,
         "device": effective_device,
         "num_workers": effective_workers,
         "pretrain_weights": resolved_pretrain,
@@ -156,7 +159,7 @@ pub(crate) async fn start_rfdetr_training(
         yolo_task,
         request.model_choice,
         rfdetr_class,
-        snapped_res,
+        resolution,
         request.epochs,
         request.batch,
         effective_workers,

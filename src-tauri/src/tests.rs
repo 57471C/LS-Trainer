@@ -782,3 +782,28 @@ fn expand_dataset_path_expands_tilde_and_home_env_vars() {
         PathBuf::from("~other/file.tar")
     );
 }
+
+#[test]
+fn rfdetr_resolution_honours_imgsz_defaults_and_validates_block_size() {
+    use crate::rfdetr::{resolve_rfdetr_class_and_pretrain, resolve_rfdetr_resolution};
+
+    let (cls_med, _, block_med) = resolve_rfdetr_class_and_pretrain("rf-detr-medium", "detect");
+    assert_eq!(cls_med, "RFDETRMedium");
+    assert_eq!(block_med, 32);
+
+    // Positive imgsz divisible by block size is used directly
+    assert_eq!(resolve_rfdetr_resolution(1280, cls_med, block_med), Ok(1280));
+    assert_eq!(resolve_rfdetr_resolution(640, cls_med, block_med), Ok(640));
+
+    // Zero / missing imgsz falls back to model's built-in default
+    assert_eq!(resolve_rfdetr_resolution(0, cls_med, block_med), Ok(576));
+
+    // Indivisible imgsz aborts with a clear error
+    let err = resolve_rfdetr_resolution(650, cls_med, block_med).unwrap_err();
+    assert!(err.contains("650") && err.contains("32"));
+
+    // Base uses block_size=56 and built-in default=560
+    let (cls_base, _, block_base) = resolve_rfdetr_class_and_pretrain("rf-detr-base", "detect");
+    assert_eq!(resolve_rfdetr_resolution(0, cls_base, block_base), Ok(560));
+    assert!(resolve_rfdetr_resolution(640, cls_base, block_base).is_err());
+}
