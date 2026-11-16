@@ -129,4 +129,4 @@ When auto-export is on, a successful run writes `best.onnx` in the run directory
 
 ## Project status
 
-Version 0.2.0. Supports local detection and instance-segmentation training (YOLO, RF-DETR, RT-DETR), standalone TUI, and ONNX export.
+Version 0.2.1. Supports local detection and instance-segmentation training (YOLO, RF-DETR, RT-DETR), standalone TUI, and ONNX export.

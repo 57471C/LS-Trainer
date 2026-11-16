@@ -14,7 +14,7 @@ use ls_trainer_lib::{
 use ratatui::style::Color;
 use sysinfo::System;
 
-pub const APP_VERSION_LABEL: &str = "Version v0.2.0";
+pub const APP_VERSION_LABEL: &str = "Version v0.2.1";
 pub const MAX_LOG_LINES: usize = 500;
 pub const MAX_HISTORY_POINTS: usize = 300;
 pub const MAX_SPARKLINE_SAMPLES: usize = 60;
