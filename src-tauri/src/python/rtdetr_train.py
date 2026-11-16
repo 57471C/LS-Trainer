@@ -1035,7 +1035,11 @@ def main():
 
     model.to(torch_device)
     if is_ddp:
-        model = DDP(model, device_ids=[torch_device.index])
+        model = DDP(
+            model,
+            device_ids=[torch_device.index],
+            find_unused_parameters=True,
+        )
 
     # Optimizer and LR scheduler
     trainable_params = [p for p in model.parameters() if p.requires_grad]
