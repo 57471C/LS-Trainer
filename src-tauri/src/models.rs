@@ -41,6 +41,22 @@ pub struct TrainingRequest {
     /// Optional manual override for DataLoader `num_workers`. `None` = auto-detect from physical CPU cores.
     #[serde(default)]
     pub workers: Option<u32>,
+    /// Optional checkpoint to fine-tune from. Empty keeps a fresh start from `model_choice`.
+    /// YOLO11 / YOLO26 pass this path as `model=`. RF-DETR and RT-DETR pass it as `pretrain_weights`.
+    #[serde(default)]
+    pub resume_from: String,
+}
+
+impl TrainingRequest {
+    /// Weights this run starts from. An empty `resume_from` keeps the selected scale.
+    pub fn starting_weights(&self) -> &str {
+        let resume = self.resume_from.trim();
+        if resume.is_empty() {
+            self.model_choice.trim()
+        } else {
+            resume
+        }
+    }
 }
 
 pub(crate) fn default_model_family() -> String {

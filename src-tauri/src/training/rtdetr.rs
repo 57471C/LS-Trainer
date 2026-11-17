@@ -37,18 +37,26 @@ pub(crate) async fn start_rtdetr_training(
     let models_dir = project_root.join("models");
     let _ = std::fs::create_dir_all(&models_dir);
 
-    let custom_path = Path::new(request.model_choice.trim());
     let (default_hf_weights, default_label) = resolve_rtdetr_model_meta(&request.model_choice);
+    let pretrain_candidate =
+        crate::training::checkpoint_pretrain_weights(&request, default_hf_weights);
+    let custom_path = Path::new(&pretrain_candidate);
     let (resolved_pretrain, model_name, base_weights) = if custom_path.is_file() {
         let (base, label) = rtdetr_run_dir_for_checkpoint(custom_path)
             .and_then(|run_dir| rtdetr_architecture_from_run(&run_dir))
             .unwrap_or_else(|| (default_hf_weights.to_string(), default_label.to_string()));
         sink.on_log(format!(
-            "[LS-Trainer] Continuing RT-DETR from checkpoint '{}' with base {base}.",
+            "[LS-Trainer] Continuing RT-DETR from pretrain_weights '{}' with base_weights {base}.",
             custom_path.display()
         ));
         (custom_path.to_string_lossy().to_string(), label, base)
     } else {
+        if !request.resume_from.trim().is_empty() {
+            sink.on_log(format!(
+                "[LS-Trainer] Resume file not found ({}). RT-DETR pretrain_weights falls back to {default_hf_weights}.",
+                request.resume_from.trim()
+            ));
+        }
         (
             default_hf_weights.to_string(),
             default_label.to_string(),

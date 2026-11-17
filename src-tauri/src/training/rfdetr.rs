@@ -1,6 +1,6 @@
 //! RF-DETR training backend (runs `python/rfdetr_train.py` in the project venv).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command as TokioCommand;
@@ -66,12 +66,13 @@ pub(crate) async fn start_rfdetr_training(
 
     let models_dir = project_root.join("models");
     let _ = std::fs::create_dir_all(&models_dir);
-    let custom_path = Path::new(request.model_choice.trim());
-    let resolved_pretrain = if custom_path.is_file() {
-        custom_path.to_string_lossy().to_string()
-    } else {
-        default_weights_name.to_string()
-    };
+    let resolved_pretrain =
+        crate::training::checkpoint_pretrain_weights(&request, default_weights_name);
+    if !request.resume_from.trim().is_empty() {
+        sink.on_log(format!(
+            "[LS-Trainer] Fine-tuning RF-DETR with pretrain_weights={resolved_pretrain}"
+        ));
+    }
 
     let device_input = request.device.trim();
     let gpu_probe = {

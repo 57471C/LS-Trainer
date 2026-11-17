@@ -13,8 +13,12 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use crate::app::{
     launch_training_thread, scan_run_history, AppState, OverlayMode, UiMode, AUG_PRESET_NAMES,
     BATCH_PRESETS, CLOSE_MOSAIC_PRESETS, DEGREES_PRESETS, DEVICE_PRESETS, EPOCH_PRESETS,
-    FLIPUD_PRESETS, IMGSZ_PRESETS, LAUNCHER_FIELD_COUNT, MIXUP_PRESETS, MOSAIC_PRESETS,
-    SCALE_PRESETS, TRANSLATE_PRESETS, WORKER_PRESETS,
+    FIELD_AMP, FIELD_AUG_PRESET, FIELD_BATCH, FIELD_CLOSE_MOSAIC, FIELD_COPY_PASTE,
+    FIELD_DATASET, FIELD_DEGREES, FIELD_DEVICE, FIELD_EPOCHS, FIELD_FLIPUD, FIELD_FREEZE,
+    FIELD_IMGSZ, FIELD_MIXUP, FIELD_MOSAIC, FIELD_RESUME, FIELD_RUN_NAME, FIELD_SCALE,
+    FIELD_SCALE_GAIN, FIELD_START, FIELD_TRANSLATE, FIELD_WORKERS, FLIPUD_PRESETS, IMGSZ_PRESETS,
+    LAUNCHER_FIELD_COUNT, MIXUP_PRESETS, MOSAIC_PRESETS, SCALE_PRESETS, TRANSLATE_PRESETS,
+    WORKER_PRESETS,
 };
 
 static CLIPBOARD_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
@@ -64,8 +68,16 @@ pub fn handle_event(
                 let is_quit_q = matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
                     && state
                         .lock()
-                        .map(|g| !g.setup.editing_field)
+                        .map(|g| !g.setup.editing_field && g.overlay != OverlayMode::Browse)
                         .unwrap_or(false);
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O'))
+                {
+                    if let Ok(mut guard) = state.lock() {
+                        guard.open_launcher_browse();
+                    }
+                    return EventOutcome::Continue;
+                }
                 if is_quit_q {
                     return EventOutcome::Quit {
                         show_exit_summary: true,
@@ -106,9 +118,34 @@ pub fn cycle_preset(current: &str, presets: &[&str], forward: bool) -> String {
     presets[next_idx].to_string()
 }
 
+fn browse_overlay_key(state: &mut AppState, code: KeyCode) {
+    match code {
+        KeyCode::Esc | KeyCode::F(6) => {
+            state.overlay = OverlayMode::None;
+        }
+        KeyCode::Up => {
+            state.browse_cursor = state.browse_cursor.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            if !state.browse_entries.is_empty() {
+                let max_idx = state.browse_entries.len() - 1;
+                state.browse_cursor = (state.browse_cursor + 1).min(max_idx);
+            }
+        }
+        KeyCode::Enter => {
+            state.apply_browse_selection();
+        }
+        _ => {}
+    }
+}
+
 pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
     let mut launch_req: Option<TrainingRequest> = None;
     if let Ok(mut guard) = state.lock() {
+        if guard.overlay == OverlayMode::Browse {
+            browse_overlay_key(&mut guard, code);
+            return false;
+        }
         if guard.overlay != OverlayMode::None {
             match code {
                 KeyCode::Esc
@@ -126,17 +163,17 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
         let focused = guard.setup.focused_field;
         let finish_edit = |s: &mut crate::app::CliConfig| {
             if s.editing_field {
-                if s.focused_field == 1 {
+                if s.focused_field == FIELD_SCALE {
                     s.model = s.arch.resolve_model_or_scale(&s.model);
-                } else if s.focused_field == 5 {
+                } else if s.focused_field == FIELD_IMGSZ {
                     if let Ok(parsed) = s.imgsz_input.trim().parse::<u32>() {
                         s.imgsz = parsed.max(32);
                     } else if s.imgsz_input.trim().is_empty() {
                         s.imgsz_input = s.imgsz.to_string();
                     }
-                } else if s.focused_field == 6 && s.workers_input.trim().is_empty() {
+                } else if s.focused_field == FIELD_WORKERS && s.workers_input.trim().is_empty() {
                     s.workers_input = "auto".to_string();
-                } else if s.focused_field == 10 {
+                } else if s.focused_field == FIELD_RUN_NAME {
                     s.finish_run_name_edit();
                 }
                 s.editing_field = false;
@@ -156,6 +193,9 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
             }
             KeyCode::F(3) => {
                 guard.overlay = OverlayMode::Config;
+            }
+            KeyCode::F(6) => {
+                guard.open_launcher_browse();
             }
             KeyCode::F(2) => {
                 finish_edit(&mut guard.setup);
@@ -190,62 +230,62 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
                 1 if !guard.setup.editing_field => {
                     guard.setup.model = guard.setup.arch.cycle_model(&guard.setup.model, false);
                 }
-                3 if !guard.setup.editing_field => {
+                FIELD_EPOCHS if !guard.setup.editing_field => {
                     guard.setup.epochs = cycle_preset(&guard.setup.epochs, &EPOCH_PRESETS, false);
                 }
-                4 if !guard.setup.editing_field => {
+                FIELD_BATCH if !guard.setup.editing_field => {
                     guard.setup.batch = cycle_preset(&guard.setup.batch, &BATCH_PRESETS, false);
                 }
-                5 if !guard.setup.editing_field => {
+                FIELD_IMGSZ if !guard.setup.editing_field => {
                     guard.setup.imgsz_input =
                         cycle_preset(&guard.setup.imgsz_input, &IMGSZ_PRESETS, false);
                     if let Ok(parsed) = guard.setup.imgsz_input.parse::<u32>() {
                         guard.setup.imgsz = parsed;
                     }
                 }
-                6 if !guard.setup.editing_field => {
+                FIELD_WORKERS if !guard.setup.editing_field => {
                     guard.setup.workers_input =
                         cycle_preset(&guard.setup.workers_input, &WORKER_PRESETS, false);
                 }
-                7 if !guard.setup.editing_field => {
+                FIELD_DEVICE if !guard.setup.editing_field => {
                     guard.setup.device = cycle_preset(&guard.setup.device, &DEVICE_PRESETS, false);
                 }
-                8 => {
+                FIELD_FREEZE => {
                     guard.setup.freeze_backbone = !guard.setup.freeze_backbone;
                 }
-                9 => {
+                FIELD_AMP => {
                     guard.setup.amp = !guard.setup.amp;
                 }
-                11 => {
+                FIELD_AUG_PRESET => {
                     let cur = guard.setup.active_aug_preset();
                     let next_p = cycle_preset(cur, &AUG_PRESET_NAMES, false);
                     guard.setup.apply_aug_preset(&next_p);
                 }
-                12 if !guard.setup.editing_field => {
+                FIELD_DEGREES if !guard.setup.editing_field => {
                     guard.setup.degrees =
                         cycle_preset(&guard.setup.degrees, &DEGREES_PRESETS, false);
                 }
-                13 if !guard.setup.editing_field => {
+                FIELD_FLIPUD if !guard.setup.editing_field => {
                     guard.setup.flipud = cycle_preset(&guard.setup.flipud, &FLIPUD_PRESETS, false);
                 }
-                14 if !guard.setup.editing_field => {
+                FIELD_SCALE_GAIN if !guard.setup.editing_field => {
                     guard.setup.scale = cycle_preset(&guard.setup.scale, &SCALE_PRESETS, false);
                 }
-                15 if !guard.setup.editing_field => {
+                FIELD_TRANSLATE if !guard.setup.editing_field => {
                     guard.setup.translate =
                         cycle_preset(&guard.setup.translate, &TRANSLATE_PRESETS, false);
                 }
-                16 if !guard.setup.editing_field => {
+                FIELD_MOSAIC if !guard.setup.editing_field => {
                     guard.setup.mosaic = cycle_preset(&guard.setup.mosaic, &MOSAIC_PRESETS, false);
                 }
-                17 if !guard.setup.editing_field => {
+                FIELD_CLOSE_MOSAIC if !guard.setup.editing_field => {
                     guard.setup.close_mosaic =
                         cycle_preset(&guard.setup.close_mosaic, &CLOSE_MOSAIC_PRESETS, false);
                 }
-                18 if !guard.setup.editing_field => {
+                FIELD_MIXUP if !guard.setup.editing_field => {
                     guard.setup.mixup = cycle_preset(&guard.setup.mixup, &MIXUP_PRESETS, false);
                 }
-                19 => {
+                FIELD_COPY_PASTE => {
                     guard.setup.copy_paste = !guard.setup.copy_paste;
                 }
                 _ => {}
@@ -258,62 +298,62 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
                 1 if !guard.setup.editing_field => {
                     guard.setup.model = guard.setup.arch.cycle_model(&guard.setup.model, true);
                 }
-                3 if !guard.setup.editing_field => {
+                FIELD_EPOCHS if !guard.setup.editing_field => {
                     guard.setup.epochs = cycle_preset(&guard.setup.epochs, &EPOCH_PRESETS, true);
                 }
-                4 if !guard.setup.editing_field => {
+                FIELD_BATCH if !guard.setup.editing_field => {
                     guard.setup.batch = cycle_preset(&guard.setup.batch, &BATCH_PRESETS, true);
                 }
-                5 if !guard.setup.editing_field => {
+                FIELD_IMGSZ if !guard.setup.editing_field => {
                     guard.setup.imgsz_input =
                         cycle_preset(&guard.setup.imgsz_input, &IMGSZ_PRESETS, true);
                     if let Ok(parsed) = guard.setup.imgsz_input.parse::<u32>() {
                         guard.setup.imgsz = parsed;
                     }
                 }
-                6 if !guard.setup.editing_field => {
+                FIELD_WORKERS if !guard.setup.editing_field => {
                     guard.setup.workers_input =
                         cycle_preset(&guard.setup.workers_input, &WORKER_PRESETS, true);
                 }
-                7 if !guard.setup.editing_field => {
+                FIELD_DEVICE if !guard.setup.editing_field => {
                     guard.setup.device = cycle_preset(&guard.setup.device, &DEVICE_PRESETS, true);
                 }
-                8 => {
+                FIELD_FREEZE => {
                     guard.setup.freeze_backbone = !guard.setup.freeze_backbone;
                 }
-                9 => {
+                FIELD_AMP => {
                     guard.setup.amp = !guard.setup.amp;
                 }
-                11 => {
+                FIELD_AUG_PRESET => {
                     let cur = guard.setup.active_aug_preset();
                     let next_p = cycle_preset(cur, &AUG_PRESET_NAMES, true);
                     guard.setup.apply_aug_preset(&next_p);
                 }
-                12 if !guard.setup.editing_field => {
+                FIELD_DEGREES if !guard.setup.editing_field => {
                     guard.setup.degrees =
                         cycle_preset(&guard.setup.degrees, &DEGREES_PRESETS, true);
                 }
-                13 if !guard.setup.editing_field => {
+                FIELD_FLIPUD if !guard.setup.editing_field => {
                     guard.setup.flipud = cycle_preset(&guard.setup.flipud, &FLIPUD_PRESETS, true);
                 }
-                14 if !guard.setup.editing_field => {
+                FIELD_SCALE_GAIN if !guard.setup.editing_field => {
                     guard.setup.scale = cycle_preset(&guard.setup.scale, &SCALE_PRESETS, true);
                 }
-                15 if !guard.setup.editing_field => {
+                FIELD_TRANSLATE if !guard.setup.editing_field => {
                     guard.setup.translate =
                         cycle_preset(&guard.setup.translate, &TRANSLATE_PRESETS, true);
                 }
-                16 if !guard.setup.editing_field => {
+                FIELD_MOSAIC if !guard.setup.editing_field => {
                     guard.setup.mosaic = cycle_preset(&guard.setup.mosaic, &MOSAIC_PRESETS, true);
                 }
-                17 if !guard.setup.editing_field => {
+                FIELD_CLOSE_MOSAIC if !guard.setup.editing_field => {
                     guard.setup.close_mosaic =
                         cycle_preset(&guard.setup.close_mosaic, &CLOSE_MOSAIC_PRESETS, true);
                 }
-                18 if !guard.setup.editing_field => {
+                FIELD_MIXUP if !guard.setup.editing_field => {
                     guard.setup.mixup = cycle_preset(&guard.setup.mixup, &MIXUP_PRESETS, true);
                 }
-                19 => {
+                FIELD_COPY_PASTE => {
                     guard.setup.copy_paste = !guard.setup.copy_paste;
                 }
                 _ => {}
@@ -323,26 +363,30 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
                     guard.setup.editing_field = true;
                     guard.setup.model.pop();
                 }
-                2 => {
+                FIELD_DATASET => {
                     guard.setup.editing_field = true;
                     guard.setup.dataset.pop();
                 }
-                3 => {
+                FIELD_RESUME => {
+                    guard.setup.editing_field = true;
+                    guard.setup.resume_from.pop();
+                }
+                FIELD_EPOCHS => {
                     guard.setup.editing_field = true;
                     guard.setup.epochs.pop();
                 }
-                4 => {
+                FIELD_BATCH => {
                     guard.setup.editing_field = true;
                     guard.setup.batch.pop();
                 }
-                5 => {
+                FIELD_IMGSZ => {
                     guard.setup.editing_field = true;
                     guard.setup.imgsz_input.pop();
                     if let Ok(parsed) = guard.setup.imgsz_input.parse::<u32>() {
                         guard.setup.imgsz = parsed;
                     }
                 }
-                6 => {
+                FIELD_WORKERS => {
                     guard.setup.editing_field = true;
                     if guard.setup.workers_input.eq_ignore_ascii_case("auto") {
                         guard.setup.workers_input.clear();
@@ -350,40 +394,40 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
                         guard.setup.workers_input.pop();
                     }
                 }
-                7 => {
+                FIELD_DEVICE => {
                     guard.setup.editing_field = true;
                     guard.setup.device.pop();
                 }
-                10 => {
+                FIELD_RUN_NAME => {
                     guard.setup.editing_field = true;
                     guard.setup.run_name_custom = true;
                     guard.setup.run_name.pop();
                 }
-                12 => {
+                FIELD_DEGREES => {
                     guard.setup.editing_field = true;
                     guard.setup.degrees.pop();
                 }
-                13 => {
+                FIELD_FLIPUD => {
                     guard.setup.editing_field = true;
                     guard.setup.flipud.pop();
                 }
-                14 => {
+                FIELD_SCALE_GAIN => {
                     guard.setup.editing_field = true;
                     guard.setup.scale.pop();
                 }
-                15 => {
+                FIELD_TRANSLATE => {
                     guard.setup.editing_field = true;
                     guard.setup.translate.pop();
                 }
-                16 => {
+                FIELD_MOSAIC => {
                     guard.setup.editing_field = true;
                     guard.setup.mosaic.pop();
                 }
-                17 => {
+                FIELD_CLOSE_MOSAIC => {
                     guard.setup.editing_field = true;
                     guard.setup.close_mosaic.pop();
                 }
-                18 => {
+                FIELD_MIXUP => {
                     guard.setup.editing_field = true;
                     guard.setup.mixup.pop();
                 }
@@ -398,26 +442,30 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
                     guard.setup.editing_field = true;
                     guard.setup.model.push(c);
                 }
-                2 => {
+                FIELD_DATASET => {
                     guard.setup.editing_field = true;
                     guard.setup.dataset.push(c);
                 }
-                3 if c.is_ascii_digit() => {
+                FIELD_RESUME => {
+                    guard.setup.editing_field = true;
+                    guard.setup.resume_from.push(c);
+                }
+                FIELD_EPOCHS if c.is_ascii_digit() => {
                     guard.setup.editing_field = true;
                     guard.setup.epochs.push(c);
                 }
-                4 if c.is_ascii_digit() => {
+                FIELD_BATCH if c.is_ascii_digit() => {
                     guard.setup.editing_field = true;
                     guard.setup.batch.push(c);
                 }
-                5 if c.is_ascii_digit() => {
+                FIELD_IMGSZ if c.is_ascii_digit() => {
                     guard.setup.editing_field = true;
                     guard.setup.imgsz_input.push(c);
                     if let Ok(parsed) = guard.setup.imgsz_input.parse::<u32>() {
                         guard.setup.imgsz = parsed;
                     }
                 }
-                6 => {
+                FIELD_WORKERS => {
                     guard.setup.editing_field = true;
                     if c.is_ascii_digit() {
                         if guard.setup.workers_input.eq_ignore_ascii_case("auto") {
@@ -428,61 +476,61 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
                         guard.setup.workers_input = "auto".to_string();
                     }
                 }
-                7 => {
+                FIELD_DEVICE => {
                     guard.setup.editing_field = true;
                     guard.setup.device.push(c);
                 }
-                8 if c == ' ' => {
+                FIELD_FREEZE if c == ' ' => {
                     guard.setup.freeze_backbone = !guard.setup.freeze_backbone;
                 }
-                9 if c == ' ' => {
+                FIELD_AMP if c == ' ' => {
                     guard.setup.amp = !guard.setup.amp;
                 }
-                10 => {
+                FIELD_RUN_NAME => {
                     guard.setup.editing_field = true;
                     guard.setup.run_name_custom = true;
                     guard.setup.run_name.push(c);
                 }
-                11 if c == ' ' => {
+                FIELD_AUG_PRESET if c == ' ' => {
                     let cur = guard.setup.active_aug_preset();
                     let next_p = cycle_preset(cur, &AUG_PRESET_NAMES, true);
                     guard.setup.apply_aug_preset(&next_p);
                 }
-                12 if c.is_ascii_digit() || c == '.' => {
+                FIELD_DEGREES if c.is_ascii_digit() || c == '.' => {
                     guard.setup.editing_field = true;
                     guard.setup.degrees.push(c);
                 }
-                13 if c.is_ascii_digit() || c == '.' => {
+                FIELD_FLIPUD if c.is_ascii_digit() || c == '.' => {
                     guard.setup.editing_field = true;
                     guard.setup.flipud.push(c);
                 }
-                14 if c.is_ascii_digit() || c == '.' => {
+                FIELD_SCALE_GAIN if c.is_ascii_digit() || c == '.' => {
                     guard.setup.editing_field = true;
                     guard.setup.scale.push(c);
                 }
-                15 if c.is_ascii_digit() || c == '.' => {
+                FIELD_TRANSLATE if c.is_ascii_digit() || c == '.' => {
                     guard.setup.editing_field = true;
                     guard.setup.translate.push(c);
                 }
-                16 if c.is_ascii_digit() || c == '.' => {
+                FIELD_MOSAIC if c.is_ascii_digit() || c == '.' => {
                     guard.setup.editing_field = true;
                     guard.setup.mosaic.push(c);
                 }
-                17 if c.is_ascii_digit() => {
+                FIELD_CLOSE_MOSAIC if c.is_ascii_digit() => {
                     guard.setup.editing_field = true;
                     guard.setup.close_mosaic.push(c);
                 }
-                18 if c.is_ascii_digit() || c == '.' => {
+                FIELD_MIXUP if c.is_ascii_digit() || c == '.' => {
                     guard.setup.editing_field = true;
                     guard.setup.mixup.push(c);
                 }
-                19 if c == ' ' => {
+                FIELD_COPY_PASTE if c == ' ' => {
                     guard.setup.copy_paste = !guard.setup.copy_paste;
                 }
                 _ => {}
             },
             KeyCode::Enter => {
-                if focused == 20 {
+                if focused == FIELD_START {
                     finish_edit(&mut guard.setup);
                     guard.setup.refresh_suggested_run_name();
                     match guard.setup.to_training_request() {
@@ -497,15 +545,15 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
                 } else if focused == 0 {
                     let next_arch = guard.setup.arch.next();
                     guard.setup.switch_arch(next_arch);
-                } else if focused == 8 {
+                } else if focused == FIELD_FREEZE {
                     guard.setup.freeze_backbone = !guard.setup.freeze_backbone;
-                } else if focused == 9 {
+                } else if focused == FIELD_AMP {
                     guard.setup.amp = !guard.setup.amp;
-                } else if focused == 11 {
+                } else if focused == FIELD_AUG_PRESET {
                     let cur = guard.setup.active_aug_preset();
                     let next_p = cycle_preset(cur, &AUG_PRESET_NAMES, true);
                     guard.setup.apply_aug_preset(&next_p);
-                } else if focused == 19 {
+                } else if focused == FIELD_COPY_PASTE {
                     guard.setup.copy_paste = !guard.setup.copy_paste;
                 } else if guard.setup.editing_field {
                     finish_edit(&mut guard.setup);
@@ -515,7 +563,7 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
             }
             _ => {}
         }
-        let editing_run_name = guard.setup.focused_field == 10 && guard.setup.editing_field;
+        let editing_run_name = guard.setup.focused_field == FIELD_RUN_NAME && guard.setup.editing_field;
         if !editing_run_name {
             guard.setup.refresh_suggested_run_name();
         }
@@ -627,7 +675,7 @@ pub fn handle_training_key(
                 }
                 _ => {}
             },
-            OverlayMode::None => {}
+            OverlayMode::Browse | OverlayMode::None => {}
         }
         return false;
     }

@@ -5,13 +5,19 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
 
 use crate::app::{
     APP_VERSION_LABEL, AppState, BAR_GPU_TEAL, BAR_STEP_BLUE, BAR_TRACK_BG, BORDER_SOFT,
-    GAUGE_TEXT_COVERED, LABEL_MUTED, TABLE_BORDER_SOFT, TITLE_ACCENT,
+    FIELD_AMP, FIELD_ARCH, FIELD_AUG_PRESET, FIELD_BATCH, FIELD_CLOSE_MOSAIC, FIELD_COPY_PASTE,
+    FIELD_DATASET, FIELD_DEGREES, FIELD_DEVICE, FIELD_EPOCHS, FIELD_FLIPUD, FIELD_FREEZE,
+    FIELD_IMGSZ, FIELD_MIXUP, FIELD_MOSAIC, FIELD_RESUME, FIELD_RUN_NAME, FIELD_SCALE,
+    FIELD_SCALE_GAIN, FIELD_START, FIELD_TRANSLATE, FIELD_WORKERS, GAUGE_TEXT_COVERED, LABEL_MUTED,
+    OVERLAY_BG, TABLE_BORDER_SOFT, TITLE_ACCENT, dataset_looks_like_archive, resume_file_name,
+    resume_status_text, BrowseKind,
 };
+use crate::ui::centered_rect;
 use crate::ui::widgets::gpu::render_top_gpu_strip;
 
 fn format_field_line(
@@ -78,8 +84,8 @@ fn format_field_line(
 fn focused_field_help(state: &AppState) -> String {
     let s = &state.setup;
     match s.focused_field {
-        0 => "Architecture family: Left/Right or Enter to switch YOLO11 | YOLO26 | RF-DETR | RT-DETR".to_string(),
-        1 => {
+        FIELD_ARCH => "Architecture family: Left/Right or Enter to switch YOLO11 | YOLO26 | RF-DETR | RT-DETR".to_string(),
+        FIELD_SCALE => {
             let family = s.arch.display_label();
             let cycle = match s.arch {
                 crate::app::ArchChoice::Yolo | crate::app::ArchChoice::Yolo26 => {
@@ -99,24 +105,25 @@ fn focused_field_help(state: &AppState) -> String {
                 )
             }
         }
-        2 => "Dataset Path: prefilled with ~/Exports/ — add the dataset folder or archive (Enter to edit)".to_string(),
-        3 => "Epochs: Total training passes over the dataset (Webview default: 60; Left/Right or Enter)".to_string(),
-        4 => "Batch Size: Images processed per step (Webview default: 4; Left/Right or Enter)".to_string(),
-        5 => "Resolution (imgsz): Input image size — 640, 960 (default), or 1280 (Left/Right or Enter)".to_string(),
-        6 => "Workers: PyTorch DataLoader workers — auto (default), 0, 1, 2, 4, 6, 7, 8 (0 recommended on Windows Arc)".to_string(),
-        7 => "Device: Compute target — auto (default), xpu, xpu:0, xpu:0,1 (dual-XPU), 0, cuda, cpu".to_string(),
-        8 => "Freeze Backbone: Unfrozen (freeze=0, default) or Freeze first 10 backbone layers (Left/Right/Enter)".to_string(),
-        9 => "Mixed Precision (AMP): Enabled FP16 (default) or Disabled FP32 (Left/Right/Enter)".to_string(),
-        10 => "Run Name: suggested from the family, scale, epochs, and image size (Y26m-e60-960_dd-mm-yy). Enter to edit; your text is kept.".to_string(),
-        11 => "Augmentation Preset: Bench (default: deg=180, flipud=0.5, scale=0.05, close_mosaic=10, mosaic=0), Off, Light, Medium".to_string(),
-        12 => "Rotation (degrees): Random rotation range 0–180° (Bench default: 180)".to_string(),
-        13 => "Vertical Flip (flipud): Up-down flip probability 0.0–1.0 (Bench default: 0.5)".to_string(),
-        14 => "Scale Gain (scale): Image scale jitter 0.0–1.0 (Bench default: 0.05)".to_string(),
-        15 => "Translate: Random translation fraction 0.0–1.0 (Webview default: 0.1)".to_string(),
-        16 => "Mosaic: 4-image mosaic probability 0.0–1.0 (Bench default: 0.0)".to_string(),
-        17 => "Close Mosaic: Disable mosaic for final N epochs (Bench default: 10)".to_string(),
-        18 => "MixUp: Image blend augmentation probability 0.0–1.0 (Webview default: 0.0)".to_string(),
-        19 => "Copy-Paste: Instance segmentation copy-paste augmentation Off (0.0, default) / On (0.3)".to_string(),
+        FIELD_DATASET => "A folder is used as-is. A .tar/.tar.gz/.tgz with data.yaml, labels, and images is unpacked into the dataset store.".to_string(),
+        FIELD_RESUME => "Blank = fresh start. Type a .pt/.pth path or press F6 to browse. Fine-tune adds -ft to the suggested run name.".to_string(),
+        FIELD_EPOCHS => "Epochs: Total training passes over the dataset (Webview default: 60; Left/Right or Enter)".to_string(),
+        FIELD_BATCH => "Batch Size: Images processed per step (Webview default: 4; Left/Right or Enter)".to_string(),
+        FIELD_IMGSZ => "Resolution (imgsz): Input image size — 640, 960 (default), or 1280 (Left/Right or Enter)".to_string(),
+        FIELD_WORKERS => "Workers: PyTorch DataLoader workers — auto (default), 0, 1, 2, 4, 6, 7, 8 (0 recommended on Windows Arc)".to_string(),
+        FIELD_DEVICE => "Device: Compute target — auto (default), xpu, xpu:0, xpu:0,1 (dual-XPU), 0, cuda, cpu".to_string(),
+        FIELD_FREEZE => "Freeze Backbone: Unfrozen (freeze=0, default) or Freeze first 10 backbone layers (Left/Right/Enter)".to_string(),
+        FIELD_AMP => "Mixed Precision (AMP): Enabled FP16 (default) or Disabled FP32 (Left/Right/Enter)".to_string(),
+        FIELD_RUN_NAME => "Run Name: suggested from the family, scale, epochs, and image size. Resume adds -ft. Enter to edit; your text is kept.".to_string(),
+        FIELD_AUG_PRESET => "Augmentation Preset: Bench (default: deg=180, flipud=0.5, scale=0.05, close_mosaic=10, mosaic=0), Off, Light, Medium".to_string(),
+        FIELD_DEGREES => "Rotation (degrees): Random rotation range 0–180° (Bench default: 180)".to_string(),
+        FIELD_FLIPUD => "Vertical Flip (flipud): Up-down flip probability 0.0–1.0 (Bench default: 0.5)".to_string(),
+        FIELD_SCALE_GAIN => "Scale Gain (scale): Image scale jitter 0.0–1.0 (Bench default: 0.05)".to_string(),
+        FIELD_TRANSLATE => "Translate: Random translation fraction 0.0–1.0 (Webview default: 0.1)".to_string(),
+        FIELD_MOSAIC => "Mosaic: 4-image mosaic probability 0.0–1.0 (Bench default: 0.0)".to_string(),
+        FIELD_CLOSE_MOSAIC => "Close Mosaic: Disable mosaic for final N epochs (Bench default: 10)".to_string(),
+        FIELD_MIXUP => "MixUp: Image blend augmentation probability 0.0–1.0 (Webview default: 0.0)".to_string(),
+        FIELD_COPY_PASTE => "Copy-Paste: Instance segmentation copy-paste augmentation Off (0.0, default) / On (0.3)".to_string(),
         _ => "Press Enter or F2 to start training with the selected scale and hyperparameters".to_string(),
     }
 }
@@ -156,8 +163,8 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
         };
 
         let s = &state.setup;
-        let spacious = padded.height >= 20;
-        let top_h = if spacious { 5 } else { 4 };
+        let spacious = padded.height >= 21;
+        let top_h = if spacious { 6 } else { 5 };
         let mid_h = if spacious { 11 } else { 10 };
         let bot_h = padded.height.saturating_sub(top_h + mid_h);
 
@@ -176,7 +183,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             s.arch.display_label(),
             s.arch.as_cli_str()
         );
-        let scale_val = if s.focused_field == 1 && s.editing_field {
+        let scale_val = if s.focused_field == FIELD_SCALE && s.editing_field {
             s.model.clone()
         } else if let Some(opt) = s.arch.find_option(&s.model) {
             format!("◀ {} · {} ({}) ▶", opt.scale, opt.id, opt.label)
@@ -192,11 +199,24 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             }
             crate::app::ArchChoice::RtDetr => "r18 (default) | large | xlarge",
         };
-        let ds_display = if s.dataset.is_empty() && !(s.focused_field == 2 && s.editing_field) {
+        let ds_display = if s.dataset.is_empty() && !(s.focused_field == FIELD_DATASET && s.editing_field)
+        {
             "<enter dataset path>".to_string()
         } else {
             s.dataset.clone()
         };
+        let ds_hint = if dataset_looks_like_archive(&s.dataset) {
+            "archive · unpacks into the dataset store on start"
+        } else {
+            "folder or .tar · Enter to edit · F6 browse"
+        };
+        let resume_display =
+            if s.resume_from.is_empty() && !(s.focused_field == FIELD_RESUME && s.editing_field) {
+                "<fresh start>".to_string()
+            } else {
+                s.resume_from.clone()
+            };
+        let resume_hint = "blank=fresh · YOLO model= · DETR pretrain_weights";
 
         let mut top_lines: Vec<Line<'static>> = Vec::with_capacity(top_h as usize);
         top_lines.push(Line::from(vec![
@@ -227,7 +247,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(" to start.", Style::default().fg(LABEL_MUTED)),
         ]));
         top_lines.push(format_field_line(
-            0,
+            FIELD_ARCH,
             s.focused_field,
             s.editing_field,
             "Architecture",
@@ -237,7 +257,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             15,
         ));
         top_lines.push(format_field_line(
-            1,
+            FIELD_SCALE,
             s.focused_field,
             s.editing_field,
             "Model Scale",
@@ -247,13 +267,23 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             15,
         ));
         top_lines.push(format_field_line(
-            2,
+            FIELD_DATASET,
             s.focused_field,
             s.editing_field,
             "Dataset Path",
             &ds_display,
             true,
-            Some("~/Exports/ — Enter to edit the rest of the path"),
+            Some(ds_hint),
+            15,
+        ));
+        top_lines.push(format_field_line(
+            FIELD_RESUME,
+            s.focused_field,
+            s.editing_field,
+            "Resume from",
+            &resume_display,
+            true,
+            Some(resume_hint),
             15,
         ));
         frame.render_widget(Paragraph::new(top_lines), v_sections[0]);
@@ -264,20 +294,20 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(v_sections[1]);
 
-        let imgsz_disp = if s.focused_field == 5 && s.editing_field {
+        let imgsz_disp = if s.focused_field == FIELD_IMGSZ && s.editing_field {
             s.imgsz_input.clone()
         } else {
             let resolved = s.resolve_imgsz().unwrap_or(s.imgsz);
             format!("◀ {resolved} ▶")
         };
-        let workers_disp = if s.focused_field == 6 && s.editing_field {
+        let workers_disp = if s.focused_field == FIELD_WORKERS && s.editing_field {
             s.workers_input.clone()
         } else if s.workers_input.trim().is_empty() {
             "◀ auto ▶".to_string()
         } else {
             format!("◀ {} ▶", s.workers_input.trim())
         };
-        let device_disp = if s.focused_field == 7 && s.editing_field {
+        let device_disp = if s.focused_field == FIELD_DEVICE && s.editing_field {
             s.device.clone()
         } else {
             format!("◀ {} ▶", s.device.trim())
@@ -307,7 +337,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         )));
         left_lines.push(format_field_line(
-            3,
+            FIELD_EPOCHS,
             s.focused_field,
             s.editing_field,
             "Epochs",
@@ -317,7 +347,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             15,
         ));
         left_lines.push(format_field_line(
-            4,
+            FIELD_BATCH,
             s.focused_field,
             s.editing_field,
             "Batch Size",
@@ -327,7 +357,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             15,
         ));
         left_lines.push(format_field_line(
-            5,
+            FIELD_IMGSZ,
             s.focused_field,
             s.editing_field,
             "Resolution",
@@ -337,7 +367,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             15,
         ));
         left_lines.push(format_field_line(
-            6,
+            FIELD_WORKERS,
             s.focused_field,
             s.editing_field,
             "Workers",
@@ -347,7 +377,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             15,
         ));
         left_lines.push(format_field_line(
-            7,
+            FIELD_DEVICE,
             s.focused_field,
             s.editing_field,
             "Device",
@@ -357,7 +387,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             15,
         ));
         left_lines.push(format_field_line(
-            8,
+            FIELD_FREEZE,
             s.focused_field,
             s.editing_field,
             "Freeze Backbone",
@@ -367,7 +397,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             15,
         ));
         left_lines.push(format_field_line(
-            9,
+            FIELD_AMP,
             s.focused_field,
             s.editing_field,
             "Mixed Prec (AMP)",
@@ -377,7 +407,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             15,
         ));
         left_lines.push(format_field_line(
-            10,
+            FIELD_RUN_NAME,
             s.focused_field,
             s.editing_field,
             "Run Name",
@@ -407,7 +437,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         )));
         right_lines.push(format_field_line(
-            11,
+            FIELD_AUG_PRESET,
             s.focused_field,
             s.editing_field,
             "Aug Preset",
@@ -417,7 +447,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             15,
         ));
         right_lines.push(format_field_line(
-            12,
+            FIELD_DEGREES,
             s.focused_field,
             s.editing_field,
             "Degrees",
@@ -427,7 +457,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             15,
         ));
         right_lines.push(format_field_line(
-            13,
+            FIELD_FLIPUD,
             s.focused_field,
             s.editing_field,
             "Flip UD",
@@ -437,7 +467,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             15,
         ));
         right_lines.push(format_field_line(
-            14,
+            FIELD_SCALE_GAIN,
             s.focused_field,
             s.editing_field,
             "Scale",
@@ -447,7 +477,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             15,
         ));
         right_lines.push(format_field_line(
-            15,
+            FIELD_TRANSLATE,
             s.focused_field,
             s.editing_field,
             "Translate",
@@ -457,7 +487,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             15,
         ));
         right_lines.push(format_field_line(
-            16,
+            FIELD_MOSAIC,
             s.focused_field,
             s.editing_field,
             "Mosaic",
@@ -467,7 +497,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             15,
         ));
         right_lines.push(format_field_line(
-            17,
+            FIELD_CLOSE_MOSAIC,
             s.focused_field,
             s.editing_field,
             "Close Mosaic",
@@ -477,7 +507,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             15,
         ));
         right_lines.push(format_field_line(
-            18,
+            FIELD_MIXUP,
             s.focused_field,
             s.editing_field,
             "MixUp",
@@ -487,7 +517,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             15,
         ));
         right_lines.push(format_field_line(
-            19,
+            FIELD_COPY_PASTE,
             s.focused_field,
             s.editing_field,
             "Copy-Paste",
@@ -499,7 +529,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
         frame.render_widget(Paragraph::new(right_lines), cols[1]);
 
         // 3. Bottom full-width section: Start Training button (20) + active field help or error banner
-        let start_focused = s.focused_field == 20;
+        let start_focused = s.focused_field == FIELD_START;
         let start_prefix = if start_focused { " ▶ " } else { "   " };
         let start_btn_style = if start_focused {
             Style::default()
@@ -524,17 +554,29 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             Span::styled("   [ Start Training (Enter / F2) ]   ", start_btn_style),
             Span::styled(
                 format!(
-                    "   Launch {} ({}) · {} ep · batch {} · {}px · dev {}",
+                    "   Launch {} ({}) · {} ep · batch {} · {}px · dev {}{}",
                     s.arch.display_label(),
                     resolved_model,
                     s.epochs,
                     s.batch,
                     s.resolve_imgsz().unwrap_or(s.imgsz),
-                    s.device
+                    s.device,
+                    resume_file_name(&s.resume_from)
+                        .map(|name| format!(" · ft {name}"))
+                        .unwrap_or_default()
                 ),
                 Style::default().fg(LABEL_MUTED),
             ),
         ]));
+
+        if let Some(status) = resume_status_text(s.arch, &s.resume_from) {
+            bot_lines.push(Line::from(Span::styled(
+                format!("   {status}"),
+                Style::default()
+                    .fg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
 
         if let Some(ref err) = s.error_banner {
             bot_lines.push(Line::from(Span::styled(
@@ -543,7 +585,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
                     .fg(Color::LightRed)
                     .add_modifier(Modifier::BOLD),
             )));
-        } else if bot_h >= 2 {
+        } else if (bot_h as usize) > bot_lines.len() {
             bot_lines.push(Line::from(vec![
                 Span::styled("   ℹ ", Style::default().fg(TITLE_ACCENT)),
                 Span::styled(focused_field_help(state), Style::default().fg(LABEL_MUTED)),
@@ -625,4 +667,77 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
         Paragraph::new(footer).alignment(Alignment::Center),
         footer_chunks[1],
     );
+}
+
+pub fn render_browse_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
+    let modal = centered_rect(78, 70, area);
+    frame.render_widget(Clear, modal);
+
+    let title = match state.browse_kind {
+        BrowseKind::Weights => " Browse weights (.pt / .pth) — Enter selects, Esc closes ",
+        BrowseKind::Dataset => " Browse dataset archives (.tar) — Enter selects, Esc closes ",
+    };
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(TITLE_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(TITLE_ACCENT))
+        .style(Style::default().bg(OVERLAY_BG));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    if inner.height == 0 || inner.width <= 4 {
+        return;
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if state.browse_entries.is_empty() {
+        let empty = match state.browse_kind {
+            BrowseKind::Weights => {
+                "No .pt or .pth files under the current path, models/, or runs/."
+            }
+            BrowseKind::Dataset => {
+                "No .tar archives under the current path or ~/Exports/."
+            }
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {empty}"),
+            Style::default().fg(LABEL_MUTED),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Type a path in the field instead.",
+            Style::default().fg(LABEL_MUTED),
+        )));
+    } else {
+        let window = inner.height as usize;
+        let start = state
+            .browse_cursor
+            .saturating_sub(window / 2)
+            .min(state.browse_entries.len().saturating_sub(window.max(1)));
+        for (offset, path) in state
+            .browse_entries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(window)
+        {
+            let selected = offset == state.browse_cursor;
+            let prefix = if selected { " ▶ " } else { "   " };
+            let style = if selected {
+                Style::default()
+                    .fg(GAUGE_TEXT_COVERED)
+                    .bg(BAR_GPU_TEAL)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(Span::styled(format!("{prefix}{path}"), style)));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }

@@ -259,9 +259,10 @@ pub(crate) async fn start_yolo_training(
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| project_root.clone());
 
+    let weights_source = request.starting_weights().to_string();
     let resolved_model = {
         let root = project_root.clone();
-        let choice = request.model_choice.clone();
+        let choice = weights_source.clone();
         let sink_dl = Arc::clone(&sink);
         tauri::async_runtime::spawn_blocking(move || {
             resolve_or_download_model_weights(&root, &choice, &sink_dl)
@@ -269,6 +270,11 @@ pub(crate) async fn start_yolo_training(
         .await
         .map_err(|e| format!("Model resolution task failed: {e}"))?
     };
+    if !request.resume_from.trim().is_empty() {
+        sink.on_log(format!(
+            "[LS-Trainer] Fine-tuning YOLO from model={resolved_model}"
+        ));
+    }
     sink.on_log("[LS-Trainer Status] Training in progress...".to_string());
 
     let effective_workers = resolve_dataloader_workers(&project_root, request.workers, &sink);

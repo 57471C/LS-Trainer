@@ -104,9 +104,11 @@ mod tests {
     use ratatui::{backend::TestBackend, style::Color, Terminal};
 
     use crate::app::{
-        parse_cli_args_from, yolo_multi_xpu_request, ArchChoice, CliConfig, HealthLevel,
-        OverlayMode, UiMode, BAR_EPOCH_TEAL, BAR_GPU_TEAL, BAR_TRACK_BG, GAUGE_TEXT_COVERED,
-        GAUGE_TEXT_UNCOVERED, TABLE_BORDER_SOFT,
+        parse_cli_args_from, yolo_multi_xpu_request, ArchChoice, BrowseKind, CliConfig,
+        HealthLevel, OverlayMode, UiMode, BAR_EPOCH_TEAL, BAR_GPU_TEAL, BAR_TRACK_BG,
+        FIELD_AUG_PRESET, FIELD_BATCH, FIELD_DEVICE, FIELD_EPOCHS, FIELD_FREEZE, FIELD_IMGSZ,
+        FIELD_RESUME, FIELD_RUN_NAME, FIELD_WORKERS, GAUGE_TEXT_COVERED, GAUGE_TEXT_UNCOVERED,
+        TABLE_BORDER_SOFT,
     };
     use crate::event::{handle_setup_key, handle_training_key};
     use crate::ui::splash::{
@@ -357,6 +359,9 @@ mod tests {
             assert!(screen_text.contains("Architecture"));
             assert!(screen_text.contains("Model Scale"));
             assert!(screen_text.contains("Dataset Path"));
+            assert!(screen_text.contains("Resume from"));
+            assert!(screen_text.contains("<fresh start>"));
+            assert!(!screen_text.contains("Resume active:"));
             assert!(screen_text.contains("Epochs"));
             assert!(screen_text.contains("Batch Size"));
             assert!(screen_text.contains("Resolution"));
@@ -431,9 +436,14 @@ mod tests {
         handle_setup_key(&state, KeyCode::Enter);
         assert!(!state.lock().unwrap().setup.editing_field);
 
-        // Down to Field 3 (Epochs), edit to "15"
+        // Down to Resume from. Blank keeps a fresh start.
         handle_setup_key(&state, KeyCode::Down);
-        assert_eq!(state.lock().unwrap().setup.focused_field, 3);
+        assert_eq!(state.lock().unwrap().setup.focused_field, FIELD_RESUME);
+        assert!(state.lock().unwrap().setup.resume_from.is_empty());
+
+        // Down to Epochs, edit to "15"
+        handle_setup_key(&state, KeyCode::Down);
+        assert_eq!(state.lock().unwrap().setup.focused_field, FIELD_EPOCHS);
         handle_setup_key(&state, KeyCode::Backspace);
         handle_setup_key(&state, KeyCode::Backspace);
         handle_setup_key(&state, KeyCode::Char('1'));
@@ -441,42 +451,42 @@ mod tests {
         handle_setup_key(&state, KeyCode::Enter);
         assert_eq!(state.lock().unwrap().setup.epochs, "15");
 
-        // Down to Field 4 (Batch Size), cycle Right 4 -> 8
+        // Down to Batch Size, cycle Right 4 -> 8
         handle_setup_key(&state, KeyCode::Down);
-        assert_eq!(state.lock().unwrap().setup.focused_field, 4);
+        assert_eq!(state.lock().unwrap().setup.focused_field, FIELD_BATCH);
         handle_setup_key(&state, KeyCode::Right);
         assert_eq!(state.lock().unwrap().setup.batch, "8");
 
-        // Down to Field 5 (Resolution / imgsz), cycle Right 960 -> 1280
+        // Down to Resolution / imgsz, cycle Right 960 -> 1280
         handle_setup_key(&state, KeyCode::Down);
-        assert_eq!(state.lock().unwrap().setup.focused_field, 5);
+        assert_eq!(state.lock().unwrap().setup.focused_field, FIELD_IMGSZ);
         handle_setup_key(&state, KeyCode::Right);
         assert_eq!(state.lock().unwrap().setup.imgsz_input, "1280");
         assert_eq!(state.lock().unwrap().setup.imgsz, 1280);
 
-        // Down to Field 6 (Workers), cycle Right auto -> 0
+        // Down to Workers, cycle Right auto -> 0
         handle_setup_key(&state, KeyCode::Down);
-        assert_eq!(state.lock().unwrap().setup.focused_field, 6);
+        assert_eq!(state.lock().unwrap().setup.focused_field, FIELD_WORKERS);
         handle_setup_key(&state, KeyCode::Right);
         assert_eq!(state.lock().unwrap().setup.workers_input, "0");
 
-        // Down to Field 7 (Device), cycle Right auto -> xpu
+        // Down to Device, cycle Right auto -> xpu
         handle_setup_key(&state, KeyCode::Down);
-        assert_eq!(state.lock().unwrap().setup.focused_field, 7);
+        assert_eq!(state.lock().unwrap().setup.focused_field, FIELD_DEVICE);
         handle_setup_key(&state, KeyCode::Right);
         assert_eq!(state.lock().unwrap().setup.device, "xpu");
 
-        // Down to Field 8 (Freeze Backbone), toggle false -> true
+        // Down to Freeze Backbone, toggle false -> true
         handle_setup_key(&state, KeyCode::Down);
-        assert_eq!(state.lock().unwrap().setup.focused_field, 8);
+        assert_eq!(state.lock().unwrap().setup.focused_field, FIELD_FREEZE);
         handle_setup_key(&state, KeyCode::Right);
         assert!(state.lock().unwrap().setup.freeze_backbone);
 
-        // Down to Field 9 (AMP), Field 10 (Run Name), Field 11 (Aug Preset): cycle bench -> off -> light
-        handle_setup_key(&state, KeyCode::Down); // 9: AMP
-        handle_setup_key(&state, KeyCode::Down); // 10: Run Name
-        handle_setup_key(&state, KeyCode::Down); // 11: Aug Preset
-        assert_eq!(state.lock().unwrap().setup.focused_field, 11);
+        // Down through AMP and Run Name to Aug Preset: cycle bench -> off -> light
+        handle_setup_key(&state, KeyCode::Down); // AMP
+        handle_setup_key(&state, KeyCode::Down); // Run Name
+        handle_setup_key(&state, KeyCode::Down); // Aug Preset
+        assert_eq!(state.lock().unwrap().setup.focused_field, FIELD_AUG_PRESET);
         handle_setup_key(&state, KeyCode::Right); // bench -> off
         assert_eq!(state.lock().unwrap().setup.active_aug_preset(), "off");
         assert_eq!(state.lock().unwrap().setup.degrees, "0");
@@ -506,6 +516,8 @@ mod tests {
         assert_eq!(req.translate, 0.1);
         assert_eq!(req.mosaic, 0.0);
         assert_eq!(req.close_mosaic, 10);
+        assert!(req.resume_from.is_empty());
+        assert!(!req.run_name.ends_with("-ft"));
     }
 
     #[test]
@@ -669,7 +681,7 @@ mod tests {
         let state = Arc::new(Mutex::new(AppState::new(CliConfig::default())));
         {
             let mut guard = state.lock().unwrap();
-            guard.setup.focused_field = 3;
+            guard.setup.focused_field = FIELD_EPOCHS;
         }
         handle_setup_key(&state, KeyCode::Right);
         {
@@ -681,7 +693,7 @@ mod tests {
 
         {
             let mut guard = state.lock().unwrap();
-            guard.setup.focused_field = 10;
+            guard.setup.focused_field = FIELD_RUN_NAME;
         }
         handle_setup_key(&state, KeyCode::Char('X'));
         handle_setup_key(&state, KeyCode::Enter);
@@ -691,7 +703,7 @@ mod tests {
 
         {
             let mut guard = state.lock().unwrap();
-            guard.setup.focused_field = 3;
+            guard.setup.focused_field = FIELD_EPOCHS;
         }
         handle_setup_key(&state, KeyCode::Right);
         {
@@ -699,6 +711,153 @@ mod tests {
             assert_eq!(guard.setup.epochs, "150");
             assert_eq!(guard.setup.run_name, custom);
         }
+    }
+
+    #[test]
+    fn resume_from_fine_tunes_and_suffixes_only_the_suggested_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "ls_trainer_resume_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let yolo_pt = dir.join("best.pt");
+        let detr_pth = dir.join("checkpoint_best_total.pth");
+        let wrong = dir.join("notes.txt");
+        std::fs::write(&yolo_pt, b"pt").unwrap();
+        std::fs::write(&detr_pth, b"pth").unwrap();
+        std::fs::write(&wrong, b"nope").unwrap();
+
+        let fresh = CliConfig::default();
+        let fresh_req = fresh.to_training_request().expect("fresh request");
+        assert!(fresh_req.resume_from.is_empty());
+        assert_eq!(fresh_req.model_choice, "yolo11m.pt");
+        assert!(!fresh_req.run_name.ends_with("-ft"));
+        assert_eq!(fresh.suggested_run_name_on("17-11-26"), "Y11m-e60-960_17-11-26");
+
+        let mut yolo = CliConfig::default();
+        yolo.dataset = dir.to_string_lossy().to_string();
+        yolo.resume_from = yolo_pt.to_string_lossy().to_string();
+        yolo.refresh_suggested_run_name();
+        assert_eq!(
+            yolo.suggested_run_name_on("17-11-26"),
+            "Y11m-e60-960_17-11-26-ft"
+        );
+        let yolo_req = yolo.to_training_request().expect("yolo resume");
+        assert_eq!(yolo_req.model_choice, "yolo11m.pt");
+        assert!(yolo_req.resume_from.ends_with("best.pt"));
+        assert!(yolo_req.run_name.ends_with("-ft"));
+        assert_eq!(yolo_req.starting_weights(), yolo_req.resume_from.as_str());
+
+        yolo.run_name = "kept-name".to_string();
+        yolo.run_name_custom = true;
+        yolo.refresh_suggested_run_name();
+        assert_eq!(yolo.run_name, "kept-name");
+        let kept = yolo.to_training_request().expect("custom name");
+        assert_eq!(kept.run_name, "kept-name");
+        assert!(kept.resume_from.ends_with("best.pt"));
+
+        let mut missing = CliConfig::default();
+        missing.dataset = dir.to_string_lossy().to_string();
+        missing.resume_from = dir.join("missing.pt").to_string_lossy().to_string();
+        let err = missing.to_training_request().expect_err("missing file");
+        assert!(err.contains("not found"), "{err}");
+
+        let mut bad_ext = CliConfig::default();
+        bad_ext.dataset = dir.to_string_lossy().to_string();
+        bad_ext.resume_from = detr_pth.to_string_lossy().to_string();
+        let err = bad_ext.to_training_request().expect_err("pth on yolo");
+        assert!(err.contains("model="), "{err}");
+
+        let mut rf = CliConfig::default();
+        rf.arch = ArchChoice::RfDetr;
+        rf.model = "rf-detr-medium".to_string();
+        rf.dataset = dir.to_string_lossy().to_string();
+        rf.resume_from = detr_pth.to_string_lossy().to_string();
+        rf.refresh_suggested_run_name();
+        let rf_req = rf.to_training_request().expect("rf resume");
+        assert_eq!(rf_req.model_choice, "rf-detr-medium");
+        assert!(rf_req.resume_from.ends_with("checkpoint_best_total.pth"));
+        assert!(rf_req.run_name.starts_with("RF-Dm-e60-960_"));
+        assert!(rf_req.run_name.ends_with("-ft"));
+
+        let mut rt = CliConfig::default();
+        rt.arch = ArchChoice::RtDetr;
+        rt.model = "rtdetr-v2-r18".to_string();
+        rt.dataset = dir.to_string_lossy().to_string();
+        rt.resume_from = wrong.to_string_lossy().to_string();
+        let err = rt.to_training_request().expect_err("txt on rt-detr");
+        assert!(err.contains("pretrain_weights"), "{err}");
+
+        let state = Arc::new(Mutex::new(AppState::new(CliConfig::default())));
+        {
+            let mut guard = state.lock().unwrap();
+            guard.setup.focused_field = FIELD_RESUME;
+            guard.setup.dataset = dir.to_string_lossy().to_string();
+        }
+        for ch in yolo_pt.to_string_lossy().chars() {
+            handle_setup_key(&state, KeyCode::Char(ch));
+        }
+        handle_setup_key(&state, KeyCode::Enter);
+        let typed = state.lock().unwrap().setup.to_training_request().unwrap();
+        assert_eq!(typed.model_choice, "yolo11m.pt");
+        assert!(typed.resume_from.ends_with("best.pt"));
+        assert!(typed.run_name.ends_with("-ft"));
+        {
+            let guard = state.lock().unwrap();
+            let backend = TestBackend::new(140, 40);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|frame| draw_ui(frame, &guard))
+                .expect("draw resume status");
+            let buf = terminal.backend().buffer();
+            let mut screen = String::new();
+            for y in 0..40 {
+                for x in 0..140 {
+                    screen.push_str(buf[(x, y)].symbol());
+                }
+                screen.push('\n');
+            }
+            assert!(screen.contains("Resume active:"), "{screen}");
+            assert!(screen.contains("best.pt"), "{screen}");
+            assert!(screen.contains("model="), "{screen}");
+            assert!(screen.contains("-ft"), "{screen}");
+        }
+
+        let weights_dir = dir.join("weights");
+        std::fs::create_dir_all(&weights_dir).unwrap();
+        std::fs::write(weights_dir.join("a.pt"), b"a").unwrap();
+        std::fs::write(weights_dir.join("b.pt"), b"b").unwrap();
+        std::fs::write(weights_dir.join("skip.txt"), b"x").unwrap();
+        std::fs::write(dir.join("data.tar"), b"not-a-real-tar").unwrap();
+        let listed = crate::app::list_browse_files_in(
+            BrowseKind::Weights,
+            &[weights_dir.clone()],
+        );
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert!(listed.iter().all(|path| path.ends_with(".pt")));
+
+        let archives = crate::app::list_browse_files_in(BrowseKind::Dataset, &[dir.clone()]);
+        assert!(archives.iter().any(|path| path.ends_with("data.tar")));
+        assert!(archives.iter().all(|path| !path.ends_with(".pt")));
+
+        {
+            let mut guard = state.lock().unwrap();
+            guard.browse_kind = BrowseKind::Weights;
+            guard.browse_entries = listed;
+            guard.browse_cursor = 0;
+            guard.overlay = OverlayMode::Browse;
+            guard.setup.resume_from.clear();
+            guard.setup.run_name_custom = false;
+        }
+        handle_setup_key(&state, KeyCode::Down);
+        handle_setup_key(&state, KeyCode::Enter);
+        let picked = state.lock().unwrap().setup.resume_from.clone();
+        assert!(picked.ends_with("b.pt"), "{picked}");
+        assert!(state.lock().unwrap().setup.run_name.ends_with("-ft"));
+        assert_eq!(state.lock().unwrap().overlay, OverlayMode::None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn write_tiny_bmp_64x64(path: &Path) {
