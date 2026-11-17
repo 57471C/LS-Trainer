@@ -23,6 +23,7 @@ Built for the [LS-Marker](https://github.com/57471C/LS-Marker) &rarr; LS-Trainer
 - **Image sizes**: `640`, `960` (default), and `1280` px
 - **Dataset & GPU checks**: Warns when a segmentation run is pointed at plain bounding-box labels; supports single-GPU and multi-GPU Intel Arc XPU (`xpu:0,1`), NVIDIA CUDA, and CPU
 - **Standalone TUI (`ls-trainer-tui`)**: Launch with no flags for an interactive Launch Menu matching the webview options, or pass CLI flags for headless/scripted launches with live GPU/CPU telemetry, loss/mAP curves, health status, `F1` help, `F3` config snapshot, and `F4` run history
+- **TUI resume and datasets**: Resume from is optional. A `.pt` is YOLO `model=`; a `.pth` is RF-DETR / RT-DETR `pretrain_weights`. The suggested run name gains `-ft`. A dataset folder is used as it is. A `.tar`, `.tar.gz`, or `.tgz` with `data.yaml`, labels, and images unpacks into the dataset store. `F6` / Ctrl+O browses one folder at a time: folders are gold, `..` goes up, and Enter selects a matching file
 - **ONNX Auto-export**: Exports the finished `best` weights to `best.onnx` at the selected image size (`dynamic=False`, `simplify=True`)
 - **Run management**: Open the run folder or copy the weights and ONNX paths
 - **Local Python sidecar**: Runs training and export from the project `.venv` (Ultralytics, `rfdetr`, `transformers`)
@@ -129,4 +130,4 @@ When auto-export is on, a successful run writes `best.onnx` in the run directory
 
 ## Project status
 
-Version 0.2.1. Supports local detection and instance-segmentation training (YOLO, RF-DETR, RT-DETR), standalone TUI, and ONNX export.
+Version 0.2.2. Supports local detection and instance-segmentation training (YOLO, RF-DETR, RT-DETR), standalone TUI with optional resume and folder browse, and ONNX export.

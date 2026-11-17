@@ -1,10 +1,17 @@
 # AGENTS.md
 
-Guidance for AI coding agents working on LS-Trainer. Version 0.2.1.
+Guidance for AI coding agents working on LS-Trainer. Version 0.2.2.
 
 ## Project context
 
 LS-Trainer is a Tauri 2 + Svelte desktop app (plus a standalone `ls-trainer-tui` terminal trainer binary) for training Ultralytics YOLO, RF-DETR, and RT-DETR models on local datasets and exporting them to ONNX for LS-Vision. The desktop UI is `src/App.svelte` with components under `src/components/`. Training, export, GPU repair, and dataset checks live in `src-tauri/src/` (`lib.rs`, `training/`, `gpu.rs`, `dataset.rs`, etc.). The TUI lives under `src-tauri/src/bin/ls-trainer-tui/`. Python runs from the project `.venv` (`yolo.exe` / `python.exe` on Windows).
+
+## TUI launch menu
+
+- Resume from is optional and blank by default. YOLO11 / YOLO26 pass a `.pt` as `model=`. RF-DETR and RT-DETR pass a `.pth` as JSON `pretrain_weights`.
+- The suggested run name gains `-ft` when Resume from is set. A name the user edited is kept.
+- A dataset folder is used as it is. A `.tar`, `.tar.gz`, or `.tgz` with `data.yaml`, labels, and images unpacks into the dataset store.
+- F6 / Ctrl+O lists one folder. `..` goes up. Folders are gold and Enter opens them. Enter on a matching file selects it.
 
 ## Training tasks
 
@@ -39,7 +46,7 @@ Keep these in sync when the version changes:
 - `src-tauri/Cargo.lock` package `app` only
 - `src-tauri/tauri.conf.json`
 - the version badge in `src/components/Header.svelte`
-- `APP_VERSION_LABEL` in `src-tauri/src/bin/tui/app.rs`
+- `APP_VERSION_LABEL` in `src-tauri/src/bin/ls-trainer-tui/app.rs`
 
 Do not bump unrelated crate versions in `Cargo.lock`.
 

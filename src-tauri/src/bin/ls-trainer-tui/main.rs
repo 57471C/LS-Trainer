@@ -381,8 +381,8 @@ mod tests {
             assert!(screen_text.contains("MixUp"));
             assert!(screen_text.contains("Copy-Paste"));
             assert!(screen_text.contains("[ Start Training (Enter / F2) ]"));
-            assert!(screen_text.contains("Version v0.2.1"));
-            // Verify Version v0.2.1 is on the very bottom left in yellow
+            assert!(screen_text.contains("Version v0.2.2"));
+            // Verify Version v0.2.2 is on the very bottom left in yellow
             let version_row = 31u16;
             assert_eq!(buf[(1, version_row)].symbol(), "V");
             assert_eq!(buf[(1, version_row)].fg, Color::Yellow);
@@ -980,8 +980,8 @@ mod tests {
 
         let splash_out = String::from_utf8(normal_scrollback.clone()).expect("utf8 splash");
         assert!(
-            splash_out.contains("Version v0.2.1"),
-            "Splash must display Version v0.2.1 under the ASCII art"
+            splash_out.contains("Version v0.2.2"),
+            "Splash must display Version v0.2.2 under the ASCII art"
         );
         // Verify each of the 8 Big Money-ne ASCII art lines is present left-aligned in normal stdout
         for (idx, expected_line) in SPLASH_ASCII_LINES.iter().enumerate() {
@@ -1399,7 +1399,7 @@ mod tests {
             assert!(screen.contains("best.onnx"));
             // Healthy status line and bottom-left yellow version label
             assert!(screen.contains("● Healthy"));
-            assert!(screen.contains("Version v0.2.1"));
+            assert!(screen.contains("Version v0.2.2"));
             let bottom_buf = terminal.backend().buffer();
             assert_eq!(bottom_buf[(1, 33)].symbol(), "V");
             assert_eq!(bottom_buf[(1, 33)].fg, Color::Yellow);

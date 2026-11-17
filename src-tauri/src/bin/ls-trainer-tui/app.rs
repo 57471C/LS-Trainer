@@ -14,7 +14,7 @@ use ls_trainer_lib::{
 use ratatui::style::Color;
 use sysinfo::System;
 
-pub const APP_VERSION_LABEL: &str = "Version v0.2.1";
+pub const APP_VERSION_LABEL: &str = "Version v0.2.2";
 /// Overwritten by the YOLO multi-XPU standalone trainer. Single-device runs do not use it.
 pub const MULTI_XPU_METRICS_PATH: &str = "/tmp/ls-trainer-metrics.json";
 const MULTI_XPU_METRICS_STALE: Duration = Duration::from_secs(20);

@@ -58,7 +58,7 @@ const {
 			</svg>
 		</button>
 		<span class="rounded border border-zinc-700/60 bg-zinc-800/80 px-2.5 py-0.5 font-mono text-xs text-zinc-400">
-			v0.2.1
+			v0.2.2
 		</span>
 	</div>
 </header>
