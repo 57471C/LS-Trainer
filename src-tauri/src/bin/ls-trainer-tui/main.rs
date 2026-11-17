@@ -285,14 +285,44 @@ mod tests {
         );
         assert_eq!(ArchChoice::RfDetr.default_model(), "rf-detr-medium");
 
-        // Verify YOLO model scale list matches webview (nano, small, medium [default], large, xlarge, v26-*, seg-*):
-        let yolo_scales: Vec<&str> = ArchChoice::Yolo
+        // YOLO11 and YOLO26 are separate selector choices. Each keeps n/s/m/l/x.
+        let yolo11_ids: Vec<&str> = ArchChoice::Yolo
             .model_options()
             .iter()
-            .map(|o| o.scale)
+            .map(|o| o.id)
             .collect();
-        assert!(yolo_scales.starts_with(&["nano", "small", "medium", "large", "xlarge"]));
+        assert_eq!(
+            yolo11_ids,
+            vec![
+                "yolo11n.pt",
+                "yolo11s.pt",
+                "yolo11m.pt",
+                "yolo11l.pt",
+                "yolo11x.pt",
+                "yolo11s-seg.pt",
+                "yolo11m-seg.pt",
+            ]
+        );
         assert_eq!(ArchChoice::Yolo.default_model(), "yolo11m.pt");
+        assert_eq!(ArchChoice::Yolo.display_label(), "YOLO11");
+        let yolo26_ids: Vec<&str> = ArchChoice::Yolo26
+            .model_options()
+            .iter()
+            .map(|o| o.id)
+            .collect();
+        assert_eq!(
+            yolo26_ids,
+            vec![
+                "yolo26n.pt",
+                "yolo26s.pt",
+                "yolo26m.pt",
+                "yolo26l.pt",
+                "yolo26x.pt",
+                "yolo26s-seg.pt",
+            ]
+        );
+        assert_eq!(ArchChoice::Yolo26.default_model(), "yolo26m.pt");
+        assert_eq!(ArchChoice::Yolo26.display_label(), "YOLO26");
 
         let state = Arc::new(Mutex::new(AppState::new(cfg)));
         {
@@ -314,6 +344,8 @@ mod tests {
                 screen_text.push('\n');
             }
             assert!(screen_text.contains("LS-Trainer TUI — Launch Menu"));
+            assert!(screen_text.contains("YOLO11"));
+            assert!(screen_text.contains("yolo11"));
             assert!(screen_text.contains("Architecture"));
             assert!(screen_text.contains("Model Scale"));
             assert!(screen_text.contains("Dataset Path"));
@@ -343,7 +375,11 @@ mod tests {
         }
 
         // Navigate and edit fields in the launcher:
-        // Field 0: Architecture -> Right arrow switches YOLO (medium) -> RF-DETR (rf-detr-medium)
+        // Field 0: Architecture -> Right from YOLO11 (medium) selects YOLO26 (yolo26m.pt),
+        // then RF-DETR (rf-detr-medium). The size stays medium across those families.
+        handle_setup_key(&state, KeyCode::Right);
+        assert_eq!(state.lock().unwrap().setup.arch, ArchChoice::Yolo26);
+        assert_eq!(state.lock().unwrap().setup.model, "yolo26m.pt");
         handle_setup_key(&state, KeyCode::Right);
         assert_eq!(state.lock().unwrap().setup.arch, ArchChoice::RfDetr);
         assert_eq!(state.lock().unwrap().setup.model, "rf-detr-medium");
@@ -358,9 +394,13 @@ mod tests {
         handle_setup_key(&state, KeyCode::Right);
         assert_eq!(state.lock().unwrap().setup.model, "rf-detr-small");
 
-        // Switch back to Field 0 (Architecture) -> Left arrow switches RF-DETR (small) -> YOLO (yolo11s.pt)
+        // Switch back to Field 0. Left from RF-DETR (small) selects YOLO26 (yolo26s.pt),
+        // then YOLO11 (yolo11s.pt).
         handle_setup_key(&state, KeyCode::Up);
         assert_eq!(state.lock().unwrap().setup.focused_field, 0);
+        handle_setup_key(&state, KeyCode::Left);
+        assert_eq!(state.lock().unwrap().setup.arch, ArchChoice::Yolo26);
+        assert_eq!(state.lock().unwrap().setup.model, "yolo26s.pt");
         handle_setup_key(&state, KeyCode::Left);
         assert_eq!(state.lock().unwrap().setup.arch, ArchChoice::Yolo);
         assert_eq!(state.lock().unwrap().setup.model, "yolo11s.pt");
@@ -488,6 +528,47 @@ mod tests {
         let req = cfg.to_training_request().expect("valid request");
         assert_eq!(req.epochs, 1);
         assert_eq!(req.workers, Some(0));
+    }
+
+    #[test]
+    fn yolo11_and_yolo26_sizes_select_the_matching_weights() {
+        let yolo11 = parse_cli_args_from(["--arch", "yolo", "--scale", "s", "--dataset", "data"])
+            .expect("parse yolo")
+            .expect("config");
+        assert_eq!(yolo11.arch, ArchChoice::Yolo);
+        assert_eq!(yolo11.model, "yolo11s.pt");
+        assert_eq!(
+            yolo11.to_training_request().expect("request").model_family,
+            "YOLO"
+        );
+        assert_eq!(
+            yolo11.to_training_request().expect("request").model_choice,
+            "yolo11s.pt"
+        );
+
+        let yolo11_named =
+            parse_cli_args_from(["--arch", "yolo11", "--scale", "x", "--dataset", "data"])
+                .expect("parse yolo11")
+                .expect("config");
+        assert_eq!(yolo11_named.model, "yolo11x.pt");
+
+        for (scale, expected) in [
+            ("n", "yolo26n.pt"),
+            ("s", "yolo26s.pt"),
+            ("m", "yolo26m.pt"),
+            ("l", "yolo26l.pt"),
+            ("x", "yolo26x.pt"),
+            ("v26-small", "yolo26s.pt"),
+        ] {
+            let cfg = parse_cli_args_from(["--arch", "yolo26", "--scale", scale, "--dataset", "data"])
+                .expect("parse yolo26")
+                .expect("config");
+            assert_eq!(cfg.arch, ArchChoice::Yolo26);
+            assert_eq!(cfg.model, expected, "scale {scale}");
+            let req = cfg.to_training_request().expect("request");
+            assert_eq!(req.model_family, "YOLO");
+            assert_eq!(req.model_choice, expected);
+        }
     }
 
     fn write_tiny_bmp_64x64(path: &Path) {

@@ -78,16 +78,23 @@ fn format_field_line(
 fn focused_field_help(state: &AppState) -> String {
     let s = &state.setup;
     match s.focused_field {
-        0 => "Architecture family: Left/Right or Enter to switch YOLO | RF-DETR | RT-DETR".to_string(),
+        0 => "Architecture family: Left/Right or Enter to switch YOLO11 | YOLO26 | RF-DETR | RT-DETR".to_string(),
         1 => {
+            let family = s.arch.display_label();
+            let cycle = match s.arch {
+                crate::app::ArchChoice::Yolo | crate::app::ArchChoice::Yolo26 => {
+                    "Left/Right cycles n/s/m/l/x"
+                }
+                _ => "Left/Right to cycle scales, Enter to type a scale or custom weights",
+            };
             if let Some(opt) = s.arch.find_option(&s.model) {
                 format!(
-                    "{} ({}) — {} | Left/Right to cycle scales, Enter to type scale or custom .pt",
+                    "{family}: {} ({}) — {} | {cycle}",
                     opt.label, opt.id, opt.desc
                 )
             } else {
                 format!(
-                    "Custom model/weights '{}' — Left/Right to cycle webview scales, Enter to edit",
+                    "{family}: custom model '{}' — {cycle}",
                     s.model
                 )
             }
@@ -164,7 +171,11 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             .split(padded);
 
         // 1. Top full-width section: Header + Architecture (0) + Model Scale (1) + Dataset Path (2)
-        let arch_val = format!("◀ {} ({}) ▶", s.arch.as_family_str(), s.arch.as_cli_str());
+        let arch_val = format!(
+            "◀ {} ({}) ▶",
+            s.arch.display_label(),
+            s.arch.as_cli_str()
+        );
         let scale_val = if s.focused_field == 1 && s.editing_field {
             s.model.clone()
         } else if let Some(opt) = s.arch.find_option(&s.model) {
@@ -176,8 +187,8 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             crate::app::ArchChoice::RfDetr => {
                 "nano | small | medium (default) | large | base | seg-*"
             }
-            crate::app::ArchChoice::Yolo => {
-                "nano | small | medium (default) | large | xlarge | v26-* | seg-*"
+            crate::app::ArchChoice::Yolo | crate::app::ArchChoice::Yolo26 => {
+                "n | s | m (default) | l | x | seg-*"
             }
             crate::app::ArchChoice::RtDetr => "r18 (default) | large | xlarge",
         };
@@ -222,7 +233,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             "Architecture",
             &arch_val,
             false,
-            Some("yolo | rf-detr | rt-detr"),
+            Some("yolo11 | yolo26 | rf-detr | rt-detr"),
             15,
         ));
         top_lines.push(format_field_line(
@@ -514,7 +525,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(
                 format!(
                     "   Launch {} ({}) · {} ep · batch {} · {}px · dev {}",
-                    s.arch.as_family_str(),
+                    s.arch.display_label(),
                     resolved_model,
                     s.epochs,
                     s.batch,

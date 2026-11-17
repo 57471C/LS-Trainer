@@ -11,6 +11,7 @@ use ratatui::{
 use crate::app::{
     AppState, BAR_EPOCH_TEAL, BAR_GPU_TEAL, BAR_OVERALL_CYAN, BAR_RAM_SLATE, BAR_STEP_BLUE,
     BORDER_SOFT, LABEL_MUTED, NEW_BEST_BADGE_BG, NEW_BEST_GOLD, TABLE_BORDER_SOFT, TITLE_ACCENT,
+    display_family_name,
 };
 use crate::ui::{compact_display_path, format_eta_seconds, render_contrast_gauge};
 
@@ -173,7 +174,7 @@ pub fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState)
     let (arch_str, model_str, _dataset_str, dev_str, batch_val) =
         if let Some(ref req) = state.active_request {
             (
-                req.model_family.as_str(),
+                display_family_name(&req.model_family, &req.model_choice),
                 req.model_choice.as_str(),
                 req.dataset_path.as_str(),
                 req.device.as_str(),
@@ -182,7 +183,7 @@ pub fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState)
         } else {
             let b = state.setup.batch.trim().parse::<u32>().unwrap_or(4).max(1);
             (
-                state.setup.arch.as_family_str(),
+                state.setup.arch.display_label().to_string(),
                 state.setup.model.as_str(),
                 state.setup.dataset.as_str(),
                 state.setup.device.as_str(),
