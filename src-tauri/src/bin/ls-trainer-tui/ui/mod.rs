@@ -26,6 +26,7 @@ pub fn draw_ui(frame: &mut Frame, state: &AppState) {
             OverlayMode::History => {
                 widgets::config::render_history_overlay(frame, frame.area(), state)
             }
+            OverlayMode::Browse => launcher::render_browse_overlay(frame, frame.area(), state),
             OverlayMode::None => {}
         }
         return;

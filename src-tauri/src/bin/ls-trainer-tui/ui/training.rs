@@ -48,6 +48,6 @@ pub fn render_training_screen(frame: &mut Frame, area: Rect, state: &AppState) {
         OverlayMode::Help => render_help_overlay(frame, area),
         OverlayMode::Config => render_config_overlay(frame, area, state),
         OverlayMode::History => render_history_overlay(frame, area, state),
-        OverlayMode::None => {}
+        OverlayMode::Browse | OverlayMode::None => {}
     }
 }

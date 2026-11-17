@@ -432,13 +432,33 @@ fn first_missing_component(path: &Path) -> Option<PathBuf> {
 
 pub(crate) fn resolve_train_task(request: &TrainingRequest) -> String {
     let model = request.model_choice.to_ascii_lowercase();
-    if model.contains("-seg") {
+    let resume = request.resume_from.to_ascii_lowercase();
+    if model.contains("-seg") || resume.contains("-seg") {
         return "segment".to_string();
     }
     if request.task.eq_ignore_ascii_case("segment") {
         return "segment".to_string();
     }
     "detect".to_string()
+}
+
+/// Checkpoint string passed as `pretrain_weights` for RF-DETR and RT-DETR.
+/// A non-empty `resume_from` wins. Otherwise an existing `model_choice` file is used,
+/// then the architecture's default weight name.
+pub(crate) fn checkpoint_pretrain_weights(
+    request: &TrainingRequest,
+    default_name: &str,
+) -> String {
+    let resume = request.resume_from.trim();
+    if !resume.is_empty() {
+        return resume.to_string();
+    }
+    let choice = std::path::Path::new(request.model_choice.trim());
+    if choice.is_file() {
+        choice.to_string_lossy().to_string()
+    } else {
+        default_name.to_string()
+    }
 }
 
 pub(crate) fn save_run_config_metadata(
@@ -466,6 +486,7 @@ pub(crate) fn save_run_config_metadata(
         "dataset_path": request.dataset_path,
         "model_family": request.model_family,
         "model_choice": request.model_choice,
+        "resume_from": request.resume_from,
         "resolved_model": resolved_model,
         "task": resolve_train_task(request),
         "freeze_backbone": request.freeze_backbone,

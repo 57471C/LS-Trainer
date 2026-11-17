@@ -15,6 +15,13 @@ use crate::app::{
 };
 use crate::ui::{compact_display_path, format_eta_seconds, render_contrast_gauge};
 
+fn weights_with_resume(scale: &str, resume_from: &str) -> String {
+    match crate::app::resume_file_name(resume_from) {
+        Some(name) => format!("{scale} · ft {name}"),
+        None => scale.to_string(),
+    }
+}
+
 pub fn render_run_summary(frame: &mut Frame, area: Rect, state: &AppState) {
     let host_h = if area.height >= 25 {
         area.height.saturating_sub(14).clamp(11, 13)
@@ -178,7 +185,7 @@ pub fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState)
         if let Some(ref req) = state.active_request {
             (
                 display_family_name(&req.model_family, &req.model_choice),
-                req.model_choice.as_str(),
+                weights_with_resume(&req.model_choice, &req.resume_from),
                 req.dataset_path.as_str(),
                 req.device.as_str(),
                 req.batch.max(1),
@@ -187,7 +194,7 @@ pub fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState)
             let b = state.setup.batch.trim().parse::<u32>().unwrap_or(4).max(1);
             (
                 state.setup.arch.display_label().to_string(),
-                state.setup.model.as_str(),
+                weights_with_resume(&state.setup.model, &state.setup.resume_from),
                 state.setup.dataset.as_str(),
                 state.setup.device.as_str(),
                 b,

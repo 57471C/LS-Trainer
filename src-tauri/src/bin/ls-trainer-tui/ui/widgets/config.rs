@@ -12,6 +12,13 @@ use crate::app::{
 };
 use crate::ui::{centered_rect, compact_display_path};
 
+fn weights_with_resume(scale: &str, resume_from: &str) -> String {
+    match crate::app::resume_file_name(resume_from) {
+        Some(name) => format!("{scale} · ft {name}"),
+        None => scale.to_string(),
+    }
+}
+
 pub fn render_config_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     let modal = centered_rect(76, 76, area);
     frame.render_widget(Clear, modal);
@@ -60,7 +67,7 @@ pub fn render_config_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
             (
                 display_family_name(&req.model_family, &req.model_choice),
                 req.task.clone(),
-                req.model_choice.clone(),
+                weights_with_resume(&req.model_choice, &req.resume_from),
                 req.dataset_path.clone(),
                 req.epochs.to_string(),
                 req.batch.to_string(),
@@ -73,7 +80,9 @@ pub fn render_config_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
         } else {
             let s = &state.setup;
             let resolved_model = s.arch.resolve_model_or_scale(&s.model);
-            let task = if resolved_model.to_ascii_lowercase().contains("-seg") {
+            let task = if resolved_model.to_ascii_lowercase().contains("-seg")
+                || s.resume_from.to_ascii_lowercase().contains("-seg")
+            {
                 "segment".to_string()
             } else {
                 "detect".to_string()
@@ -94,7 +103,7 @@ pub fn render_config_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
             (
                 s.arch.display_label().to_string(),
                 task,
-                resolved_model,
+                weights_with_resume(&resolved_model, &s.resume_from),
                 s.dataset.clone(),
                 s.epochs.clone(),
                 s.batch.clone(),

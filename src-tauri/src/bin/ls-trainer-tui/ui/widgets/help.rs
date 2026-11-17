@@ -38,7 +38,7 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
         height: inner.height.saturating_sub(1),
     };
 
-    let rows: [(&str, &str); 11] = [
+    let rows: [(&str, &str); 12] = [
         ("Key", "Action"),
         ("Space", "Pause / Resume active training process"),
         ("c", "Request immediate checkpoint save (CHECKPOINT)"),
@@ -62,6 +62,7 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
             "Navigate fields and cycle presets in Launch Menu",
         ),
         ("F2 / Enter", "Start training from Launch Menu"),
+        ("F6 / Ctrl+O", "Browse .pt/.pth or a dataset .tar"),
     ];
 
     let mut lines: Vec<Line<'static>> = Vec::new();

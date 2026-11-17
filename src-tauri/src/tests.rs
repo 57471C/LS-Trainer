@@ -12,7 +12,8 @@ use crate::rtdetr::{
     find_rtdetr_checkpoint_in_dir, is_rtdetr_request, is_rtdetr_run_dir, resolve_rtdetr_model_meta,
     rtdetr_architecture_from_run,
 };
-use crate::training::{is_rfdetr_request, resolve_train_task};
+use crate::dataset::yolo::{find_data_yaml, unpack_archive};
+use crate::training::{checkpoint_pretrain_weights, is_rfdetr_request, resolve_train_task};
 
 #[test]
 fn polygon_line_has_more_than_five_values() {
@@ -165,6 +166,7 @@ fn seg_weight_forces_segment_task() {
         flipud: 0.5,
         close_mosaic: 10,
         task: "detect".to_string(),
+        resume_from: String::new(),
     };
     assert_eq!(resolve_train_task(&request), "segment");
 }
@@ -193,8 +195,75 @@ fn task_selector_segment_without_seg_filename() {
         flipud: 0.5,
         close_mosaic: 10,
         task: "segment".to_string(),
+        resume_from: String::new(),
     };
     assert_eq!(resolve_train_task(&request), "segment");
+}
+
+#[test]
+fn resume_weights_are_optional_and_a_seg_checkpoint_forces_segment() {
+    let parsed: TrainingRequest = serde_json::from_str(
+        r#"{"dataset_path":"d","model_choice":"yolo11n.pt","run_name":"r","epochs":1,"device":"cpu"}"#,
+    )
+    .expect("older requests omit resume_from");
+    assert_eq!(parsed.resume_from, "");
+    assert_eq!(parsed.starting_weights(), "yolo11n.pt");
+
+    let mut resumed = parsed.clone();
+    resumed.resume_from = "runs/detect/best.pt".to_string();
+    assert_eq!(resumed.starting_weights(), "runs/detect/best.pt");
+    assert_eq!(
+        checkpoint_pretrain_weights(&resumed, "rf-detr-medium.pth"),
+        "runs/detect/best.pt"
+    );
+    let mut fresh_scale = parsed.clone();
+    fresh_scale.model_choice = "rf-detr-medium".to_string();
+    assert_eq!(
+        checkpoint_pretrain_weights(&fresh_scale, "rf-detr-medium.pth"),
+        "rf-detr-medium.pth"
+    );
+
+    resumed.model_choice = "yolo11n.pt".to_string();
+    resumed.resume_from = "yolo11s-seg.pt".to_string();
+    resumed.task = "detect".to_string();
+    assert_eq!(resolve_train_task(&resumed), "segment");
+}
+
+#[test]
+fn yolo_tar_with_data_yaml_unpacks_and_a_folder_stays_in_place() {
+    let tmp = std::env::temp_dir().join(format!("ls_trainer_tar_ds_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    std::fs::create_dir_all(src.join("images/train")).unwrap();
+    std::fs::create_dir_all(src.join("labels/train")).unwrap();
+    std::fs::write(
+        src.join("data.yaml"),
+        "path: .\ntrain: images/train\nval: images/train\nnames:\n  0: a\n",
+    )
+    .unwrap();
+    std::fs::write(src.join("labels/train/a.txt"), "0 0.5 0.5 0.2 0.2\n").unwrap();
+    std::fs::write(src.join("images/train/a.jpg"), b"not-a-real-jpeg").unwrap();
+
+    let folder_yaml = find_data_yaml(&src).expect("folder data.yaml");
+    assert_eq!(folder_yaml, src.join("data.yaml"));
+
+    let archive = tmp.join("dataset.tar");
+    {
+        let file = std::fs::File::create(&archive).unwrap();
+        let mut builder = tar::Builder::new(file);
+        builder.append_dir_all("dataset", &src).unwrap();
+        builder.finish().unwrap();
+    }
+
+    let unpacked = tmp.join("unpacked");
+    unpack_archive(&archive, &unpacked).unwrap();
+    let yaml = find_data_yaml(&unpacked).expect("unpacked data.yaml");
+    assert!(yaml.ends_with("data.yaml"));
+    assert!(unpacked.join("dataset/labels/train/a.txt").is_file());
+    assert!(unpacked.join("dataset/images/train/a.jpg").is_file());
+    assert_ne!(yaml, folder_yaml);
+
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
@@ -279,6 +348,7 @@ fn rtdetr_request_classification_and_checkpoint_detection() {
         scale: 0.0,
         close_mosaic: 0,
         task: "detect".to_string(),
+        resume_from: String::new(),
     };
     assert!(is_rtdetr_request(&req));
 
@@ -602,6 +672,7 @@ fn xpu_async_train_smoke() {
         scale: 0.0,
         close_mosaic: 0,
         task: "detect".to_string(),
+        resume_from: String::new(),
     };
 
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));

@@ -1,6 +1,6 @@
 //! Application state, configuration, modes, and background telemetry for `ls-trainer-tui`.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -38,7 +38,31 @@ pub const NEW_BEST_GOLD: Color = Color::Rgb(255, 216, 102);
 pub const NEW_BEST_BADGE_BG: Color = Color::Rgb(42, 92, 66);
 pub const OVERLAY_BG: Color = Color::Rgb(18, 22, 30);
 
-pub const LAUNCHER_FIELD_COUNT: usize = 21;
+pub const FIELD_ARCH: usize = 0;
+pub const FIELD_SCALE: usize = 1;
+pub const FIELD_DATASET: usize = 2;
+pub const FIELD_RESUME: usize = 3;
+pub const FIELD_EPOCHS: usize = 4;
+pub const FIELD_BATCH: usize = 5;
+pub const FIELD_IMGSZ: usize = 6;
+pub const FIELD_WORKERS: usize = 7;
+pub const FIELD_DEVICE: usize = 8;
+pub const FIELD_FREEZE: usize = 9;
+pub const FIELD_AMP: usize = 10;
+pub const FIELD_RUN_NAME: usize = 11;
+pub const FIELD_AUG_PRESET: usize = 12;
+pub const FIELD_DEGREES: usize = 13;
+pub const FIELD_FLIPUD: usize = 14;
+pub const FIELD_SCALE_GAIN: usize = 15;
+pub const FIELD_TRANSLATE: usize = 16;
+pub const FIELD_MOSAIC: usize = 17;
+pub const FIELD_CLOSE_MOSAIC: usize = 18;
+pub const FIELD_MIXUP: usize = 19;
+pub const FIELD_COPY_PASTE: usize = 20;
+pub const FIELD_START: usize = 21;
+pub const LAUNCHER_FIELD_COUNT: usize = 22;
+/// Appended to the suggested run name when Resume from is set.
+pub const RESUME_RUN_SUFFIX: &str = "-ft";
 pub const DEVICE_PRESETS: [&str; 7] = ["auto", "xpu", "xpu:0", "xpu:0,1", "0", "cuda", "cpu"];
 pub const WORKER_PRESETS: [&str; 8] = ["auto", "0", "1", "2", "4", "6", "7", "8"];
 pub const IMGSZ_PRESETS: [&str; 3] = ["640", "960", "1280"];
@@ -285,6 +309,7 @@ pub enum OverlayMode {
     Help,
     Config,
     History,
+    Browse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -590,6 +615,8 @@ pub struct CliConfig {
     pub run_name: String,
     /// Set when the user edits Run Name. Source-field changes keep their text.
     pub run_name_custom: bool,
+    /// Optional .pt / .pth to fine-tune from. Blank keeps a fresh start.
+    pub resume_from: String,
     pub degrees: String,
     pub flipud: String,
     pub scale: String,
@@ -630,6 +657,7 @@ impl CliConfig {
             amp: true,
             run_name: String::new(),
             run_name_custom: false,
+            resume_from: String::new(),
             degrees: "180".to_string(),
             flipud: "0.5".to_string(),
             scale: "0.05".to_string(),
@@ -662,7 +690,12 @@ impl CliConfig {
         };
         let epochs = self.epochs.trim().parse::<u32>().unwrap_or(60).max(1);
         let imgsz = self.resolve_imgsz().unwrap_or(self.imgsz).max(32);
-        format!("{family}{scale}-e{epochs}-{imgsz}_{date_dd_mm_yy}")
+        let suffix = if self.resume_from.trim().is_empty() {
+            ""
+        } else {
+            RESUME_RUN_SUFFIX
+        };
+        format!("{family}{scale}-e{epochs}-{imgsz}_{date_dd_mm_yy}{suffix}")
     }
 
     pub fn refresh_suggested_run_name(&mut self) {
@@ -835,6 +868,43 @@ impl CliConfig {
         Ok(parsed.max(32))
     }
 
+    /// Expanded resume path, or empty when the field is blank.
+    /// YOLO11 / YOLO26 require `.pt` (`model=`). RF-DETR / RT-DETR require `.pth` (`pretrain_weights`).
+    pub fn validated_resume_from(&self) -> Result<String, String> {
+        let raw = self.resume_from.trim();
+        if raw.is_empty() {
+            return Ok(String::new());
+        }
+        let path = ls_trainer_lib::expand_dataset_path(raw);
+        if !path.is_file() {
+            return Err(format!("Resume file not found: {}", path.display()));
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match self.arch {
+            ArchChoice::Yolo | ArchChoice::Yolo26 => {
+                if !name.ends_with(".pt") {
+                    return Err(
+                        "YOLO11 / YOLO26 resume expects a .pt file. It is passed as model=."
+                            .to_string(),
+                    );
+                }
+            }
+            ArchChoice::RfDetr | ArchChoice::RtDetr => {
+                if !name.ends_with(".pth") {
+                    return Err(
+                        "RF-DETR / RT-DETR resume expects a .pth file. It is passed as pretrain_weights."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Ok(ls_trainer_lib::to_display_path(&path))
+    }
+
     pub fn to_training_request(&self) -> Result<TrainingRequest, String> {
         let dataset_trimmed = self.dataset.trim();
         if dataset_trimmed.is_empty() {
@@ -855,7 +925,10 @@ impl CliConfig {
         let imgsz_val = self.resolve_imgsz()?;
         let workers_val = self.parse_workers()?;
         let model_resolved = self.arch.resolve_model_or_scale(&self.model);
-        let task = if model_resolved.to_ascii_lowercase().contains("-seg") {
+        let resume_from = self.validated_resume_from()?;
+        let task = if model_resolved.to_ascii_lowercase().contains("-seg")
+            || resume_from.to_ascii_lowercase().contains("-seg")
+        {
             "segment".to_string()
         } else {
             "detect".to_string()
@@ -937,8 +1010,131 @@ impl CliConfig {
             task,
             model_family: self.arch.as_family_str().to_string(),
             workers: workers_val,
+            resume_from,
         })
     }
+}
+
+/// File name of an active resume checkpoint, when the field is set.
+pub fn resume_file_name(resume_from: &str) -> Option<&str> {
+    let trimmed = resume_from.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        match trimmed.rsplit(['/', '\\']).next() {
+            Some(name) if !name.is_empty() => Some(name),
+            _ => Some(trimmed),
+        }
+    }
+}
+
+pub fn resume_weights_flag(arch: ArchChoice) -> &'static str {
+    match arch {
+        ArchChoice::Yolo | ArchChoice::Yolo26 => "model=",
+        ArchChoice::RfDetr | ArchChoice::RtDetr => "pretrain_weights",
+    }
+}
+
+pub fn resume_flag_for_family(model_family: &str) -> &'static str {
+    if model_family.eq_ignore_ascii_case("RF-DETR")
+        || model_family.eq_ignore_ascii_case("RT-DETR")
+    {
+        "pretrain_weights"
+    } else {
+        "model="
+    }
+}
+
+pub fn resume_status_text(arch: ArchChoice, resume_from: &str) -> Option<String> {
+    let name = resume_file_name(resume_from)?;
+    Some(format!(
+        "Resume active: {name} · fine-tune · {}",
+        resume_weights_flag(arch)
+    ))
+}
+
+pub fn dataset_looks_like_archive(path: &str) -> bool {
+    let lower = path.trim().to_ascii_lowercase();
+    lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".tar")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowseKind {
+    Weights,
+    Dataset,
+}
+
+fn browse_file_matches(kind: BrowseKind, path: &Path) -> bool {
+    let name = path.to_string_lossy().to_ascii_lowercase();
+    match kind {
+        BrowseKind::Weights => name.ends_with(".pt") || name.ends_with(".pth"),
+        BrowseKind::Dataset => dataset_looks_like_archive(&name),
+    }
+}
+
+pub fn list_browse_files_in(kind: BrowseKind, roots: &[PathBuf]) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut seen = HashSet::new();
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(root)
+            .max_depth(4)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if !browse_file_matches(kind, entry.path()) {
+                continue;
+            }
+            let text = entry.path().to_string_lossy().to_string();
+            if seen.insert(text.clone()) {
+                found.push(text);
+            }
+            if found.len() >= 400 {
+                break;
+            }
+        }
+        if found.len() >= 400 {
+            break;
+        }
+    }
+    found.sort();
+    found
+}
+
+pub fn list_browse_files(kind: BrowseKind, current: &str) -> Vec<String> {
+    let mut roots = Vec::new();
+    let expanded = ls_trainer_lib::expand_dataset_path(current);
+    if expanded.is_dir() {
+        roots.push(expanded);
+    } else if let Some(parent) = expanded.parent() {
+        if parent.is_dir() {
+            roots.push(parent.to_path_buf());
+        }
+    }
+    match kind {
+        BrowseKind::Weights => {
+            for rel in ["models", "runs"] {
+                let path = PathBuf::from(rel);
+                if path.is_dir() {
+                    roots.push(path);
+                }
+            }
+        }
+        BrowseKind::Dataset => {
+            let exports = ls_trainer_lib::expand_dataset_path(DEFAULT_DATASET_PATH);
+            if exports.is_dir() {
+                roots.push(exports);
+            }
+        }
+    }
+    let mut seen_roots = HashSet::new();
+    roots.retain(|path| seen_roots.insert(path.to_string_lossy().to_string()));
+    list_browse_files_in(kind, &roots)
 }
 
 #[derive(Debug, Clone)]
@@ -1050,6 +1246,9 @@ pub struct AppState {
     pub onnx_path: Option<String>,
     pub history_entries: Vec<RunHistoryEntry>,
     pub history_selected: usize,
+    pub browse_entries: Vec<String>,
+    pub browse_cursor: usize,
+    pub browse_kind: BrowseKind,
 }
 
 /// YOLO (including YOLO26) with two or more XPU devices. `xpu:0,1` counts.
@@ -1251,7 +1450,46 @@ impl AppState {
             onnx_path: None,
             history_entries: Vec::new(),
             history_selected: 0,
+            browse_entries: Vec::new(),
+            browse_cursor: 0,
+            browse_kind: BrowseKind::Weights,
         }
+    }
+
+    pub fn open_launcher_browse(&mut self) {
+        let kind = match self.setup.focused_field {
+            FIELD_RESUME => BrowseKind::Weights,
+            FIELD_DATASET => BrowseKind::Dataset,
+            _ => return,
+        };
+        let current = match kind {
+            BrowseKind::Weights => self.setup.resume_from.clone(),
+            BrowseKind::Dataset => self.setup.dataset.clone(),
+        };
+        self.browse_kind = kind;
+        self.browse_entries = list_browse_files(kind, &current);
+        self.browse_cursor = 0;
+        self.setup.editing_field = false;
+        self.overlay = OverlayMode::Browse;
+    }
+
+    pub fn apply_browse_selection(&mut self) {
+        let Some(path) = self.browse_entries.get(self.browse_cursor).cloned() else {
+            self.overlay = OverlayMode::None;
+            return;
+        };
+        match self.browse_kind {
+            BrowseKind::Weights => {
+                self.setup.resume_from = path;
+                self.setup.error_banner = None;
+                self.setup.refresh_suggested_run_name();
+            }
+            BrowseKind::Dataset => {
+                self.setup.dataset = path;
+                self.setup.error_banner = None;
+            }
+        }
+        self.overlay = OverlayMode::None;
     }
 
     #[allow(dead_code)]
@@ -1259,7 +1497,7 @@ impl AppState {
         match self.overlay {
             OverlayMode::Help => AppMode::Help,
             OverlayMode::Config | OverlayMode::History => AppMode::Config,
-            OverlayMode::None => match self.mode {
+            OverlayMode::Browse | OverlayMode::None => match self.mode {
                 UiMode::Setup => AppMode::Launcher,
                 UiMode::Training => AppMode::Training,
             },
@@ -2279,7 +2517,13 @@ pub fn launch_training_thread(state: Arc<Mutex<AppState>>, request: TrainingRequ
         guard.dataset_train_images = initial_train_imgs;
         guard.training_started_at = Some(Instant::now());
         guard.training_ended_at = None;
-        guard.status_line = "Initializing training...".to_string();
+        guard.status_line = match resume_file_name(&request.resume_from) {
+            Some(name) => format!(
+                "Fine-tuning from {name} ({})",
+                resume_flag_for_family(&request.model_family)
+            ),
+            None => "Initializing training...".to_string(),
+        };
         guard.latest_metrics = TrainMetrics {
             epoch: 0,
             total_epochs: request.epochs,
@@ -2471,7 +2715,8 @@ where
                        --arch <yolo11|yolo26|rf-detr|rt-detr>   Model family (`yolo` selects YOLO11)\n  \
                        --scale <n|s|m|l|x|nano|small|...>       Size for the selected family (default: medium)\n  \
                        --model <path>                  Model ID or weights path\n  \
-                       --dataset <path>                Dataset folder or archive path\n  \
+                       --dataset <path>                Dataset folder, or a .tar with data.yaml, labels, and images\n  \
+                       --resume-from <path>            Optional .pt (YOLO model=) or .pth (DETR pretrain_weights)\n  \
                        --epochs <n>                    Number of training epochs (default: 60)\n  \
                        --batch <n>                     Batch size (default: 4)\n  \
                        --device <str>                  Device (auto, xpu, xpu:0, xpu:0,1 for YOLO, cuda, 0, cpu)\n  \
@@ -2499,6 +2744,9 @@ where
             }
             "--dataset" => {
                 cfg.dataset = next_val()?;
+            }
+            "--resume-from" => {
+                cfg.resume_from = next_val()?;
             }
             "--model" | "--scale" => {
                 let raw = next_val()?;
