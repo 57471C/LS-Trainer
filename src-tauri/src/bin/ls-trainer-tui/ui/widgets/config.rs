@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::app::{
     AppState, BAR_GPU_TEAL, GAUGE_TEXT_COVERED, LABEL_MUTED, OVERLAY_BG, TABLE_BORDER_SOFT,
-    TITLE_ACCENT,
+    TITLE_ACCENT, display_family_name,
 };
 use crate::ui::{centered_rect, compact_display_path};
 
@@ -58,7 +58,7 @@ pub fn render_config_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
                 req.close_mosaic
             );
             (
-                req.model_family.clone(),
+                display_family_name(&req.model_family, &req.model_choice),
                 req.task.clone(),
                 req.model_choice.clone(),
                 req.dataset_path.clone(),
@@ -92,7 +92,7 @@ pub fn render_config_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
                 if s.copy_paste { "0.3" } else { "0.0" }
             );
             (
-                s.arch.as_family_str().to_string(),
+                s.arch.display_label().to_string(),
                 task,
                 resolved_model,
                 s.dataset.clone(),

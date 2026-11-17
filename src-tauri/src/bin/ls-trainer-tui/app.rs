@@ -122,8 +122,8 @@ pub const RFDETR_MODEL_OPTIONS: [ModelScaleOption; 10] = [
     },
 ];
 
-/// Webview model options for Ultralytics YOLO (`src/models.ts`). Default is `medium` (`yolo11m.pt`).
-pub const YOLO_MODEL_OPTIONS: [ModelScaleOption; 13] = [
+/// Webview YOLO11 options (`src/models.ts`, group "YOLO11 Series"). Default is `medium` (`yolo11m.pt`).
+pub const YOLO11_MODEL_OPTIONS: [ModelScaleOption; 7] = [
     ModelScaleOption {
         scale: "nano",
         id: "yolo11n.pt",
@@ -155,36 +155,6 @@ pub const YOLO_MODEL_OPTIONS: [ModelScaleOption; 13] = [
         desc: "56.9M params · Maximum accuracy, high compute",
     },
     ModelScaleOption {
-        scale: "v26-nano",
-        id: "yolo26n.pt",
-        label: "YOLO26 Nano",
-        desc: "2.5M params · Next-gen ultra-fast edge detector",
-    },
-    ModelScaleOption {
-        scale: "v26-small",
-        id: "yolo26s.pt",
-        label: "YOLO26 Small",
-        desc: "9.0M params · Next-gen balanced detector",
-    },
-    ModelScaleOption {
-        scale: "v26-medium",
-        id: "yolo26m.pt",
-        label: "YOLO26 Medium",
-        desc: "19.5M params · Next-gen high-accuracy detector",
-    },
-    ModelScaleOption {
-        scale: "v26-large",
-        id: "yolo26l.pt",
-        label: "YOLO26 Large",
-        desc: "24.8M params · Next-gen precision detector",
-    },
-    ModelScaleOption {
-        scale: "v26-xlarge",
-        id: "yolo26x.pt",
-        label: "YOLO26 XLarge",
-        desc: "55.0M params · Next-gen maximum capacity",
-    },
-    ModelScaleOption {
         scale: "seg-small",
         id: "yolo11s-seg.pt",
         label: "YOLO11 Small-Seg",
@@ -196,13 +166,76 @@ pub const YOLO_MODEL_OPTIONS: [ModelScaleOption; 13] = [
         label: "YOLO11 Medium-Seg",
         desc: "22.4M params · High-accuracy polygon masks",
     },
+];
+
+/// Webview YOLO26 options (`src/models.ts`, group "YOLO26 Series"). Default is `medium` (`yolo26m.pt`).
+pub const YOLO26_MODEL_OPTIONS: [ModelScaleOption; 6] = [
     ModelScaleOption {
-        scale: "v26-seg-small",
+        scale: "nano",
+        id: "yolo26n.pt",
+        label: "YOLO26 Nano",
+        desc: "2.5M params · Next-gen ultra-fast edge detector",
+    },
+    ModelScaleOption {
+        scale: "small",
+        id: "yolo26s.pt",
+        label: "YOLO26 Small",
+        desc: "9.0M params · Next-gen balanced detector",
+    },
+    ModelScaleOption {
+        scale: "medium",
+        id: "yolo26m.pt",
+        label: "YOLO26 Medium",
+        desc: "19.5M params · Next-gen high-accuracy detector",
+    },
+    ModelScaleOption {
+        scale: "large",
+        id: "yolo26l.pt",
+        label: "YOLO26 Large",
+        desc: "24.8M params · Next-gen precision detector",
+    },
+    ModelScaleOption {
+        scale: "xlarge",
+        id: "yolo26x.pt",
+        label: "YOLO26 XLarge",
+        desc: "55.0M params · Next-gen maximum capacity",
+    },
+    ModelScaleOption {
+        scale: "seg-small",
         id: "yolo26s-seg.pt",
         label: "YOLO26 Small-Seg",
         desc: "9.8M params · Next-gen instance segmentation",
     },
 ];
+
+/// Older TUI scale names (`v26-nano`, …) still resolve to YOLO26 weights.
+fn yolo26_legacy_scale(lower: &str) -> Option<&'static str> {
+    match lower {
+        "v26-nano" => Some("yolo26n.pt"),
+        "v26-small" => Some("yolo26s.pt"),
+        "v26-medium" => Some("yolo26m.pt"),
+        "v26-large" => Some("yolo26l.pt"),
+        "v26-xlarge" => Some("yolo26x.pt"),
+        "v26-seg-small" => Some("yolo26s-seg.pt"),
+        _ => None,
+    }
+}
+
+/// Label shown for a saved YOLO run. `model_family` stays `YOLO` on the training request.
+pub fn display_family_name(model_family: &str, model_choice: &str) -> String {
+    let choice = model_choice.to_ascii_lowercase();
+    if model_family.eq_ignore_ascii_case("YOLO")
+        || model_family.to_ascii_lowercase().starts_with("yolo")
+    {
+        if choice.contains("yolo26") {
+            return "YOLO26".to_string();
+        }
+        if choice.contains("yolo11") {
+            return "YOLO11".to_string();
+        }
+    }
+    model_family.to_string()
+}
 
 /// Webview model options for RT-DETR (`src/models.ts`). Default is `rtdetr-v2-r18`.
 pub const RTDETR_MODEL_OPTIONS: [ModelScaleOption; 3] = [
@@ -260,7 +293,10 @@ pub enum HealthLevel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchChoice {
+    /// Ultralytics YOLO11. `--arch yolo` and `--arch yolo11` both select this.
     Yolo,
+    /// Ultralytics YOLO26. Same trainer as YOLO11; weights are `yolo26*.pt`.
+    Yolo26,
     RfDetr,
     RtDetr,
 }
@@ -268,16 +304,28 @@ pub enum ArchChoice {
 impl ArchChoice {
     pub fn from_str(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "yolo" | "ultralytics" => Some(Self::Yolo),
+            "yolo" | "yolo11" | "ultralytics" => Some(Self::Yolo),
+            "yolo26" => Some(Self::Yolo26),
             "rf-detr" | "rfdetr" => Some(Self::RfDetr),
             "rt-detr" | "rtdetr" => Some(Self::RtDetr),
             _ => None,
         }
     }
 
+    /// Value stored on `TrainingRequest.model_family`. Both YOLO series stay `YOLO`.
     pub fn as_family_str(self) -> &'static str {
         match self {
-            Self::Yolo => "YOLO",
+            Self::Yolo | Self::Yolo26 => "YOLO",
+            Self::RfDetr => "RF-DETR",
+            Self::RtDetr => "RT-DETR",
+        }
+    }
+
+    /// Selector label. YOLO11 and YOLO26 are separate choices, matching the web model list.
+    pub fn display_label(self) -> &'static str {
+        match self {
+            Self::Yolo => "YOLO11",
+            Self::Yolo26 => "YOLO26",
             Self::RfDetr => "RF-DETR",
             Self::RtDetr => "RT-DETR",
         }
@@ -285,7 +333,8 @@ impl ArchChoice {
 
     pub fn as_cli_str(self) -> &'static str {
         match self {
-            Self::Yolo => "yolo",
+            Self::Yolo => "yolo11",
+            Self::Yolo26 => "yolo26",
             Self::RfDetr => "rf-detr",
             Self::RtDetr => "rt-detr",
         }
@@ -294,6 +343,7 @@ impl ArchChoice {
     pub fn default_model(self) -> &'static str {
         match self {
             Self::Yolo => "yolo11m.pt",
+            Self::Yolo26 => "yolo26m.pt",
             Self::RfDetr => "rf-detr-medium",
             Self::RtDetr => "rtdetr-v2-r18",
         }
@@ -301,7 +351,8 @@ impl ArchChoice {
 
     pub fn model_options(self) -> &'static [ModelScaleOption] {
         match self {
-            Self::Yolo => &YOLO_MODEL_OPTIONS,
+            Self::Yolo => &YOLO11_MODEL_OPTIONS,
+            Self::Yolo26 => &YOLO26_MODEL_OPTIONS,
             Self::RfDetr => &RFDETR_MODEL_OPTIONS,
             Self::RtDetr => &RTDETR_MODEL_OPTIONS,
         }
@@ -323,13 +374,22 @@ impl ArchChoice {
                 return opt.id.to_string();
             }
         }
-        // Also support common short aliases
+        // Short size aliases. `n/s/m/l/x` follow the family that is selected.
+        // `v26-*` remains accepted so older commands still pick YOLO26 weights.
         match (self, lower.as_str()) {
             (Self::Yolo, "n") => "yolo11n.pt".to_string(),
             (Self::Yolo, "s") => "yolo11s.pt".to_string(),
             (Self::Yolo, "m") => "yolo11m.pt".to_string(),
             (Self::Yolo, "l") => "yolo11l.pt".to_string(),
             (Self::Yolo, "x" | "xl") => "yolo11x.pt".to_string(),
+            (Self::Yolo26, "n") => "yolo26n.pt".to_string(),
+            (Self::Yolo26, "s") => "yolo26s.pt".to_string(),
+            (Self::Yolo26, "m") => "yolo26m.pt".to_string(),
+            (Self::Yolo26, "l") => "yolo26l.pt".to_string(),
+            (Self::Yolo26, "x" | "xl") => "yolo26x.pt".to_string(),
+            (Self::Yolo | Self::Yolo26, legacy) => {
+                yolo26_legacy_scale(legacy).unwrap_or(trimmed).to_string()
+            }
             (Self::RfDetr, "n") => "rf-detr-nano".to_string(),
             (Self::RfDetr, "s") => "rf-detr-small".to_string(),
             (Self::RfDetr, "m") => "rf-detr-medium".to_string(),
@@ -378,7 +438,8 @@ impl ArchChoice {
 
     pub fn next(self) -> Self {
         match self {
-            Self::Yolo => Self::RfDetr,
+            Self::Yolo => Self::Yolo26,
+            Self::Yolo26 => Self::RfDetr,
             Self::RfDetr => Self::RtDetr,
             Self::RtDetr => Self::Yolo,
         }
@@ -387,7 +448,8 @@ impl ArchChoice {
     pub fn prev(self) -> Self {
         match self {
             Self::Yolo => Self::RtDetr,
-            Self::RfDetr => Self::Yolo,
+            Self::Yolo26 => Self::Yolo,
+            Self::RfDetr => Self::Yolo26,
             Self::RtDetr => Self::RfDetr,
         }
     }
@@ -1681,7 +1743,8 @@ pub fn scan_run_history() -> Vec<RunHistoryEntry> {
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
                         if !fam.is_empty() && !mod_c.is_empty() {
-                            arch_model = format!("{fam} ({mod_c})");
+                            let fam_label = display_family_name(fam, mod_c);
+                            arch_model = format!("{fam_label} ({mod_c})");
                         } else if !mod_c.is_empty() {
                             arch_model = mod_c.to_string();
                         }
@@ -1921,8 +1984,8 @@ where
                      USAGE:\n  \
                        ls-trainer-tui [OPTIONS]\n\n\
                      OPTIONS:\n  \
-                       --arch <yolo|rf-detr|rt-detr>   Model architecture family\n  \
-                       --scale <nano|small|medium|...> Model scale shorthand (default: medium)\n  \
+                       --arch <yolo11|yolo26|rf-detr|rt-detr>   Model family (`yolo` selects YOLO11)\n  \
+                       --scale <n|s|m|l|x|nano|small|...>       Size for the selected family (default: medium)\n  \
                        --model <path>                  Model ID or weights path\n  \
                        --dataset <path>                Dataset folder or archive path\n  \
                        --epochs <n>                    Number of training epochs (default: 60)\n  \
@@ -1940,7 +2003,9 @@ where
             "--arch" => {
                 let raw = next_val()?;
                 cfg.arch = ArchChoice::from_str(&raw).ok_or_else(|| {
-                    format!("Unsupported --arch '{raw}'. Expected yolo, rf-detr, or rt-detr.")
+                    format!(
+                        "Unsupported --arch '{raw}'. Expected yolo11, yolo26, rf-detr, or rt-detr."
+                    )
                 })?;
                 if !explicit_model {
                     cfg.model = cfg.arch.default_model().to_string();
