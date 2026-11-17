@@ -1,5 +1,6 @@
 //! Full-screen interactive Launch Menu (`ls-trainer-tui` started with no CLI flags).
 
+use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -128,6 +129,187 @@ fn focused_field_help(state: &AppState) -> String {
     }
 }
 
+struct LauncherZones {
+    top: Rect,
+    left: Rect,
+    right: Rect,
+    bottom: Rect,
+}
+
+fn launcher_zones(area: Rect) -> Option<LauncherZones> {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(12),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let inner = Block::default().borders(Borders::ALL).inner(chunks[1]);
+    if inner.height == 0 || inner.width <= 4 {
+        return None;
+    }
+    let padded = Rect {
+        x: inner.x + 1,
+        y: inner.y,
+        width: inner.width.saturating_sub(2),
+        height: inner.height,
+    };
+    let spacious = padded.height >= 21;
+    let top_h = if spacious { 6 } else { 5 };
+    let mid_h = if spacious { 11 } else { 10 };
+    let bot_h = padded.height.saturating_sub(top_h + mid_h);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(top_h),
+            Constraint::Length(mid_h),
+            Constraint::Length(bot_h),
+        ])
+        .split(padded);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(sections[1]);
+    Some(LauncherZones {
+        top: sections[0],
+        left: cols[0],
+        right: cols[1],
+        bottom: sections[2],
+    })
+}
+
+fn row_hit(area: Rect, column: u16, row: u16, fields: &[usize]) -> Option<(usize, u16)> {
+    if column < area.x || row < area.y || column >= area.x.saturating_add(area.width) {
+        return None;
+    }
+    let local_y = row.saturating_sub(area.y);
+    if local_y == 0 || local_y as usize > fields.len() {
+        return None;
+    }
+    Some((fields[local_y as usize - 1], column - area.x))
+}
+
+fn field_cycle_label(state: &AppState, field: usize) -> Option<String> {
+    let s = &state.setup;
+    let editing = s.focused_field == field && s.editing_field;
+    match field {
+        FIELD_ARCH => Some(format!(
+            "◀ {} ({}) ▶",
+            s.arch.display_label(),
+            s.arch.as_cli_str()
+        )),
+        FIELD_SCALE if !editing => {
+            if let Some(opt) = s.arch.find_option(&s.model) {
+                Some(format!("◀ {} · {} ({}) ▶", opt.scale, opt.id, opt.label))
+            } else {
+                Some(format!("◀ custom · {} ▶", s.model))
+            }
+        }
+        FIELD_IMGSZ if !editing => {
+            Some(format!("◀ {} ▶", s.resolve_imgsz().unwrap_or(s.imgsz)))
+        }
+        FIELD_WORKERS if !editing => Some(if s.workers_input.trim().is_empty() {
+            "◀ auto ▶".to_string()
+        } else {
+            format!("◀ {} ▶", s.workers_input.trim())
+        }),
+        FIELD_DEVICE if !editing => Some(format!("◀ {} ▶", s.device.trim())),
+        FIELD_FREEZE => Some(
+            if s.freeze_backbone {
+                "◀ Freeze 10 layers ▶"
+            } else {
+                "◀ Unfrozen (freeze=0) ▶"
+            }
+            .to_string(),
+        ),
+        FIELD_AMP => Some(
+            if s.amp {
+                "◀ Enabled (FP16) ▶"
+            } else {
+                "◀ Disabled (FP32) ▶"
+            }
+            .to_string(),
+        ),
+        FIELD_AUG_PRESET => Some(format!("◀ {} ▶", s.active_aug_preset().to_ascii_uppercase())),
+        FIELD_COPY_PASTE => Some(
+            if s.copy_paste {
+                "◀ On (0.3) ▶"
+            } else {
+                "◀ Off (0.0) ▶"
+            }
+            .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn click_key(state: &AppState, field: usize, local_x: u16) -> KeyCode {
+    if field == FIELD_START {
+        return KeyCode::Enter;
+    }
+    let Some(val) = field_cycle_label(state, field) else {
+        return KeyCode::Enter;
+    };
+    // " ▶ " or "   " (3) + "{label:<15} " (16). The value span is " {val} ".
+    let origin = 19u16;
+    if local_x < origin {
+        return KeyCode::Enter;
+    }
+    let rel = (local_x - origin) as usize;
+    let editing = state.setup.focused_field == field && state.setup.editing_field;
+    let cursor = if editing { "▏" } else { "" };
+    let span = format!(" {val}{cursor} ");
+    match span.chars().nth(rel) {
+        Some('◀') => KeyCode::Left,
+        Some('▶') => KeyCode::Right,
+        _ => KeyCode::Enter,
+    }
+}
+
+/// Left click on a Launch Menu row. Chevrons cycle like Left/Right. The rest of the row
+/// opens or toggles like Enter. The start row launches.
+pub fn launcher_click_key(state: &AppState, area: Rect, column: u16, row: u16) -> Option<(usize, KeyCode)> {
+    let zones = launcher_zones(area)?;
+    let top_fields = [FIELD_ARCH, FIELD_SCALE, FIELD_DATASET, FIELD_RESUME];
+    let left_fields = [
+        FIELD_EPOCHS,
+        FIELD_BATCH,
+        FIELD_IMGSZ,
+        FIELD_WORKERS,
+        FIELD_DEVICE,
+        FIELD_FREEZE,
+        FIELD_AMP,
+        FIELD_RUN_NAME,
+    ];
+    let right_fields = [
+        FIELD_AUG_PRESET,
+        FIELD_DEGREES,
+        FIELD_FLIPUD,
+        FIELD_SCALE_GAIN,
+        FIELD_TRANSLATE,
+        FIELD_MOSAIC,
+        FIELD_CLOSE_MOSAIC,
+        FIELD_MIXUP,
+        FIELD_COPY_PASTE,
+    ];
+    let hit = row_hit(zones.top, column, row, &top_fields)
+        .or_else(|| row_hit(zones.left, column, row, &left_fields))
+        .or_else(|| row_hit(zones.right, column, row, &right_fields))
+        .or_else(|| {
+            if column < zones.bottom.x
+                || row != zones.bottom.y
+                || column >= zones.bottom.x.saturating_add(zones.bottom.width)
+                || zones.bottom.height == 0
+            {
+                None
+            } else {
+                Some((FIELD_START, column - zones.bottom.x))
+            }
+        })?;
+    Some((hit.0, click_key(state, hit.0, hit.1)))
+}
+
 pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -151,33 +333,12 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(BORDER_SOFT));
 
-    let inner = block.inner(chunks[1]);
     frame.render_widget(block, chunks[1]);
 
-    if inner.height > 0 && inner.width > 4 {
-        let padded = Rect {
-            x: inner.x + 1,
-            y: inner.y,
-            width: inner.width.saturating_sub(2),
-            height: inner.height,
-        };
-
+    if let Some(zones) = launcher_zones(area) {
         let s = &state.setup;
-        let spacious = padded.height >= 21;
-        let top_h = if spacious { 6 } else { 5 };
-        let mid_h = if spacious { 11 } else { 10 };
-        let bot_h = padded.height.saturating_sub(top_h + mid_h);
 
-        let v_sections = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(top_h),
-                Constraint::Length(mid_h),
-                Constraint::Length(bot_h),
-            ])
-            .split(padded);
-
-        // 1. Top full-width section: Header + Architecture (0) + Model Scale (1) + Dataset Path (2)
+        // 1. Top full-width section: Header + Architecture + Model Scale + Dataset + Resume
         let arch_val = format!(
             "◀ {} ({}) ▶",
             s.arch.display_label(),
@@ -218,7 +379,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             };
         let resume_hint = "blank=fresh · YOLO model= · DETR pretrain_weights";
 
-        let mut top_lines: Vec<Line<'static>> = Vec::with_capacity(top_h as usize);
+        let mut top_lines: Vec<Line<'static>> = Vec::with_capacity(zones.top.height as usize);
         top_lines.push(Line::from(vec![
             Span::styled(
                 "   Configure training run (Webview defaults). Press ",
@@ -286,14 +447,9 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             Some(resume_hint),
             15,
         ));
-        frame.render_widget(Paragraph::new(top_lines), v_sections[0]);
+        frame.render_widget(Paragraph::new(top_lines), zones.top);
 
-        // 2. Middle 2-column section: Hyperparameters (left, fields 3..=10) & Augmentation (right, fields 11..=19)
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(v_sections[1]);
-
+        // 2. Middle 2-column section: Hyperparameters (left) and Augmentation (right)
         let imgsz_disp = if s.focused_field == FIELD_IMGSZ && s.editing_field {
             s.imgsz_input.clone()
         } else {
@@ -416,7 +572,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             Some(&format!("suggested · {task_str}")),
             15,
         ));
-        frame.render_widget(Paragraph::new(left_lines), cols[0]);
+        frame.render_widget(Paragraph::new(left_lines), zones.left);
 
         let active_preset = s.active_aug_preset();
         let preset_disp = format!("◀ {} ▶", active_preset.to_ascii_uppercase());
@@ -526,7 +682,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             Some("seg copy-paste"),
             15,
         ));
-        frame.render_widget(Paragraph::new(right_lines), cols[1]);
+        frame.render_widget(Paragraph::new(right_lines), zones.right);
 
         // 3. Bottom full-width section: Start Training button (20) + active field help or error banner
         let start_focused = s.focused_field == FIELD_START;
@@ -585,14 +741,14 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
                     .fg(Color::LightRed)
                     .add_modifier(Modifier::BOLD),
             )));
-        } else if (bot_h as usize) > bot_lines.len() {
+        } else if (zones.bottom.height as usize) > bot_lines.len() {
             bot_lines.push(Line::from(vec![
                 Span::styled("   ℹ ", Style::default().fg(TITLE_ACCENT)),
                 Span::styled(focused_field_help(state), Style::default().fg(LABEL_MUTED)),
             ]));
         }
 
-        frame.render_widget(Paragraph::new(bot_lines), v_sections[2]);
+        frame.render_widget(Paragraph::new(bot_lines), zones.bottom);
     }
 
     let footer = Line::from(vec![

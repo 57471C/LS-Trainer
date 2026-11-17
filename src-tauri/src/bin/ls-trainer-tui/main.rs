@@ -2,11 +2,31 @@ mod app;
 mod event;
 mod ui;
 
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arboard::Clipboard;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::event as ct_event;
+use crossterm::execute;
+
+struct MouseCapture;
+
+impl MouseCapture {
+    fn enable() -> Self {
+        let _ = execute!(io::stdout(), EnableMouseCapture);
+        let _ = io::stdout().flush();
+        Self
+    }
+}
+
+impl Drop for MouseCapture {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+        let _ = io::stdout().flush();
+    }
+}
 
 use crate::app::{
     launch_training_thread, parse_cli_args, spawn_hardware_polling_tasks, AppState,
@@ -55,6 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut terminal = ratatui::init();
+    let _mouse = MouseCapture::enable();
 
     if let Some(req) = initial_req {
         launch_training_thread(Arc::clone(&state), req);
@@ -86,6 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    drop(_mouse);
     ratatui::restore();
     if show_exit_summary {
         print_exit_summary(&state);
@@ -934,6 +956,86 @@ mod tests {
         assert_eq!(state.lock().unwrap().overlay, OverlayMode::None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launcher_clicks_cycle_open_and_target_start() {
+        use ratatui::layout::Rect;
+
+        use crate::app::{ArchChoice, FIELD_ARCH, FIELD_DATASET, FIELD_SCALE, FIELD_START};
+        use crate::event::apply_launcher_click;
+        use crate::ui::launcher::launcher_click_key;
+
+        let area = Rect::new(0, 0, 120, 32);
+        let state = AppState::new(CliConfig::default());
+        assert!(launcher_click_key(&state, area, 0, 0).is_none());
+
+        let mut scale_left = None;
+        let mut scale_right = None;
+        let mut scale_enter = None;
+        let mut arch_enter = None;
+        let mut dataset_enter = None;
+        let mut start_enter = None;
+        for row in 0..area.height {
+            for col in 0..area.width {
+                let Some((field, key)) = launcher_click_key(&state, area, col, row) else {
+                    continue;
+                };
+                match (field, key) {
+                    (FIELD_SCALE, KeyCode::Left) if scale_left.is_none() => {
+                        scale_left = Some((col, row));
+                    }
+                    (FIELD_SCALE, KeyCode::Right) if scale_right.is_none() => {
+                        scale_right = Some((col, row));
+                    }
+                    (FIELD_SCALE, KeyCode::Enter) if scale_enter.is_none() => {
+                        scale_enter = Some((col, row));
+                    }
+                    (FIELD_ARCH, KeyCode::Enter) if arch_enter.is_none() => {
+                        arch_enter = Some((col, row));
+                    }
+                    (FIELD_DATASET, KeyCode::Enter) if dataset_enter.is_none() => {
+                        dataset_enter = Some((col, row));
+                    }
+                    (FIELD_START, KeyCode::Enter) if start_enter.is_none() => {
+                        start_enter = Some((col, row));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(scale_left.is_some() && scale_right.is_some() && scale_enter.is_some());
+        assert!(arch_enter.is_some());
+        assert!(dataset_enter.is_some());
+        assert!(start_enter.is_some());
+
+        let shared = Arc::new(Mutex::new(state));
+        let (col, row) = arch_enter.unwrap();
+        apply_launcher_click(&shared, area, col, row);
+        {
+            let guard = shared.lock().unwrap();
+            assert_eq!(guard.setup.arch, ArchChoice::Yolo26);
+            assert_eq!(guard.setup.focused_field, FIELD_ARCH);
+            assert!(!guard.setup.editing_field);
+        }
+
+        let (col, row) = scale_right.unwrap();
+        let before = shared.lock().unwrap().setup.model.clone();
+        apply_launcher_click(&shared, area, col, row);
+        {
+            let guard = shared.lock().unwrap();
+            assert_eq!(guard.setup.focused_field, FIELD_SCALE);
+            assert_ne!(guard.setup.model, before);
+            assert!(!guard.setup.editing_field);
+        }
+
+        let (col, row) = dataset_enter.unwrap();
+        apply_launcher_click(&shared, area, col, row);
+        {
+            let guard = shared.lock().unwrap();
+            assert_eq!(guard.setup.focused_field, FIELD_DATASET);
+            assert!(guard.setup.editing_field);
+        }
     }
 
     fn write_tiny_bmp_64x64(path: &Path) {

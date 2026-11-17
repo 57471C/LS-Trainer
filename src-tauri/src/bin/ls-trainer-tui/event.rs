@@ -8,7 +8,8 @@ use app_lib::{
     ProcessControlCommand, TrainingRequest,
 };
 use arboard::Clipboard;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use ratatui::layout::Rect;
 
 use crate::app::{
     launch_training_thread, scan_run_history, AppState, OverlayMode, UiMode, AUG_PRESET_NAMES,
@@ -50,6 +51,25 @@ pub fn handle_event(
 ) -> EventOutcome {
     match ev {
         Event::Resize(_w, _h) => EventOutcome::Continue,
+        Event::Mouse(mouse) => {
+            if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+                return EventOutcome::Continue;
+            }
+            let mode = state.lock().map(|g| g.mode).unwrap_or(UiMode::Training);
+            if mode != UiMode::Setup {
+                return EventOutcome::Continue;
+            }
+            let Ok((width, height)) = crossterm::terminal::size() else {
+                return EventOutcome::Continue;
+            };
+            if apply_launcher_click(state, Rect::new(0, 0, width, height), mouse.column, mouse.row)
+            {
+                return EventOutcome::Quit {
+                    show_exit_summary: false,
+                };
+            }
+            EventOutcome::Continue
+        }
         Event::Key(key) => {
             if key.kind != KeyEventKind::Press {
                 return EventOutcome::Continue;
@@ -139,6 +159,51 @@ fn browse_overlay_key(state: &mut AppState, code: KeyCode) {
     }
 }
 
+fn finish_setup_edit(s: &mut crate::app::CliConfig) {
+    if s.editing_field {
+        if s.focused_field == FIELD_SCALE {
+            s.model = s.arch.resolve_model_or_scale(&s.model);
+        } else if s.focused_field == FIELD_IMGSZ {
+            if let Ok(parsed) = s.imgsz_input.trim().parse::<u32>() {
+                s.imgsz = parsed.max(32);
+            } else if s.imgsz_input.trim().is_empty() {
+                s.imgsz_input = s.imgsz.to_string();
+            }
+        } else if s.focused_field == FIELD_WORKERS && s.workers_input.trim().is_empty() {
+            s.workers_input = "auto".to_string();
+        } else if s.focused_field == FIELD_RUN_NAME {
+            s.finish_run_name_edit();
+        }
+        s.editing_field = false;
+    }
+}
+
+/// Focus the clicked Launch Menu row, then run the same key that row uses.
+pub fn apply_launcher_click(
+    state: &Arc<Mutex<AppState>>,
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> bool {
+    let Some((field, key)) = (|| {
+        let guard = state.lock().ok()?;
+        if guard.mode != UiMode::Setup || guard.overlay != OverlayMode::None {
+            return None;
+        }
+        crate::ui::launcher::launcher_click_key(&guard, area, column, row)
+    })() else {
+        return false;
+    };
+    if let Ok(mut guard) = state.lock() {
+        if guard.setup.focused_field != field {
+            finish_setup_edit(&mut guard.setup);
+            guard.setup.focused_field = field;
+            guard.setup.editing_field = false;
+        }
+    }
+    handle_setup_key(state, key)
+}
+
 pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
     let mut launch_req: Option<TrainingRequest> = None;
     if let Ok(mut guard) = state.lock() {
@@ -161,24 +226,7 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
         }
 
         let focused = guard.setup.focused_field;
-        let finish_edit = |s: &mut crate::app::CliConfig| {
-            if s.editing_field {
-                if s.focused_field == FIELD_SCALE {
-                    s.model = s.arch.resolve_model_or_scale(&s.model);
-                } else if s.focused_field == FIELD_IMGSZ {
-                    if let Ok(parsed) = s.imgsz_input.trim().parse::<u32>() {
-                        s.imgsz = parsed.max(32);
-                    } else if s.imgsz_input.trim().is_empty() {
-                        s.imgsz_input = s.imgsz.to_string();
-                    }
-                } else if s.focused_field == FIELD_WORKERS && s.workers_input.trim().is_empty() {
-                    s.workers_input = "auto".to_string();
-                } else if s.focused_field == FIELD_RUN_NAME {
-                    s.finish_run_name_edit();
-                }
-                s.editing_field = false;
-            }
-        };
+        let finish_edit = finish_setup_edit;
 
         match code {
             KeyCode::Esc => {
