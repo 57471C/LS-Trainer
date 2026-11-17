@@ -1,6 +1,6 @@
 //! Application state, configuration, modes, and background telemetry for `ls-trainer-tui`.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -36,6 +36,8 @@ pub const TITLE_ACCENT: Color = Color::Rgb(116, 202, 218);
 pub const LABEL_MUTED: Color = Color::Rgb(138, 150, 168);
 pub const NEW_BEST_GOLD: Color = Color::Rgb(255, 216, 102);
 pub const NEW_BEST_BADGE_BG: Color = Color::Rgb(42, 92, 66);
+/// Folders and `..` in the browse overlay.
+pub const BROWSE_DIR_FG: Color = Color::Rgb(255, 196, 84);
 pub const OVERLAY_BG: Color = Color::Rgb(18, 22, 30);
 
 pub const FIELD_ARCH: usize = 0;
@@ -1064,6 +1066,20 @@ pub enum BrowseKind {
     Dataset,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowseEntryKind {
+    Parent,
+    Dir,
+    File,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowseEntry {
+    pub label: String,
+    pub path: PathBuf,
+    pub kind: BrowseEntryKind,
+}
+
 fn browse_file_matches(kind: BrowseKind, path: &Path) -> bool {
     let name = path.to_string_lossy().to_ascii_lowercase();
     match kind {
@@ -1072,69 +1088,100 @@ fn browse_file_matches(kind: BrowseKind, path: &Path) -> bool {
     }
 }
 
-pub fn list_browse_files_in(kind: BrowseKind, roots: &[PathBuf]) -> Vec<String> {
-    let mut found = Vec::new();
-    let mut seen = HashSet::new();
-    for root in roots {
-        if !root.is_dir() {
-            continue;
+fn nearest_existing_dir(path: &Path) -> Option<PathBuf> {
+    let mut cur = Some(path);
+    while let Some(dir) = cur {
+        if dir.is_dir() {
+            return Some(dir.to_path_buf());
         }
-        for entry in walkdir::WalkDir::new(root)
-            .max_depth(4)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            if !browse_file_matches(kind, entry.path()) {
-                continue;
-            }
-            let text = entry.path().to_string_lossy().to_string();
-            if seen.insert(text.clone()) {
-                found.push(text);
-            }
-            if found.len() >= 400 {
-                break;
-            }
-        }
-        if found.len() >= 400 {
-            break;
-        }
+        cur = dir.parent();
     }
-    found.sort();
-    found
+    None
 }
 
-pub fn list_browse_files(kind: BrowseKind, current: &str) -> Vec<String> {
-    let mut roots = Vec::new();
-    let expanded = ls_trainer_lib::expand_dataset_path(current);
-    if expanded.is_dir() {
-        roots.push(expanded);
-    } else if let Some(parent) = expanded.parent() {
-        if parent.is_dir() {
-            roots.push(parent.to_path_buf());
-        }
-    }
+fn default_browse_dir(kind: BrowseKind) -> PathBuf {
     match kind {
         BrowseKind::Weights => {
-            for rel in ["models", "runs"] {
-                let path = PathBuf::from(rel);
-                if path.is_dir() {
-                    roots.push(path);
-                }
+            let models = PathBuf::from("models");
+            if models.is_dir() {
+                models
+            } else {
+                env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
             }
         }
         BrowseKind::Dataset => {
             let exports = ls_trainer_lib::expand_dataset_path(DEFAULT_DATASET_PATH);
             if exports.is_dir() {
-                roots.push(exports);
+                exports
+            } else {
+                env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
             }
         }
     }
-    let mut seen_roots = HashSet::new();
-    roots.retain(|path| seen_roots.insert(path.to_string_lossy().to_string()));
-    list_browse_files_in(kind, &roots)
+}
+
+pub fn browse_start_dir(kind: BrowseKind, current: &str) -> PathBuf {
+    let trimmed = current.trim();
+    let chosen = if trimmed.is_empty() {
+        default_browse_dir(kind)
+    } else {
+        let expanded = ls_trainer_lib::expand_dataset_path(trimmed);
+        nearest_existing_dir(&expanded).unwrap_or_else(|| default_browse_dir(kind))
+    };
+    std::fs::canonicalize(&chosen).unwrap_or(chosen)
+}
+
+/// One directory level: `..`, then folders, then matching files.
+pub fn list_browse_dir(kind: BrowseKind, dir: &Path) -> Vec<BrowseEntry> {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut entries = Vec::new();
+    if let Some(parent) = dir.parent() {
+        if parent != dir && !parent.as_os_str().is_empty() {
+            entries.push(BrowseEntry {
+                label: "..".to_string(),
+                path: parent.to_path_buf(),
+                kind: BrowseEntryKind::Parent,
+            });
+        }
+    }
+
+    let Ok(read) = std::fs::read_dir(&dir) else {
+        return entries;
+    };
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for item in read.filter_map(|entry| entry.ok()) {
+        let name = item.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = item.path();
+        if path.is_dir() {
+            dirs.push(BrowseEntry {
+                label: format!("{name}/"),
+                path,
+                kind: BrowseEntryKind::Dir,
+            });
+        } else if browse_file_matches(kind, &path) {
+            files.push(BrowseEntry {
+                label: name.to_string(),
+                path,
+                kind: BrowseEntryKind::File,
+            });
+        }
+    }
+    let by_label = |a: &BrowseEntry, b: &BrowseEntry| {
+        a.label
+            .to_ascii_lowercase()
+            .cmp(&b.label.to_ascii_lowercase())
+    };
+    dirs.sort_by(by_label);
+    files.sort_by(by_label);
+    entries.extend(dirs);
+    entries.extend(files);
+    entries.truncate(400);
+    entries
 }
 
 #[derive(Debug, Clone)]
@@ -1246,9 +1293,10 @@ pub struct AppState {
     pub onnx_path: Option<String>,
     pub history_entries: Vec<RunHistoryEntry>,
     pub history_selected: usize,
-    pub browse_entries: Vec<String>,
+    pub browse_entries: Vec<BrowseEntry>,
     pub browse_cursor: usize,
     pub browse_kind: BrowseKind,
+    pub browse_dir: PathBuf,
 }
 
 /// YOLO (including YOLO26) with two or more XPU devices. `xpu:0,1` counts.
@@ -1453,6 +1501,7 @@ impl AppState {
             browse_entries: Vec::new(),
             browse_cursor: 0,
             browse_kind: BrowseKind::Weights,
+            browse_dir: PathBuf::new(),
         }
     }
 
@@ -1467,17 +1516,25 @@ impl AppState {
             BrowseKind::Dataset => self.setup.dataset.clone(),
         };
         self.browse_kind = kind;
-        self.browse_entries = list_browse_files(kind, &current);
+        self.browse_dir = browse_start_dir(kind, &current);
+        self.browse_entries = list_browse_dir(kind, &self.browse_dir);
         self.browse_cursor = 0;
         self.setup.editing_field = false;
         self.overlay = OverlayMode::Browse;
     }
 
     pub fn apply_browse_selection(&mut self) {
-        let Some(path) = self.browse_entries.get(self.browse_cursor).cloned() else {
+        let Some(entry) = self.browse_entries.get(self.browse_cursor).cloned() else {
             self.overlay = OverlayMode::None;
             return;
         };
+        if entry.kind != BrowseEntryKind::File {
+            self.browse_dir = entry.path;
+            self.browse_entries = list_browse_dir(self.browse_kind, &self.browse_dir);
+            self.browse_cursor = 0;
+            return;
+        }
+        let path = ls_trainer_lib::to_display_path(&entry.path);
         match self.browse_kind {
             BrowseKind::Weights => {
                 self.setup.resume_from = path;

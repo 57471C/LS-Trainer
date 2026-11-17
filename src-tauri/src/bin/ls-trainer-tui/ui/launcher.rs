@@ -15,7 +15,7 @@ use crate::app::{
     FIELD_IMGSZ, FIELD_MIXUP, FIELD_MOSAIC, FIELD_RESUME, FIELD_RUN_NAME, FIELD_SCALE,
     FIELD_SCALE_GAIN, FIELD_START, FIELD_TRANSLATE, FIELD_WORKERS, GAUGE_TEXT_COVERED, LABEL_MUTED,
     OVERLAY_BG, TABLE_BORDER_SOFT, TITLE_ACCENT, dataset_looks_like_archive, resume_file_name,
-    resume_status_text, BrowseKind,
+    resume_status_text, BrowseEntryKind, BrowseKind, BROWSE_DIR_FG,
 };
 use crate::ui::centered_rect;
 use crate::ui::widgets::gpu::render_top_gpu_strip;
@@ -105,8 +105,8 @@ fn focused_field_help(state: &AppState) -> String {
                 )
             }
         }
-        FIELD_DATASET => "A folder is used as-is. A .tar/.tar.gz/.tgz with data.yaml, labels, and images is unpacked into the dataset store.".to_string(),
-        FIELD_RESUME => "Blank = fresh start. Type a .pt/.pth path or press F6 to browse. Fine-tune adds -ft to the suggested run name.".to_string(),
+        FIELD_DATASET => "A folder is used as-is. A .tar/.tar.gz/.tgz with data.yaml, labels, and images is unpacked into the dataset store. F6 opens folders; .. goes up.".to_string(),
+        FIELD_RESUME => "Blank = fresh start. Type a .pt/.pth path or press F6 to browse. Gold folders and .. move between directories. Fine-tune adds -ft to the suggested run name.".to_string(),
         FIELD_EPOCHS => "Epochs: Total training passes over the dataset (Webview default: 60; Left/Right or Enter)".to_string(),
         FIELD_BATCH => "Batch Size: Images processed per step (Webview default: 4; Left/Right or Enter)".to_string(),
         FIELD_IMGSZ => "Resolution (imgsz): Input image size — 640, 960 (default), or 1280 (Left/Right or Enter)".to_string(),
@@ -669,13 +669,25 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
     );
 }
 
+fn clip_to_width(text: &str, width: usize) -> String {
+    let width = width.max(1);
+    let count = text.chars().count();
+    if count <= width {
+        return text.to_string();
+    }
+    let keep = width.saturating_sub(1);
+    let mut clipped: String = text.chars().take(keep).collect();
+    clipped.push('…');
+    clipped
+}
+
 pub fn render_browse_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
     let modal = centered_rect(78, 70, area);
     frame.render_widget(Clear, modal);
 
     let title = match state.browse_kind {
-        BrowseKind::Weights => " Browse weights (.pt / .pth) — Enter selects, Esc closes ",
-        BrowseKind::Dataset => " Browse dataset archives (.tar) — Enter selects, Esc closes ",
+        BrowseKind::Weights => " Browse weights (.pt / .pth) — Enter opens or selects ",
+        BrowseKind::Dataset => " Browse dataset — Enter opens a folder or selects a .tar ",
     };
     let block = Block::default()
         .title(Span::styled(
@@ -694,48 +706,77 @@ pub fn render_browse_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
+    let width = inner.width as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
-    if state.browse_entries.is_empty() {
-        let empty = match state.browse_kind {
-            BrowseKind::Weights => {
-                "No .pt or .pth files under the current path, models/, or runs/."
-            }
-            BrowseKind::Dataset => {
-                "No .tar archives under the current path or ~/Exports/."
-            }
-        };
+    let show_header = inner.height >= 4;
+    if show_header {
+        let location = app_lib::to_display_path(&state.browse_dir);
         lines.push(Line::from(Span::styled(
-            format!("  {empty}"),
+            clip_to_width(&format!("  {location}"), width),
             Style::default().fg(LABEL_MUTED),
         )));
         lines.push(Line::from(Span::styled(
-            "  Type a path in the field instead.",
+            clip_to_width("  gold folder · Enter opens · .. goes up · Esc closes", width),
+            Style::default().fg(LABEL_MUTED),
+        )));
+    }
+
+    let list_height = if show_header {
+        inner.height.saturating_sub(2) as usize
+    } else {
+        inner.height as usize
+    };
+    if state.browse_entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  This folder cannot be read.",
             Style::default().fg(LABEL_MUTED),
         )));
     } else {
-        let window = inner.height as usize;
         let start = state
             .browse_cursor
-            .saturating_sub(window / 2)
-            .min(state.browse_entries.len().saturating_sub(window.max(1)));
-        for (offset, path) in state
+            .saturating_sub(list_height / 2)
+            .min(state.browse_entries.len().saturating_sub(list_height.max(1)));
+        for (offset, entry) in state
             .browse_entries
             .iter()
             .enumerate()
             .skip(start)
-            .take(window)
+            .take(list_height)
         {
             let selected = offset == state.browse_cursor;
+            let navigable = entry.kind != BrowseEntryKind::File;
             let prefix = if selected { " ▶ " } else { "   " };
-            let style = if selected {
+            let style = if selected && navigable {
+                Style::default()
+                    .fg(GAUGE_TEXT_COVERED)
+                    .bg(BROWSE_DIR_FG)
+                    .add_modifier(Modifier::BOLD)
+            } else if selected {
                 Style::default()
                     .fg(GAUGE_TEXT_COVERED)
                     .bg(BAR_GPU_TEAL)
                     .add_modifier(Modifier::BOLD)
+            } else if navigable {
+                Style::default()
+                    .fg(BROWSE_DIR_FG)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
-            lines.push(Line::from(Span::styled(format!("{prefix}{path}"), style)));
+            lines.push(Line::from(Span::styled(
+                clip_to_width(&format!("{prefix}{}", entry.label), width),
+                style,
+            )));
+        }
+        let only_navigation = state
+            .browse_entries
+            .iter()
+            .all(|entry| entry.kind != BrowseEntryKind::File);
+        if only_navigation && lines.len() < inner.height as usize {
+            lines.push(Line::from(Span::styled(
+                "  No matching files in this folder.",
+                Style::default().fg(LABEL_MUTED),
+            )));
         }
     }
 

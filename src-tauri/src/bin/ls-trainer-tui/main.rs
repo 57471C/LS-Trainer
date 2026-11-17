@@ -104,8 +104,9 @@ mod tests {
     use ratatui::{backend::TestBackend, style::Color, Terminal};
 
     use crate::app::{
-        parse_cli_args_from, yolo_multi_xpu_request, ArchChoice, BrowseKind, CliConfig,
-        HealthLevel, OverlayMode, UiMode, BAR_EPOCH_TEAL, BAR_GPU_TEAL, BAR_TRACK_BG,
+        parse_cli_args_from, yolo_multi_xpu_request, ArchChoice, BrowseEntryKind, BrowseKind,
+        CliConfig, HealthLevel, OverlayMode, UiMode, BAR_EPOCH_TEAL, BAR_GPU_TEAL, BAR_TRACK_BG,
+        BROWSE_DIR_FG,
         FIELD_AUG_PRESET, FIELD_BATCH, FIELD_DEVICE, FIELD_EPOCHS, FIELD_FREEZE, FIELD_IMGSZ,
         FIELD_RESUME, FIELD_RUN_NAME, FIELD_WORKERS, GAUGE_TEXT_COVERED, GAUGE_TEXT_UNCOVERED,
         TABLE_BORDER_SOFT,
@@ -825,32 +826,107 @@ mod tests {
         }
 
         let weights_dir = dir.join("weights");
-        std::fs::create_dir_all(&weights_dir).unwrap();
+        let nested = weights_dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(weights_dir.join("a.pt"), b"a").unwrap();
         std::fs::write(weights_dir.join("b.pt"), b"b").unwrap();
         std::fs::write(weights_dir.join("skip.txt"), b"x").unwrap();
+        std::fs::write(nested.join("c.pt"), b"c").unwrap();
         std::fs::write(dir.join("data.tar"), b"not-a-real-tar").unwrap();
-        let listed = crate::app::list_browse_files_in(
-            BrowseKind::Weights,
-            &[weights_dir.clone()],
-        );
-        assert_eq!(listed.len(), 2, "{listed:?}");
-        assert!(listed.iter().all(|path| path.ends_with(".pt")));
+        let listed = crate::app::list_browse_dir(BrowseKind::Weights, &weights_dir);
+        assert_eq!(listed[0].label, "..");
+        assert_eq!(listed[0].kind, BrowseEntryKind::Parent);
+        assert!(listed.iter().any(|entry| entry.label == "nested/"
+            && entry.kind == BrowseEntryKind::Dir));
+        assert!(listed.iter().any(|entry| entry.label == "a.pt"));
+        assert!(listed.iter().any(|entry| entry.label == "b.pt"));
+        assert!(listed.iter().all(|entry| entry.label != "skip.txt"));
+        assert!(listed.iter().all(|entry| entry.label != "c.pt"));
 
-        let archives = crate::app::list_browse_files_in(BrowseKind::Dataset, &[dir.clone()]);
-        assert!(archives.iter().any(|path| path.ends_with("data.tar")));
-        assert!(archives.iter().all(|path| !path.ends_with(".pt")));
+        let archives = crate::app::list_browse_dir(BrowseKind::Dataset, &dir);
+        assert!(archives.iter().any(|entry| entry.label == "data.tar"
+            && entry.kind == BrowseEntryKind::File));
+        assert!(archives
+            .iter()
+            .any(|entry| entry.label == "weights/" && entry.kind == BrowseEntryKind::Dir));
+        assert!(archives.iter().all(|entry| entry.kind != BrowseEntryKind::File
+            || entry.label.ends_with(".tar")));
 
         {
             let mut guard = state.lock().unwrap();
             guard.browse_kind = BrowseKind::Weights;
+            guard.browse_dir = std::fs::canonicalize(&weights_dir).unwrap();
             guard.browse_entries = listed;
             guard.browse_cursor = 0;
             guard.overlay = OverlayMode::Browse;
             guard.setup.resume_from.clear();
             guard.setup.run_name_custom = false;
+            let backend = TestBackend::new(140, 40);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|frame| draw_ui(frame, &guard))
+                .expect("draw browse");
+            let buf = terminal.backend().buffer();
+            let mut saw_gold_folder = false;
+            let mut saw_selected_parent = false;
+            for y in 0..40 {
+                for x in 0..140 {
+                    let cell = &buf[(x, y)];
+                    if cell.fg == BROWSE_DIR_FG {
+                        saw_gold_folder = true;
+                    }
+                    if cell.bg == BROWSE_DIR_FG && cell.symbol() == "." {
+                        saw_selected_parent = true;
+                    }
+                }
+            }
+            assert!(saw_gold_folder, "folders stay gold when they are not selected");
+            assert!(saw_selected_parent, "selected .. uses the folder colour");
         }
-        handle_setup_key(&state, KeyCode::Down);
+        let nested_idx = state
+            .lock()
+            .unwrap()
+            .browse_entries
+            .iter()
+            .position(|entry| entry.label == "nested/")
+            .expect("nested folder");
+        {
+            let mut guard = state.lock().unwrap();
+            guard.browse_cursor = nested_idx;
+        }
+        handle_setup_key(&state, KeyCode::Enter);
+        {
+            let guard = state.lock().unwrap();
+            assert_eq!(guard.overlay, OverlayMode::Browse);
+            assert!(guard.browse_dir.ends_with("nested"), "{:?}", guard.browse_dir);
+            assert_eq!(guard.browse_entries[0].label, "..");
+            assert!(guard
+                .browse_entries
+                .iter()
+                .any(|entry| entry.label == "c.pt"));
+            assert!(guard.setup.resume_from.is_empty());
+        }
+        handle_setup_key(&state, KeyCode::Enter);
+        {
+            let guard = state.lock().unwrap();
+            assert!(guard.browse_dir.ends_with("weights"), "{:?}", guard.browse_dir);
+            assert!(guard
+                .browse_entries
+                .iter()
+                .any(|entry| entry.label == "b.pt"));
+            assert_eq!(guard.overlay, OverlayMode::Browse);
+        }
+        let file_idx = state
+            .lock()
+            .unwrap()
+            .browse_entries
+            .iter()
+            .position(|entry| entry.label == "b.pt")
+            .expect("b.pt");
+        {
+            let mut guard = state.lock().unwrap();
+            guard.browse_cursor = file_idx;
+        }
         handle_setup_key(&state, KeyCode::Enter);
         let picked = state.lock().unwrap().setup.resume_from.clone();
         assert!(picked.ends_with("b.pt"), "{picked}");

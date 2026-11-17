@@ -62,7 +62,7 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
             "Navigate fields and cycle presets in Launch Menu",
         ),
         ("F2 / Enter", "Start training from Launch Menu"),
-        ("F6 / Ctrl+O", "Browse .pt/.pth or a dataset .tar"),
+        ("F6 / Ctrl+O", "Browse; gold folders and .. change folder"),
     ];
 
     let mut lines: Vec<Line<'static>> = Vec::new();
