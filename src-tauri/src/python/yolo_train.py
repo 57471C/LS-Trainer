@@ -802,10 +802,304 @@ def _train_kwargs_from_cli(cli_args, device_list):
     return kwargs
 
 
+MULTI_XPU_METRICS_PATH = "/tmp/ls-trainer-metrics.json"
+
+# Callback source inlined into the standalone script. It must stay free of this
+# module's control-thread locks: Ultralytics cloudpickles model callbacks into DDP workers.
+_STANDALONE_METRICS_PY = r'''
+import json
+import time
+
+_LS_METRICS_PATH = "/tmp/ls-trainer-metrics.json"
+_LS_XPU_COUNT = @@XPU_COUNT@@
+_LS_METRICS_INTERVAL = 5.0
+
+
+def _ls_remove_metrics_file():
+    for suffix in ("", ".tmp"):
+        try:
+            os.remove(_LS_METRICS_PATH + suffix)
+        except OSError:
+            pass
+
+
+def _ls_rank0():
+    for key in ("RANK", "LOCAL_RANK"):
+        raw = os.environ.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            rank = int(raw)
+        except (TypeError, ValueError):
+            return False
+        if rank not in (-1, 0):
+            return False
+    return True
+
+
+def _ls_finite(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
+def _ls_metric(metrics, keys):
+    if not isinstance(metrics, dict):
+        return None
+    found = None
+    for key in keys:
+        number = _ls_finite(metrics.get(key))
+        if number is None:
+            continue
+        if found is None or number > found:
+            found = number
+    return found
+
+
+def _ls_xe_idle_paths(xpu):
+    cached = getattr(_ls_xe_idle_paths, "value", None)
+    if cached is not None:
+        return cached
+    cards = []
+    try:
+        entries = os.listdir("/sys/class/drm")
+    except OSError:
+        entries = []
+    for name in entries:
+        if not name.startswith("card") or not name[4:].isdigit():
+            continue
+        idle = "/sys/class/drm/" + name + "/device/tile0/gt0/gtidle/idle_residency_ms"
+        if not os.path.isfile(idle):
+            continue
+        bus = None
+        try:
+            bdf = os.path.basename(os.path.realpath("/sys/class/drm/" + name + "/device"))
+            bus = int(bdf.split(":")[1], 16)
+        except (OSError, ValueError, IndexError):
+            bus = None
+        cards.append((int(name[4:]), bus, idle))
+    cards.sort()
+    paths = []
+    for index in range(int(_LS_XPU_COUNT)):
+        bus = None
+        try:
+            uuid = str(getattr(xpu.get_device_properties(index), "uuid", ""))
+            bus = int(uuid.split("-")[3][:2], 16)
+        except Exception:
+            bus = None
+        chosen = None
+        if bus is not None:
+            for _card_index, card_bus, idle in cards:
+                if card_bus == bus:
+                    chosen = idle
+                    break
+        if chosen is None and index < len(cards):
+            chosen = cards[index][2]
+        paths.append(chosen)
+    _ls_xe_idle_paths.value = paths
+    return paths
+
+
+def _ls_read_int_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _ls_fill_xe_util(xpu, busy):
+    # torch.xpu.utilization needs Level Zero engine groups. These Arc B70s do not
+    # expose them, so the render-engine idle counter is the reading that moves.
+    try:
+        paths = _ls_xe_idle_paths(xpu)
+    except Exception:
+        return busy
+    need = [
+        index
+        for index, value in enumerate(busy)
+        if value is None and index < len(paths) and paths[index]
+    ]
+    if not need:
+        return busy
+    started = time.monotonic()
+    before = {index: _ls_read_int_file(paths[index]) for index in need}
+    time.sleep(0.1)
+    elapsed_ms = (time.monotonic() - started) * 1000.0
+    if elapsed_ms <= 0:
+        return busy
+    for index in need:
+        idle0 = before.get(index)
+        idle1 = _ls_read_int_file(paths[index])
+        if idle0 is None or idle1 is None or idle1 < idle0:
+            continue
+        pct = 100.0 * (1.0 - ((idle1 - idle0) / elapsed_ms))
+        if pct < 0.0:
+            pct = 0.0
+        elif pct > 100.0:
+            pct = 100.0
+        busy[index] = int(round(pct))
+    return busy
+
+
+def _ls_device_stats():
+    vram_mb = []
+    util_pct = []
+    gpu_index = []
+    try:
+        import torch
+        xpu = getattr(torch, "xpu", None)
+    except Exception:
+        return vram_mb, util_pct, gpu_index
+    if xpu is None:
+        return vram_mb, util_pct, gpu_index
+    for index in range(int(_LS_XPU_COUNT)):
+        allocated_mb = None
+        info_mb = None
+        try:
+            allocated_mb = int(xpu.memory_allocated(index) / (1024 * 1024))
+        except Exception:
+            allocated_mb = None
+        # memory_allocated is per-process, so another DDP rank's card stays at 0.
+        # mem_get_info is device-wide and visible from rank 0.
+        try:
+            free_bytes, total_bytes = xpu.mem_get_info(index)
+            info_mb = int(max(0, int(total_bytes) - int(free_bytes)) / (1024 * 1024))
+        except Exception:
+            info_mb = None
+        if allocated_mb is None and info_mb is None:
+            used = None
+        else:
+            used = max(value for value in (allocated_mb, info_mb) if value is not None)
+        busy = None
+        try:
+            busy = int(round(float(xpu.utilization(index))))
+        except Exception:
+            busy = None
+        vram_mb.append(used)
+        util_pct.append(busy)
+        gpu_index.append(index)
+    if any(value is None for value in util_pct):
+        _ls_fill_xe_util(xpu, util_pct)
+    kept_vram = []
+    kept_util = []
+    kept_index = []
+    for index, used, busy in zip(gpu_index, vram_mb, util_pct):
+        if used is None and busy is None:
+            continue
+        kept_index.append(index)
+        kept_vram.append(used)
+        kept_util.append(busy)
+    return kept_vram, kept_util, kept_index
+
+
+def _ls_write_metrics(trainer, force=False):
+    try:
+        if not _ls_rank0():
+            return
+        now = time.time()
+        last = getattr(_ls_write_metrics, "last_write", 0.0)
+        if (not force) and last and (now - last) < _LS_METRICS_INTERVAL:
+            return
+        epoch = getattr(_ls_write_metrics, "epoch", 0)
+        raw_epoch = getattr(trainer, "epoch", None) if trainer is not None else None
+        if raw_epoch is not None:
+            try:
+                epoch = int(raw_epoch) + 1
+            except (TypeError, ValueError):
+                pass
+            total = getattr(trainer, "epochs", None)
+            try:
+                total = int(total) if total is not None else 0
+                if total > 0 and epoch > total:
+                    epoch = total
+            except (TypeError, ValueError):
+                pass
+            _ls_write_metrics.epoch = epoch
+        metrics = getattr(trainer, "metrics", None) if trainer is not None else None
+        map50 = _ls_metric(metrics, ("metrics/mAP50(B)", "metrics/mAP50(M)"))
+        map95 = _ls_metric(metrics, ("metrics/mAP50-95(B)", "metrics/mAP50-95(M)"))
+        if map50 is not None:
+            prev50 = getattr(_ls_write_metrics, "best50", None)
+            best50 = map50 if prev50 is None else max(prev50, map50)
+            _ls_write_metrics.best50 = best50
+        else:
+            best50 = getattr(_ls_write_metrics, "best50", None)
+        if map95 is not None:
+            headline = map95
+        elif map50 is not None:
+            headline = map50
+        else:
+            headline = getattr(_ls_write_metrics, "headline", None)
+        if map95 is not None or map50 is not None:
+            _ls_write_metrics.headline = headline
+            prev_best = getattr(_ls_write_metrics, "best_headline", None)
+            best_headline = headline if prev_best is None else max(prev_best, headline)
+            _ls_write_metrics.best_headline = best_headline
+        else:
+            best_headline = getattr(_ls_write_metrics, "best_headline", None)
+        vram_mb, util_pct, gpu_index = _ls_device_stats()
+        payload = {
+            "epoch": int(epoch),
+            "best_map": best_headline,
+            "map": headline,
+            "map50": map50 if map50 is not None else getattr(_ls_write_metrics, "map50", None),
+            "best_map50": best50,
+            "map50_95": map95 if map95 is not None else getattr(_ls_write_metrics, "map95", None),
+            "vram_mb": vram_mb,
+            "util_pct": util_pct,
+            "gpu_index": gpu_index,
+        }
+        if map50 is not None:
+            _ls_write_metrics.map50 = map50
+        if map95 is not None:
+            _ls_write_metrics.map95 = map95
+        text = json.dumps(payload, allow_nan=False) + "\n"
+        tmp = _LS_METRICS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, _LS_METRICS_PATH)
+        _ls_write_metrics.last_write = now
+    except Exception:
+        return
+
+
+def _ls_on_train_batch_end(trainer):
+    _ls_write_metrics(trainer, force=False)
+
+
+def _ls_on_val_batch_end(validator):
+    _ls_write_metrics(validator, force=False)
+
+
+def _ls_on_fit_epoch_end(trainer):
+    _ls_write_metrics(trainer, force=True)
+
+
+def _ls_on_train_end(trainer):
+    _ls_write_metrics(trainer, force=True)
+'''
+
+
+def _remove_multi_xpu_metrics_file():
+    for suffix in ("", ".tmp"):
+        try:
+            os.remove(MULTI_XPU_METRICS_PATH + suffix)
+        except OSError:
+            pass
+
+
 def build_standalone_yolo_script(cli_args, device_list):
     """Short fresh-process trainer. It must not import this module or touch its locks."""
     model = _parse_arg_value(cli_args, "model=") or ""
     train_kwargs = _train_kwargs_from_cli(cli_args, device_list)
+    metrics = _STANDALONE_METRICS_PY.replace("@@XPU_COUNT@@", str(len(device_list)))
     return (
         "import os\n"
         "import signal\n"
@@ -818,11 +1112,19 @@ def build_standalone_yolo_script(cli_args, device_list):
         "    except Exception:\n"
         "        pass\n"
         "\n"
+        f"{metrics}"
         "from ultralytics import YOLO\n"
         "\n"
         "if __name__ == '__main__':\n"
         f"    model = YOLO({model!r})\n"
-        f"    model.train(**{train_kwargs!r})\n"
+        "    model.add_callback('on_train_batch_end', _ls_on_train_batch_end)\n"
+        "    model.add_callback('on_val_batch_end', _ls_on_val_batch_end)\n"
+        "    model.add_callback('on_fit_epoch_end', _ls_on_fit_epoch_end)\n"
+        "    model.add_callback('on_train_end', _ls_on_train_end)\n"
+        "    try:\n"
+        f"        model.train(**{train_kwargs!r})\n"
+        "    finally:\n"
+        "        _ls_remove_metrics_file()\n"
     )
 
 
@@ -893,6 +1195,7 @@ def launch_standalone_yolo_multi_xpu(cli_args, device_list):
     process calls `model.train`. The child starts with stdin closed and no inherited control state.
     """
     _STOP_REQUESTED["flag"] = False
+    _remove_multi_xpu_metrics_file()
     script = build_standalone_yolo_script(cli_args, device_list)
     script_fd, script_path = tempfile.mkstemp(prefix="ls-trainer-yolo-xpu-", suffix=".py")
     os.close(script_fd)
@@ -904,6 +1207,10 @@ def launch_standalone_yolo_multi_xpu(cli_args, device_list):
         print(
             "[LS-Trainer] Multi-XPU YOLO standalone script "
             f"{script_path} device={device_list}",
+            flush=True,
+        )
+        print(
+            f"[LS-Trainer] Multi-XPU metrics file {MULTI_XPU_METRICS_PATH}",
             flush=True,
         )
         env = os.environ.copy()
@@ -979,6 +1286,7 @@ def launch_standalone_yolo_multi_xpu(cli_args, device_list):
             os.remove(script_path)
         except OSError:
             pass
+        _remove_multi_xpu_metrics_file()
 
 
 def main():
@@ -1139,6 +1447,52 @@ def run_self_checks():
     assert "TrainingControlState" not in script
     assert "threading" not in script
     assert "stdin" not in script
+    assert "_RUNTIME" not in script
+    assert "/tmp/ls-trainer-metrics.json" in script
+    assert "model.add_callback(" in script
+    assert "memory_allocated" in script
+    assert "utilization" in script
+    assert "os.replace" in script
+
+    namespace = {"__name__": "ls_trainer_metrics_check"}
+    exec(compile(script, "<standalone>", "exec"), namespace)
+    import cloudpickle
+
+    for callback_name in (
+        "_ls_on_train_batch_end",
+        "_ls_on_val_batch_end",
+        "_ls_on_fit_epoch_end",
+        "_ls_on_train_end",
+    ):
+        cloudpickle.dumps(namespace[callback_name])
+
+    class _FakeTrainer:
+        epoch = 3
+        epochs = 4
+        metrics = {
+            "metrics/mAP50(B)": 0.81,
+            "metrics/mAP50-95(B)": 0.55,
+        }
+
+    saved_rank = os.environ.pop("RANK", None)
+    saved_local_rank = os.environ.pop("LOCAL_RANK", None)
+    try:
+        namespace["_ls_on_fit_epoch_end"](_FakeTrainer())
+        with open(MULTI_XPU_METRICS_PATH, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        assert payload["epoch"] == 4
+        assert payload["map"] == 0.55
+        assert payload["best_map"] == 0.55
+        assert payload["map50"] == 0.81
+        assert isinstance(payload["vram_mb"], list)
+        assert isinstance(payload["util_pct"], list)
+        assert isinstance(payload["gpu_index"], list)
+    finally:
+        if saved_rank is not None:
+            os.environ["RANK"] = saved_rank
+        if saved_local_rank is not None:
+            os.environ["LOCAL_RANK"] = saved_local_rank
+        _remove_multi_xpu_metrics_file()
     print("yolo multi-xpu self-checks ok")
 
 

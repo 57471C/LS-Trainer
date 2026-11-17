@@ -71,6 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     guard.refresh_run_artifacts();
                 }
             }
+            guard.tick_multi_xpu_metrics();
             let _ = terminal.draw(|frame| draw_ui(frame, &guard));
         }
 
@@ -103,9 +104,9 @@ mod tests {
     use ratatui::{backend::TestBackend, style::Color, Terminal};
 
     use crate::app::{
-        parse_cli_args_from, ArchChoice, CliConfig, HealthLevel, OverlayMode, UiMode,
-        BAR_EPOCH_TEAL, BAR_GPU_TEAL, BAR_TRACK_BG, GAUGE_TEXT_COVERED, GAUGE_TEXT_UNCOVERED,
-        TABLE_BORDER_SOFT,
+        parse_cli_args_from, yolo_multi_xpu_request, ArchChoice, CliConfig, HealthLevel,
+        OverlayMode, UiMode, BAR_EPOCH_TEAL, BAR_GPU_TEAL, BAR_TRACK_BG, GAUGE_TEXT_COVERED,
+        GAUGE_TEXT_UNCOVERED, TABLE_BORDER_SOFT,
     };
     use crate::event::{handle_setup_key, handle_training_key};
     use crate::ui::splash::{
@@ -1415,5 +1416,236 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp_coco);
         let _ = std::fs::remove_dir_all(PathBuf::from("runs/detect").join(run_name));
+    }
+
+    fn multi_xpu_state(device: &str, family: &str) -> AppState {
+        let mut cfg = CliConfig::default();
+        cfg.interactive = false;
+        cfg.dataset = "/tmp".to_string();
+        cfg.device = device.to_string();
+        cfg.epochs = "60".to_string();
+        if family == "YOLO26" {
+            cfg.arch = ArchChoice::Yolo26;
+            cfg.model = "m".to_string();
+        }
+        let req = cfg.to_training_request().expect("training request");
+        let mut state = AppState::new(cfg);
+        state.mode = UiMode::Training;
+        state.is_running = true;
+        state.multi_xpu_proc_alive = true;
+        state.latest_metrics.total_epochs = req.epochs;
+        state.active_request = Some(req);
+        state
+    }
+
+    #[test]
+    fn multi_xpu_metrics_file_updates_epoch_map_vram_and_util_gauges() {
+        let mut yolo = multi_xpu_state("xpu:0,1", "YOLO");
+        assert!(yolo_multi_xpu_request(
+            yolo.active_request.as_ref().expect("request")
+        ));
+        let yolo26 = multi_xpu_state("xpu:0,1", "YOLO26");
+        assert_eq!(
+            yolo26.active_request.as_ref().expect("request").model_family,
+            "YOLO"
+        );
+        assert!(yolo_multi_xpu_request(
+            yolo26.active_request.as_ref().expect("request")
+        ));
+        let single = multi_xpu_state("xpu:0", "YOLO");
+        assert!(!yolo_multi_xpu_request(
+            single.active_request.as_ref().expect("request")
+        ));
+        let mut numeric = multi_xpu_state("0,1", "YOLO");
+        assert!(!yolo_multi_xpu_request(
+            numeric.active_request.as_ref().expect("request")
+        ));
+        numeric.active_request.as_mut().expect("request").device = "xpu:0, xpu:1".to_string();
+        assert!(yolo_multi_xpu_request(
+            numeric.active_request.as_ref().expect("request")
+        ));
+        let mut rf = multi_xpu_state("xpu:0,1", "YOLO");
+        rf.active_request.as_mut().expect("request").model_family = "RF-DETR".to_string();
+        assert!(!yolo_multi_xpu_request(
+            rf.active_request.as_ref().expect("request")
+        ));
+
+        let dir = std::env::temp_dir().join(format!(
+            "ls-trainer-metrics-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("metrics.json");
+        let missing = dir.join("missing.json");
+
+        yolo.poll_yolo_multi_xpu_metrics_at(&missing, std::time::SystemTime::now());
+        assert!(yolo.multi_xpu_gauges_blank);
+        assert_eq!(yolo.latest_metrics.epoch, 0);
+        assert!(yolo.best_map50.is_none());
+        assert!(yolo.best_map50_95.is_none());
+
+        let body = r#"{"epoch":12,"best_map":0.742,"map":0.718,"map50":0.91,"best_map50":0.93,"vram_mb":[2100,1980],"util_pct":[87,91],"gpu_index":[0,1]}"#;
+        std::fs::write(&path, body).expect("write metrics");
+        let fresh = std::time::SystemTime::now();
+        yolo.poll_yolo_multi_xpu_metrics_at(&path, fresh);
+        assert!(!yolo.multi_xpu_gauges_blank);
+        assert_eq!(yolo.latest_metrics.epoch, 12);
+        assert_eq!(yolo.latest_metrics.total_epochs, 60);
+        assert!((yolo.best_map50.expect("mAP50") - 0.93).abs() < 1e-9);
+        assert!((yolo.best_map50_95.expect("mAP50-95") - 0.742).abs() < 1e-9);
+        assert_eq!(yolo.gpus.len(), 2);
+        assert!((yolo.gpus[0].vram_used_gb - (2100.0 / 1024.0)).abs() < 1e-9);
+        assert!((yolo.gpus[1].vram_used_gb - (1980.0 / 1024.0)).abs() < 1e-9);
+        assert!((yolo.gpus[0].util_percent - 87.0).abs() < 1e-9);
+        assert!((yolo.gpus[1].util_percent - 91.0).abs() < 1e-9);
+        assert!(!yolo.gpus[0].hide_vram && !yolo.gpus[0].hide_util);
+        assert_eq!(yolo.train_loss_history.len(), 0);
+
+        let backend = TestBackend::new(160, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_ui(frame, &yolo))
+            .expect("draw fresh gauges");
+        let screen = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            screen.contains("Epoch 12 / 60"),
+            "epoch gauge missing from:\n{screen}"
+        );
+        assert!(screen.contains("93.00%"), "mAP50 gauge missing from:\n{screen}");
+        assert!(
+            screen.contains("74.20%"),
+            "mAP50-95 gauge missing from:\n{screen}"
+        );
+        assert!(
+            screen.contains("VRAM 2.05 GiB"),
+            "vram gauge missing from:\n{screen}"
+        );
+        assert!(
+            screen.contains("VRAM 1.93 GiB"),
+            "second vram gauge missing from:\n{screen}"
+        );
+        assert!(screen.contains("87.0%"), "util gauge missing from:\n{screen}");
+        assert!(screen.contains("91.0%"), "second util gauge missing from:\n{screen}");
+
+        let _ = std::fs::remove_file(&path);
+        yolo.poll_yolo_multi_xpu_metrics_at(&path, fresh + std::time::Duration::from_secs(5));
+        assert_eq!(yolo.latest_metrics.epoch, 12, "a just-removed file keeps the last reading");
+
+        std::fs::write(&path, "not-json").expect("write garbage");
+        yolo.poll_yolo_multi_xpu_metrics_at(&path, fresh);
+        assert!(yolo.multi_xpu_gauges_blank);
+        assert!(yolo.best_map50.is_none());
+
+        std::fs::write(&path, body).expect("rewrite metrics");
+        let again = std::time::SystemTime::now();
+        yolo.poll_yolo_multi_xpu_metrics_at(&path, again);
+        assert_eq!(yolo.latest_metrics.epoch, 12);
+        yolo.poll_yolo_multi_xpu_metrics_at(&path, again + std::time::Duration::from_secs(30));
+        assert!(yolo.multi_xpu_gauges_blank);
+        assert_eq!(yolo.latest_metrics.epoch, 0);
+        terminal
+            .draw(|frame| draw_ui(frame, &yolo))
+            .expect("draw blank gauges");
+        let blank = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            blank.contains("Epoch -- / 60"),
+            "stale file should blank the epoch gauge:\n{blank}"
+        );
+        assert!(
+            blank.contains("VRAM --"),
+            "stale file should blank VRAM:\n{blank}"
+        );
+        assert!(!blank.contains("74.20%"));
+
+        let mut untouched = multi_xpu_state("xpu:0", "YOLO");
+        untouched.latest_metrics.epoch = 1;
+        std::fs::write(&path, body).expect("rewrite for single-device");
+        untouched.poll_yolo_multi_xpu_metrics_at(&path, std::time::SystemTime::now());
+        assert_eq!(untouched.latest_metrics.epoch, 1);
+        assert!(untouched.gpus.is_empty());
+        assert!(!untouched.multi_xpu_gauges_blank);
+
+        rf.latest_metrics.epoch = 2;
+        rf.poll_yolo_multi_xpu_metrics_at(&path, std::time::SystemTime::now());
+        assert_eq!(rf.latest_metrics.epoch, 2);
+        assert!(rf.gpus.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Point `LS_TRAINER_METRICS_SNAPSHOT` at a JSON file captured from a live dual-XPU run.
+    #[test]
+    fn live_multi_xpu_metrics_snapshot_drives_gauges() {
+        let Ok(src) = std::env::var("LS_TRAINER_METRICS_SNAPSHOT") else {
+            return;
+        };
+        let raw = std::fs::read_to_string(&src).expect("read snapshot");
+        let value: serde_json::Value = serde_json::from_str(raw.trim()).expect("snapshot json");
+        let epoch = value["epoch"].as_u64().expect("epoch") as u32;
+        assert!(epoch >= 1, "live snapshot epoch was {epoch}");
+        let vram = value["vram_mb"].as_array().expect("vram_mb");
+        let util = value["util_pct"].as_array().expect("util_pct");
+        assert!(
+            vram.len() >= 2,
+            "expected both Arc VRAM samples, got {vram:?}"
+        );
+        assert!(
+            util.len() >= 2,
+            "expected both Arc util samples, got {util:?}"
+        );
+        assert!(
+            vram.iter().any(|item| item.as_f64().unwrap_or(0.0) > 0.0),
+            "expected non-zero VRAM, got {vram:?}"
+        );
+        let util_nums: Vec<f64> = util.iter().filter_map(|item| item.as_f64()).collect();
+        assert!(
+            util_nums.len() >= 2,
+            "expected numeric util for both devices, got {util:?}"
+        );
+
+        let mut state = multi_xpu_state("xpu:0,1", "YOLO");
+        let dir = std::env::temp_dir().join(format!(
+            "ls-trainer-live-metrics-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("metrics.json");
+        std::fs::write(&path, raw.trim()).expect("copy snapshot");
+        state.poll_yolo_multi_xpu_metrics_at(&path, std::time::SystemTime::now());
+        assert!(!state.multi_xpu_gauges_blank);
+        assert_eq!(state.latest_metrics.epoch, epoch.min(60));
+
+        let backend = TestBackend::new(160, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_ui(frame, &state))
+            .expect("draw live snapshot");
+        let screen = buffer_to_string(terminal.backend().buffer());
+        let epoch_label = format!("Epoch {} / 60", epoch.min(60));
+        assert!(
+            screen.contains(&epoch_label),
+            "epoch gauge missing from:\n{screen}"
+        );
+        let mb0 = vram[0].as_f64().expect("vram0");
+        let vram_label = format!("VRAM {:.2} GiB", mb0 / 1024.0);
+        assert!(
+            screen.contains(&vram_label),
+            "vram gauge {vram_label} missing from:\n{screen}"
+        );
+        let util_label = format!("{:.1}%", util_nums[0]);
+        assert!(
+            screen.contains(&util_label),
+            "util gauge {util_label} missing from:\n{screen}"
+        );
+        if let Some(best) = value["best_map"].as_f64() {
+            let map_label = format!("{:.2}%", best * 100.0);
+            assert!(
+                screen.contains(&map_label),
+                "best mAP {map_label} missing from:\n{screen}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

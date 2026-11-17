@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use app_lib as ls_trainer_lib;
 use ls_trainer_lib::{
@@ -15,6 +15,9 @@ use ratatui::style::Color;
 use sysinfo::System;
 
 pub const APP_VERSION_LABEL: &str = "Version v0.2.1";
+/// Overwritten by the YOLO multi-XPU standalone trainer. Single-device runs do not use it.
+pub const MULTI_XPU_METRICS_PATH: &str = "/tmp/ls-trainer-metrics.json";
+const MULTI_XPU_METRICS_STALE: Duration = Duration::from_secs(20);
 pub const MAX_LOG_LINES: usize = 500;
 pub const MAX_HISTORY_POINTS: usize = 300;
 pub const MAX_SPARKLINE_SAMPLES: usize = 60;
@@ -945,6 +948,10 @@ pub struct GpuCardState {
     pub vram_used_gb: f64,
     pub vram_total_gb: f64,
     pub util_percent: f64,
+    /// Multi-XPU file had no VRAM sample. Single-device cards leave this false.
+    pub hide_vram: bool,
+    /// Multi-XPU file had no utilisation sample. Single-device cards leave this false.
+    pub hide_util: bool,
     pub power_watts: Option<f64>,
     pub temp_celsius: Option<f64>,
     pub util_history: VecDeque<u64>,
@@ -960,6 +967,8 @@ impl GpuCardState {
             vram_used_gb: 0.0,
             vram_total_gb: 0.0,
             util_percent: 0.0,
+            hide_vram: false,
+            hide_util: false,
             power_watts: None,
             temp_celsius: None,
             util_history,
@@ -1006,6 +1015,13 @@ pub struct AppState {
     pub warning_tags: Vec<String>,
     pub last_error_msg: Option<String>,
     pub latest_metrics: TrainMetrics,
+    /// Training subprocess for a YOLO multi-XPU run is still alive.
+    pub multi_xpu_proc_alive: bool,
+    /// Epoch / mAP / VRAM / util gauges should render blank for this multi-XPU run.
+    pub multi_xpu_gauges_blank: bool,
+    multi_xpu_last_good: Option<SystemTime>,
+    multi_xpu_seen_mtime: Option<SystemTime>,
+    multi_xpu_poll_tick: usize,
     pub step_counter: u64,
     pub train_loss_history: VecDeque<(f64, f64)>,
     pub val_loss_history: VecDeque<(f64, f64)>,
@@ -1034,6 +1050,96 @@ pub struct AppState {
     pub onnx_path: Option<String>,
     pub history_entries: Vec<RunHistoryEntry>,
     pub history_selected: usize,
+}
+
+/// YOLO (including YOLO26) with two or more XPU devices. `xpu:0,1` counts.
+pub fn yolo_multi_xpu_request(req: &TrainingRequest) -> bool {
+    let family = req.model_family.to_ascii_lowercase();
+    if family != "yolo" && !family.starts_with("yolo") {
+        return false;
+    }
+    let device = req.device.trim().to_ascii_lowercase();
+    if !device.contains("xpu") || !device.contains(',') {
+        return false;
+    }
+    let mut saw_xpu = false;
+    for part in device
+        .split(|c: char| matches!(c, ',' | '[' | ']' | '\'' | '"' | ' '))
+        .filter(|part| !part.is_empty())
+    {
+        if part == "xpu" || part.starts_with("xpu:") {
+            saw_xpu = true;
+        } else if saw_xpu && part.chars().all(|ch| ch.is_ascii_digit()) {
+            // `xpu:0,1` — the bare index is another Arc.
+        } else {
+            return false;
+        }
+    }
+    saw_xpu
+}
+
+#[derive(serde::Deserialize)]
+struct MultiXpuMetricsFile {
+    #[serde(default)]
+    epoch: Option<u32>,
+    #[serde(default)]
+    best_map: Option<f64>,
+    #[serde(default)]
+    map: Option<f64>,
+    #[serde(default)]
+    map50: Option<f64>,
+    #[serde(default)]
+    best_map50: Option<f64>,
+    #[serde(default)]
+    map50_95: Option<f64>,
+    #[serde(default)]
+    vram_mb: Vec<Option<f64>>,
+    #[serde(default)]
+    util_pct: Vec<Option<f64>>,
+    #[serde(default)]
+    gpu_index: Vec<u32>,
+}
+
+enum MetricsRead {
+    Fresh(MultiXpuMetricsFile, SystemTime),
+    Missing,
+    Stale,
+    Unreadable,
+}
+
+fn finite_nonneg(value: Option<f64>) -> Option<f64> {
+    value.filter(|number| number.is_finite() && *number >= 0.0)
+}
+
+fn read_multi_xpu_metrics(path: &Path, now: SystemTime) -> MetricsRead {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(_) => return MetricsRead::Missing,
+    };
+    let modified = match meta.modified() {
+        Ok(modified) => modified,
+        Err(_) => return MetricsRead::Unreadable,
+    };
+    let fresh = match now.duration_since(modified) {
+        Ok(age) => age <= MULTI_XPU_METRICS_STALE,
+        Err(_) => true,
+    };
+    if !fresh {
+        return MetricsRead::Stale;
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(_) => return MetricsRead::Unreadable,
+    };
+    match serde_json::from_str::<MultiXpuMetricsFile>(text.trim()) {
+        Ok(parsed) => MetricsRead::Fresh(parsed, modified),
+        Err(_) => MetricsRead::Unreadable,
+    }
+}
+
+pub fn remove_multi_xpu_metrics_file() {
+    let _ = std::fs::remove_file(MULTI_XPU_METRICS_PATH);
+    let _ = std::fs::remove_file(format!("{MULTI_XPU_METRICS_PATH}.tmp"));
 }
 
 pub fn strip_ansi_codes(s: &str) -> String {
@@ -1112,6 +1218,11 @@ impl AppState {
             warning_tags: Vec::new(),
             last_error_msg: None,
             latest_metrics: TrainMetrics::default(),
+            multi_xpu_proc_alive: false,
+            multi_xpu_gauges_blank: false,
+            multi_xpu_last_good: None,
+            multi_xpu_seen_mtime: None,
+            multi_xpu_poll_tick: 0,
             step_counter: 0,
             train_loss_history: VecDeque::with_capacity(MAX_HISTORY_POINTS),
             val_loss_history: VecDeque::with_capacity(MAX_HISTORY_POINTS),
@@ -1433,19 +1544,213 @@ impl AppState {
                     card.name = g.name.clone();
                 }
                 card.vram_used_gb = g.vram_used_gb;
+                card.hide_vram = false;
                 if g.vram_total_gb > 0.0 {
                     card.vram_total_gb = g.vram_total_gb;
                 }
+                card.hide_util = false;
                 card.push_util(g.util_percent);
             } else {
                 let mut card = GpuCardState::new(g.index, g.name.clone());
                 card.vram_used_gb = g.vram_used_gb;
                 card.vram_total_gb = g.vram_total_gb;
+                card.hide_vram = false;
+                card.hide_util = false;
                 card.push_util(g.util_percent);
                 self.gpus.push(card);
             }
         }
         self.gpus.sort_by_key(|c| c.index);
+    }
+
+    fn should_poll_multi_xpu_metrics(&self) -> bool {
+        self.is_running
+            && self.multi_xpu_proc_alive
+            && self
+                .active_request
+                .as_ref()
+                .is_some_and(yolo_multi_xpu_request)
+    }
+
+    pub fn poll_yolo_multi_xpu_metrics(&mut self, path: &Path) {
+        self.poll_yolo_multi_xpu_metrics_at(path, SystemTime::now());
+    }
+
+    /// Poll the metrics file about once a second while a multi-XPU YOLO run is active.
+    pub fn tick_multi_xpu_metrics(&mut self) {
+        if !self.multi_xpu_proc_alive {
+            return;
+        }
+        self.multi_xpu_poll_tick = self.multi_xpu_poll_tick.wrapping_add(1);
+        if self.multi_xpu_poll_tick % 12 == 1 {
+            self.poll_yolo_multi_xpu_metrics(Path::new(MULTI_XPU_METRICS_PATH));
+        }
+    }
+
+    pub fn poll_yolo_multi_xpu_metrics_at(&mut self, path: &Path, now: SystemTime) {
+        if !self.should_poll_multi_xpu_metrics() {
+            return;
+        }
+        match read_multi_xpu_metrics(path, now) {
+            MetricsRead::Fresh(snap, modified) => {
+                self.multi_xpu_last_good = Some(now);
+                if self.multi_xpu_seen_mtime == Some(modified) && !self.multi_xpu_gauges_blank {
+                    return;
+                }
+                self.multi_xpu_seen_mtime = Some(modified);
+                self.apply_multi_xpu_metrics_snapshot(snap);
+            }
+            MetricsRead::Stale | MetricsRead::Unreadable => self.blank_multi_xpu_gauges(),
+            MetricsRead::Missing => {
+                let recent = self.multi_xpu_last_good.is_some_and(|seen| {
+                    now.duration_since(seen)
+                        .map(|age| age <= MULTI_XPU_METRICS_STALE)
+                        .unwrap_or(true)
+                });
+                if !recent {
+                    self.blank_multi_xpu_gauges();
+                }
+            }
+        }
+    }
+
+    /// Read a last snapshot when the training process exits, then delete the file.
+    /// A missing file keeps the last fresh reading so the completion summary stays filled.
+    pub fn capture_final_multi_xpu_metrics(&mut self) {
+        let multi = self
+            .active_request
+            .as_ref()
+            .is_some_and(yolo_multi_xpu_request);
+        if self.multi_xpu_proc_alive {
+            let now = SystemTime::now();
+            if let MetricsRead::Fresh(snap, modified) =
+                read_multi_xpu_metrics(Path::new(MULTI_XPU_METRICS_PATH), now)
+            {
+                self.multi_xpu_seen_mtime = Some(modified);
+                self.multi_xpu_last_good = Some(now);
+                self.apply_multi_xpu_metrics_snapshot(snap);
+            }
+            self.multi_xpu_proc_alive = false;
+        }
+        if multi {
+            remove_multi_xpu_metrics_file();
+        }
+    }
+
+    fn blank_multi_xpu_gauges(&mut self) {
+        self.multi_xpu_gauges_blank = true;
+        self.multi_xpu_seen_mtime = None;
+        self.multi_xpu_last_good = None;
+        self.latest_metrics.epoch = 0;
+        self.latest_metrics.map50 = None;
+        self.latest_metrics.map50_95 = None;
+        self.best_map50 = None;
+        self.best_map50_95 = None;
+        for card in &mut self.gpus {
+            card.hide_vram = true;
+            card.hide_util = true;
+            card.util_history.clear();
+        }
+    }
+
+    fn raise_best_map50(&mut self, value: f64) {
+        let improved = self
+            .best_map50
+            .map_or(value > 0.0, |prev| value > prev + 1e-6);
+        if improved {
+            self.trigger_new_best();
+        }
+        self.best_map50 = Some(self.best_map50.map_or(value, |prev| prev.max(value)));
+    }
+
+    fn raise_best_map95(&mut self, value: f64) {
+        let improved = self
+            .best_map50_95
+            .map_or(value > 0.0, |prev| value > prev + 1e-6);
+        if improved {
+            self.trigger_new_best();
+        }
+        self.best_map50_95 = Some(self.best_map50_95.map_or(value, |prev| prev.max(value)));
+    }
+
+    fn apply_multi_xpu_metrics_snapshot(&mut self, snap: MultiXpuMetricsFile) {
+        self.multi_xpu_gauges_blank = false;
+        if let Some(epoch) = snap.epoch {
+            let total = self.latest_metrics.total_epochs;
+            self.latest_metrics.epoch = if total > 0 { epoch.min(total) } else { epoch };
+        }
+        if let Some(value) = finite_nonneg(snap.map50) {
+            self.latest_metrics.map50 = Some(value);
+            self.raise_best_map50(value);
+        }
+        if let Some(value) = finite_nonneg(snap.best_map50) {
+            self.raise_best_map50(value);
+        }
+        if let Some(value) = finite_nonneg(snap.map50_95).or(finite_nonneg(snap.map)) {
+            self.latest_metrics.map50_95 = Some(value);
+            self.raise_best_map95(value);
+        }
+        if let Some(value) = finite_nonneg(snap.best_map) {
+            self.raise_best_map95(value);
+        }
+
+        let count = snap
+            .vram_mb
+            .len()
+            .max(snap.util_pct.len())
+            .max(snap.gpu_index.len());
+        let mut reported = Vec::with_capacity(count);
+        for pos in 0..count {
+            let index = snap.gpu_index.get(pos).copied().unwrap_or(pos as u32);
+            let vram_mb = snap
+                .vram_mb
+                .get(pos)
+                .copied()
+                .flatten()
+                .filter(|mb| mb.is_finite() && *mb >= 0.0);
+            let util = snap
+                .util_pct
+                .get(pos)
+                .copied()
+                .flatten()
+                .filter(|pct| pct.is_finite() && *pct >= 0.0);
+            if vram_mb.is_none() && util.is_none() {
+                continue;
+            }
+            reported.push(index);
+            let vram_gb = vram_mb.map(|mb| mb / 1024.0);
+            if let Some(card) = self.gpus.iter_mut().find(|card| card.index == index) {
+                paint_multi_xpu_card(card, vram_gb, util);
+            } else {
+                let mut card = GpuCardState::new(index, format!("XPU {index}"));
+                paint_multi_xpu_card(&mut card, vram_gb, util);
+                self.gpus.push(card);
+            }
+        }
+        for card in &mut self.gpus {
+            if !reported.contains(&card.index) {
+                card.hide_vram = true;
+                card.hide_util = true;
+                card.util_history.clear();
+            }
+        }
+        self.gpus.sort_by_key(|card| card.index);
+    }
+}
+
+fn paint_multi_xpu_card(card: &mut GpuCardState, vram_gb: Option<f64>, util: Option<f64>) {
+    if let Some(gb) = vram_gb {
+        card.vram_used_gb = gb;
+        card.hide_vram = false;
+    } else {
+        card.hide_vram = true;
+    }
+    if let Some(util) = util {
+        card.hide_util = false;
+        card.push_util(util);
+    } else {
+        card.hide_util = true;
+        card.util_history.clear();
     }
 }
 
@@ -1479,6 +1784,7 @@ impl TrainingEventSink for TuiEventSink {
 
     fn on_exit(&self, code: Option<i32>) {
         if let Ok(mut guard) = self.state.lock() {
+            guard.capture_final_multi_xpu_metrics();
             guard.refresh_run_artifacts();
             if code == Some(0) && !guard.stop_initiated {
                 // Keep `is_running = true` while the post-training ONNX export executes.
@@ -1642,6 +1948,11 @@ mod linux_hwmon {
                             let mut card = GpuCardState::new(r.index, r.name);
                             card.temp_celsius = r.temp_celsius;
                             card.power_watts = r.power_watts;
+                            if guard.multi_xpu_gauges_blank {
+                                card.hide_vram = true;
+                                card.hide_util = true;
+                                card.util_history.clear();
+                            }
                             guard.gpus.push(card);
                         }
                     }
@@ -1660,7 +1971,13 @@ pub fn spawn_hardware_polling_tasks(state: Arc<Mutex<AppState>>) {
         if let Some(dev_name) = info.device_name {
             if let Ok(mut guard) = state_init.lock() {
                 if guard.gpus.is_empty() {
-                    guard.gpus.push(GpuCardState::new(0, dev_name));
+                    let mut card = GpuCardState::new(0, dev_name);
+                    if guard.multi_xpu_gauges_blank {
+                        card.hide_vram = true;
+                        card.hide_util = true;
+                        card.util_history.clear();
+                    }
+                    guard.gpus.push(card);
                 }
             }
         }
@@ -1968,6 +2285,28 @@ pub fn launch_training_thread(state: Arc<Mutex<AppState>>, request: TrainingRequ
             total_epochs: request.epochs,
             ..Default::default()
         };
+        guard.multi_xpu_proc_alive = false;
+        guard.multi_xpu_gauges_blank = false;
+        guard.multi_xpu_last_good = None;
+        guard.multi_xpu_seen_mtime = None;
+        guard.multi_xpu_poll_tick = 0;
+        if yolo_multi_xpu_request(&request) {
+            guard.multi_xpu_proc_alive = true;
+            guard.multi_xpu_gauges_blank = true;
+            guard.best_map50 = None;
+            guard.best_map50_95 = None;
+            for card in &mut guard.gpus {
+                card.hide_vram = true;
+                card.hide_util = true;
+                card.util_history.clear();
+            }
+            remove_multi_xpu_metrics_file();
+        } else {
+            for card in &mut guard.gpus {
+                card.hide_vram = false;
+                card.hide_util = false;
+            }
+        }
         guard.refresh_run_artifacts();
     }
 

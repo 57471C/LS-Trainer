@@ -74,12 +74,14 @@ pub fn render_top_gpu_strip(frame: &mut Frame, area: Rect, state: &AppState) {
             .constraints([Constraint::Length(1), Constraint::Min(1)])
             .split(padded);
 
-        let vram_ratio = if gpu.vram_total_gb > 0.0 {
-            (gpu.vram_used_gb / gpu.vram_total_gb).clamp(0.0, 1.0)
-        } else {
+        let vram_ratio = if gpu.hide_vram || gpu.vram_total_gb <= 0.0 {
             0.0
+        } else {
+            (gpu.vram_used_gb / gpu.vram_total_gb).clamp(0.0, 1.0)
         };
-        let vram_label = if gpu.vram_total_gb > 0.0 {
+        let vram_label = if gpu.hide_vram {
+            "VRAM --".to_string()
+        } else if gpu.vram_total_gb > 0.0 {
             format!(
                 "VRAM {:.2} / {:.2} GiB ({:.0}%)",
                 gpu.vram_used_gb,
@@ -100,7 +102,11 @@ pub fn render_top_gpu_strip(frame: &mut Frame, area: Rect, state: &AppState) {
         let util_text = Paragraph::new(Line::from(vec![
             Span::styled("Util ", Style::default().fg(LABEL_MUTED)),
             Span::styled(
-                format!("{:>5.1}%", gpu.util_percent),
+                if gpu.hide_util {
+                    "    --".to_string()
+                } else {
+                    format!("{:>5.1}%", gpu.util_percent)
+                },
                 Style::default()
                     .fg(Color::LightGreen)
                     .add_modifier(Modifier::BOLD),

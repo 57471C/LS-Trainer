@@ -144,18 +144,21 @@ pub fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState)
         .split(padded);
 
     let m = &state.latest_metrics;
+    let gauges_blank = state.multi_xpu_gauges_blank;
     let total_ep = m.total_epochs.max(1);
-    let ep_ratio = if m.total_epochs > 0 {
-        (m.epoch as f64 / total_ep as f64).clamp(0.0, 1.0)
-    } else {
+    let ep_ratio = if gauges_blank || m.total_epochs == 0 {
         0.0
+    } else {
+        (m.epoch as f64 / total_ep as f64).clamp(0.0, 1.0)
     };
-    let ep_label = format!(
-        "Epoch {} / {} ({:.0}%)",
-        m.epoch,
-        m.total_epochs,
-        ep_ratio * 100.0
-    );
+    let ep_label = if gauges_blank {
+        format!("Epoch -- / {} (--%)", m.total_epochs)
+    } else {
+        format!(
+            "Epoch {} / {} ({:.0}%)",
+            m.epoch, m.total_epochs, ep_ratio * 100.0
+        )
+    };
     render_contrast_gauge(frame, rows[0], ep_ratio, &ep_label, BAR_EPOCH_TEAL);
 
     let step_ratio = if m.total_steps > 0 {
@@ -192,7 +195,9 @@ pub fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState)
         };
 
     // Overall progress across epochs + steps + samples/images
-    let overall_ratio = if !state.is_running && state.exit_code == Some(0) {
+    let overall_ratio = if gauges_blank {
+        0.0
+    } else if !state.is_running && state.exit_code == Some(0) {
         1.0
     } else if m.total_epochs > 0 && m.total_steps > 0 && m.epoch > 0 {
         let done_steps = m
@@ -226,10 +231,14 @@ pub fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState)
     } else {
         "-- imgs".to_string()
     };
+    let epoch_disp = if gauges_blank {
+        "--".to_string()
+    } else {
+        m.epoch.to_string()
+    };
     let overall_label = format!(
-        "Overall {:.0}% · Ep {}/{} · Step {}/{} · {}",
+        "Overall {:.0}% · Ep {epoch_disp}/{} · Step {}/{} · {}",
         overall_ratio * 100.0,
-        m.epoch,
         m.total_epochs,
         m.step,
         m.total_steps,
@@ -268,14 +277,22 @@ pub fn render_run_details_panel(frame: &mut Frame, area: Rect, state: &AppState)
         _ => "--:--".to_string(),
     };
 
-    let map50_str = state
-        .best_map50
-        .map(|v| format!("{:.2}%", v * 100.0))
-        .unwrap_or_else(|| "--".to_string());
-    let map95_str = state
-        .best_map50_95
-        .map(|v| format!("{:.2}%", v * 100.0))
-        .unwrap_or_else(|| "--".to_string());
+    let map50_str = if gauges_blank {
+        "--".to_string()
+    } else {
+        state
+            .best_map50
+            .map(|v| format!("{:.2}%", v * 100.0))
+            .unwrap_or_else(|| "--".to_string())
+    };
+    let map95_str = if gauges_blank {
+        "--".to_string()
+    } else {
+        state
+            .best_map50_95
+            .map(|v| format!("{:.2}%", v * 100.0))
+            .unwrap_or_else(|| "--".to_string())
+    };
 
     let new_best_active = state.is_new_best_active();
     let best_metric_color = if new_best_active {
