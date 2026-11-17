@@ -251,7 +251,12 @@ mod tests {
         assert!(!cfg.freeze_backbone);
         assert_eq!(cfg.freeze_layers, 10);
         assert!(cfg.amp);
-        assert_eq!(cfg.run_name, "BB-Parts-v3");
+        assert_eq!(cfg.dataset, "~/Exports/");
+        assert!(!cfg.run_name_custom);
+        assert_eq!(
+            cfg.run_name,
+            format!("Y11m-e60-960_{}", crate::app::local_date_dd_mm_yy())
+        );
         assert_eq!(cfg.active_aug_preset(), "bench");
         assert_eq!(cfg.degrees, "180");
         assert_eq!(cfg.flipud, "0.5");
@@ -346,6 +351,8 @@ mod tests {
             assert!(screen_text.contains("LS-Trainer TUI — Launch Menu"));
             assert!(screen_text.contains("YOLO11"));
             assert!(screen_text.contains("yolo11"));
+            assert!(screen_text.contains("~/Exports/"));
+            assert!(screen_text.contains("Y11m-e60-960_"));
             assert!(screen_text.contains("Architecture"));
             assert!(screen_text.contains("Model Scale"));
             assert!(screen_text.contains("Dataset Path"));
@@ -568,6 +575,128 @@ mod tests {
             let req = cfg.to_training_request().expect("request");
             assert_eq!(req.model_family, "YOLO");
             assert_eq!(req.model_choice, expected);
+        }
+    }
+
+    #[test]
+    fn suggested_run_name_uses_family_scale_epochs_size_and_date() {
+        let mut cfg = CliConfig::default();
+        cfg.arch = ArchChoice::RfDetr;
+        cfg.model = "rf-detr-medium".to_string();
+        cfg.epochs = "60".to_string();
+        cfg.imgsz = 960;
+        cfg.imgsz_input = "960".to_string();
+        assert_eq!(
+            cfg.suggested_run_name_on("17-11-26"),
+            "RF-Dm-e60-960_17-11-26"
+        );
+
+        cfg.arch = ArchChoice::RtDetr;
+        cfg.model = "rtdetr-v2-r18".to_string();
+        cfg.epochs = "2".to_string();
+        cfg.imgsz = 1280;
+        cfg.imgsz_input = "1280".to_string();
+        assert_eq!(
+            cfg.suggested_run_name_on("17-11-26"),
+            "RT-Dr18-e2-1280_17-11-26"
+        );
+
+        cfg.arch = ArchChoice::Yolo26;
+        cfg.model = "yolo26m.pt".to_string();
+        cfg.epochs = "100".to_string();
+        assert_eq!(
+            cfg.suggested_run_name_on("17-11-26"),
+            "Y26m-e100-1280_17-11-26"
+        );
+
+        cfg.arch = ArchChoice::Yolo;
+        cfg.model = "yolo11l.pt".to_string();
+        cfg.epochs = "100".to_string();
+        cfg.imgsz = 640;
+        cfg.imgsz_input = "640".to_string();
+        assert_eq!(
+            cfg.suggested_run_name_on("17-11-26"),
+            "Y11l-e100-640_17-11-26"
+        );
+
+        let dated = parse_cli_args_from([
+            "--arch",
+            "yolo26",
+            "--epochs",
+            "100",
+            "--imgsz",
+            "1280",
+            "--dataset",
+            "data",
+        ])
+        .expect("parse")
+        .expect("config");
+        assert!(dated.run_name.starts_with("Y26m-e100-1280_"));
+        assert!(!dated.run_name_custom);
+
+        let named = parse_cli_args_from([
+            "--arch",
+            "yolo26",
+            "--epochs",
+            "100",
+            "--run-name",
+            "kept-name",
+            "--dataset",
+            "data",
+        ])
+        .expect("parse")
+        .expect("config");
+        assert_eq!(named.run_name, "kept-name");
+        assert!(named.run_name_custom);
+
+        #[cfg(unix)]
+        {
+            let out = std::process::Command::new("date")
+                .arg("+%d-%m-%y")
+                .output()
+                .expect("date");
+            let expected = String::from_utf8(out.stdout)
+                .expect("utf8")
+                .trim()
+                .to_string();
+            assert_eq!(crate::app::local_date_dd_mm_yy(), expected);
+        }
+    }
+
+    #[test]
+    fn run_name_tracks_epochs_until_the_user_edits_it() {
+        let state = Arc::new(Mutex::new(AppState::new(CliConfig::default())));
+        {
+            let mut guard = state.lock().unwrap();
+            guard.setup.focused_field = 3;
+        }
+        handle_setup_key(&state, KeyCode::Right);
+        {
+            let guard = state.lock().unwrap();
+            assert_eq!(guard.setup.epochs, "100");
+            assert!(guard.setup.run_name.contains("-e100-"));
+            assert!(!guard.setup.run_name_custom);
+        }
+
+        {
+            let mut guard = state.lock().unwrap();
+            guard.setup.focused_field = 10;
+        }
+        handle_setup_key(&state, KeyCode::Char('X'));
+        handle_setup_key(&state, KeyCode::Enter);
+        let custom = state.lock().unwrap().setup.run_name.clone();
+        assert!(custom.ends_with('X'), "{custom}");
+        assert!(state.lock().unwrap().setup.run_name_custom);
+
+        {
+            let mut guard = state.lock().unwrap();
+            guard.setup.focused_field = 3;
+        }
+        handle_setup_key(&state, KeyCode::Right);
+        {
+            let guard = state.lock().unwrap();
+            assert_eq!(guard.setup.epochs, "150");
+            assert_eq!(guard.setup.run_name, custom);
         }
     }
 
