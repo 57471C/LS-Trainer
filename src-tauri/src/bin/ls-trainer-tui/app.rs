@@ -455,25 +455,117 @@ impl ArchChoice {
     }
 }
 
-fn discover_recent_dataset_path() -> String {
-    let candidates = [
-        "runs/detect/BB-Parts-v3/ls_trainer_config.json",
-        "runs/detect/test/ls_trainer_config.json",
-        "runs/detect/gui-test/ls_trainer_config.json",
-    ];
-    for rel in candidates {
-        if let Ok(raw) = std::fs::read_to_string(rel) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(ds) = val.get("dataset_path").and_then(|v| v.as_str()) {
-                    let trimmed = ds.trim();
-                    if !trimmed.is_empty() && Path::new(trimmed).exists() {
-                        return trimmed.to_string();
-                    }
+/// Starting text for the dataset field. The user edits the rest of the path.
+pub const DEFAULT_DATASET_PATH: &str = "~/Exports/";
+
+/// Local calendar date as `dd-mm-yy`.
+pub fn local_date_dd_mm_yy() -> String {
+    #[cfg(unix)]
+    {
+        #[repr(C)]
+        struct Tm {
+            tm_sec: i32,
+            tm_min: i32,
+            tm_hour: i32,
+            tm_mday: i32,
+            tm_mon: i32,
+            tm_year: i32,
+            tm_wday: i32,
+            tm_yday: i32,
+            tm_isdst: i32,
+            tm_gmtoff: i64,
+            tm_zone: *const std::ffi::c_char,
+        }
+        unsafe extern "C" {
+            fn time(tloc: *mut i64) -> i64;
+            fn localtime_r(timep: *const i64, result: *mut Tm) -> *mut Tm;
+        }
+        unsafe {
+            let mut now = 0i64;
+            if time(&mut now) != -1 {
+                let mut tm = std::mem::zeroed::<Tm>();
+                if !localtime_r(&now, &mut tm).is_null()
+                    && tm.tm_mday >= 1
+                    && (1..=12).contains(&tm.tm_mon.saturating_add(1))
+                {
+                    let year = tm.tm_year + 1900;
+                    return format!(
+                        "{:02}-{:02}-{:02}",
+                        tm.tm_mday,
+                        tm.tm_mon + 1,
+                        year.rem_euclid(100)
+                    );
                 }
             }
         }
     }
-    String::new()
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct SystemTime {
+            year: u16,
+            month: u16,
+            day_of_week: u16,
+            day: u16,
+            hour: u16,
+            minute: u16,
+            second: u16,
+            milliseconds: u16,
+        }
+        unsafe extern "system" {
+            fn GetLocalTime(lp: *mut SystemTime);
+        }
+        unsafe {
+            let mut st = std::mem::zeroed::<SystemTime>();
+            GetLocalTime(&mut st);
+            if st.day >= 1 && (1..=12).contains(&st.month) {
+                return format!("{:02}-{:02}-{:02}", st.day, st.month, st.year % 100);
+            }
+        }
+    }
+    "01-01-70".to_string()
+}
+
+fn scale_token(scale: &str) -> String {
+    match scale {
+        "nano" | "n" => "n",
+        "small" | "s" => "s",
+        "medium" | "m" => "m",
+        "large" | "l" => "l",
+        "xlarge" | "x" | "xl" => "x",
+        "base" | "b" => "b",
+        "seg-nano" => "segn",
+        "seg-small" => "segs",
+        "seg-medium" => "segm",
+        "seg-large" => "segl",
+        "seg-preview" => "segp",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Last `r18` / `r50` style token in a model id, used for RT-DETR variants.
+fn r_variant(model: &str) -> Option<String> {
+    let lower = model.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut found = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'r' {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start {
+                found = Some(lower[i..end].to_string());
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    found
 }
 
 #[derive(Debug, Clone)]
@@ -493,6 +585,8 @@ pub struct CliConfig {
     pub freeze_layers: u32,
     pub amp: bool,
     pub run_name: String,
+    /// Set when the user edits Run Name. Source-field changes keep their text.
+    pub run_name_custom: bool,
     pub degrees: String,
     pub flipud: String,
     pub scale: String,
@@ -508,10 +602,18 @@ pub struct CliConfig {
 
 impl Default for CliConfig {
     fn default() -> Self {
+        let mut cfg = Self::blank();
+        cfg.refresh_suggested_run_name();
+        cfg
+    }
+}
+
+impl CliConfig {
+    fn blank() -> Self {
         Self {
             interactive: true,
             arch: ArchChoice::Yolo,
-            dataset: discover_recent_dataset_path(),
+            dataset: DEFAULT_DATASET_PATH.to_string(),
             model: ArchChoice::Yolo.default_model().to_string(),
             epochs: "60".to_string(),
             batch: "4".to_string(),
@@ -523,7 +625,8 @@ impl Default for CliConfig {
             freeze_backbone: false,
             freeze_layers: 10,
             amp: true,
-            run_name: "BB-Parts-v3".to_string(),
+            run_name: String::new(),
+            run_name_custom: false,
             degrees: "180".to_string(),
             flipud: "0.5".to_string(),
             scale: "0.05".to_string(),
@@ -537,9 +640,48 @@ impl Default for CliConfig {
             error_banner: None,
         }
     }
-}
 
-impl CliConfig {
+    /// `Y26m-e100-1280_17-11-26` from the current family, scale, epochs, and image size.
+    pub fn suggested_run_name_on(&self, date_dd_mm_yy: &str) -> String {
+        let family = match self.arch {
+            ArchChoice::Yolo => "Y11",
+            ArchChoice::Yolo26 => "Y26",
+            ArchChoice::RfDetr => "RF-D",
+            ArchChoice::RtDetr => "RT-D",
+        };
+        let resolved = self.arch.resolve_model_or_scale(&self.model);
+        let scale = if let Some(opt) = self.arch.find_option(&resolved) {
+            scale_token(opt.scale)
+        } else if self.arch == ArchChoice::RtDetr {
+            r_variant(&resolved).unwrap_or_else(|| "custom".to_string())
+        } else {
+            "custom".to_string()
+        };
+        let epochs = self.epochs.trim().parse::<u32>().unwrap_or(60).max(1);
+        let imgsz = self.resolve_imgsz().unwrap_or(self.imgsz).max(32);
+        format!("{family}{scale}-e{epochs}-{imgsz}_{date_dd_mm_yy}")
+    }
+
+    pub fn refresh_suggested_run_name(&mut self) {
+        if self.run_name_custom {
+            return;
+        }
+        self.run_name = self.suggested_run_name_on(&local_date_dd_mm_yy());
+    }
+
+    /// After the Run Name editor closes, keep a real edit and resume suggestions if it was cleared.
+    pub fn finish_run_name_edit(&mut self) {
+        let suggestion = self.suggested_run_name_on(&local_date_dd_mm_yy());
+        let trimmed = self.run_name.trim();
+        if trimmed.is_empty() || trimmed == suggestion {
+            self.run_name_custom = false;
+            self.run_name = suggestion;
+        } else {
+            self.run_name = trimmed.to_string();
+            self.run_name_custom = true;
+        }
+    }
+
     pub fn switch_arch(&mut self, next_arch: ArchChoice) {
         let old_arch = self.arch;
         let current_scale = old_arch.find_option(&self.model).map(|o| o.scale);
@@ -762,10 +904,13 @@ impl CliConfig {
         Ok(TrainingRequest {
             dataset_path: dataset_trimmed.to_string(),
             model_choice: model_resolved,
-            run_name: if self.run_name.trim().is_empty() {
-                "BB-Parts-v3".to_string()
-            } else {
-                self.run_name.trim().to_string()
+            run_name: {
+                let trimmed = self.run_name.trim();
+                if trimmed.is_empty() {
+                    self.suggested_run_name_on(&local_date_dd_mm_yy())
+                } else {
+                    trimmed.to_string()
+                }
             },
             epochs: epochs_val,
             imgsz: imgsz_val,
@@ -2111,6 +2256,7 @@ where
             }
             "--run-name" => {
                 cfg.run_name = next_val()?;
+                cfg.run_name_custom = true;
             }
             other => {
                 return Err(format!(
@@ -2119,6 +2265,10 @@ where
             }
         }
         i += 1;
+    }
+
+    if !cfg.run_name_custom {
+        cfg.refresh_suggested_run_name();
     }
 
     Ok(Some(cfg))

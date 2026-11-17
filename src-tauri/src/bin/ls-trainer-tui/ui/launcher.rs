@@ -99,7 +99,7 @@ fn focused_field_help(state: &AppState) -> String {
                 )
             }
         }
-        2 => "Dataset Path: YOLO folder/archive (.tar/.zip) or RF-DETR COCO dataset directory (Enter to edit)".to_string(),
+        2 => "Dataset Path: prefilled with ~/Exports/ — add the dataset folder or archive (Enter to edit)".to_string(),
         3 => "Epochs: Total training passes over the dataset (Webview default: 60; Left/Right or Enter)".to_string(),
         4 => "Batch Size: Images processed per step (Webview default: 4; Left/Right or Enter)".to_string(),
         5 => "Resolution (imgsz): Input image size — 640, 960 (default), or 1280 (Left/Right or Enter)".to_string(),
@@ -107,7 +107,7 @@ fn focused_field_help(state: &AppState) -> String {
         7 => "Device: Compute target — auto (default), xpu, xpu:0, xpu:0,1 (dual-XPU), 0, cuda, cpu".to_string(),
         8 => "Freeze Backbone: Unfrozen (freeze=0, default) or Freeze first 10 backbone layers (Left/Right/Enter)".to_string(),
         9 => "Mixed Precision (AMP): Enabled FP16 (default) or Disabled FP32 (Left/Right/Enter)".to_string(),
-        10 => "Run Name: Output directory under runs/<task>/<run_name> (Webview default: BB-Parts-v3)".to_string(),
+        10 => "Run Name: suggested from the family, scale, epochs, and image size (Y26m-e60-960_dd-mm-yy). Enter to edit; your text is kept.".to_string(),
         11 => "Augmentation Preset: Bench (default: deg=180, flipud=0.5, scale=0.05, close_mosaic=10, mosaic=0), Off, Light, Medium".to_string(),
         12 => "Rotation (degrees): Random rotation range 0–180° (Bench default: 180)".to_string(),
         13 => "Vertical Flip (flipud): Up-down flip probability 0.0–1.0 (Bench default: 0.5)".to_string(),
@@ -253,7 +253,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             "Dataset Path",
             &ds_display,
             true,
-            Some("Enter to edit dataset folder or archive path"),
+            Some("~/Exports/ — Enter to edit the rest of the path"),
             15,
         ));
         frame.render_widget(Paragraph::new(top_lines), v_sections[0]);
@@ -383,7 +383,7 @@ pub fn render_launcher_screen(frame: &mut Frame, area: Rect, state: &AppState) {
             "Run Name",
             &s.run_name,
             true,
-            Some(&format!("task: {task_str}")),
+            Some(&format!("suggested · {task_str}")),
             15,
         ));
         frame.render_widget(Paragraph::new(left_lines), cols[0]);

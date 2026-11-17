@@ -136,6 +136,8 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
                     }
                 } else if s.focused_field == 6 && s.workers_input.trim().is_empty() {
                     s.workers_input = "auto".to_string();
+                } else if s.focused_field == 10 {
+                    s.finish_run_name_edit();
                 }
                 s.editing_field = false;
             }
@@ -157,6 +159,7 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
             }
             KeyCode::F(2) => {
                 finish_edit(&mut guard.setup);
+                guard.setup.refresh_suggested_run_name();
                 match guard.setup.to_training_request() {
                     Ok(req) => {
                         guard.setup.error_banner = None;
@@ -353,6 +356,7 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
                 }
                 10 => {
                     guard.setup.editing_field = true;
+                    guard.setup.run_name_custom = true;
                     guard.setup.run_name.pop();
                 }
                 12 => {
@@ -436,6 +440,7 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
                 }
                 10 => {
                     guard.setup.editing_field = true;
+                    guard.setup.run_name_custom = true;
                     guard.setup.run_name.push(c);
                 }
                 11 if c == ' ' => {
@@ -479,6 +484,7 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
             KeyCode::Enter => {
                 if focused == 20 {
                     finish_edit(&mut guard.setup);
+                    guard.setup.refresh_suggested_run_name();
                     match guard.setup.to_training_request() {
                         Ok(req) => {
                             guard.setup.error_banner = None;
@@ -508,6 +514,10 @@ pub fn handle_setup_key(state: &Arc<Mutex<AppState>>, code: KeyCode) -> bool {
                 }
             }
             _ => {}
+        }
+        let editing_run_name = guard.setup.focused_field == 10 && guard.setup.editing_field;
+        if !editing_run_name {
+            guard.setup.refresh_suggested_run_name();
         }
     }
 
